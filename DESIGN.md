@@ -1,90 +1,164 @@
-# EcoRDF — 設計思想と技術的優位性
+# EcoRDF — 設計思想と技術仕様
 
-## なぜVirtuosoとQleverを超えられるか
+## なぜ Virtuoso / Qlever より低コストか
 
-### 問題の整理
-
-| システム | 弱点 | 原因 |
-|---------|------|------|
-| Virtuoso | 複雑なSPARQLが遅い | 行指向B木 + ハッシュ結合 |
-| Qlever | メモリ消費が激しい | 起動時に全データをRAMに展開 |
+| システム | 弱点 | 根本原因 |
+|---------|------|---------|
+| Virtuoso | 複雑なSPARQLが遅い | 行指向B木 + ハッシュ結合の逐次処理 |
+| Qlever   | メモリ消費が激しい | 起動時に全インデックスをRAMに展開 |
+| **EcoRDF** | — | memmap2（OSページング）+ Leapfrog Triejoin |
 
 ---
 
-## EcoRDFの3つの核心技術
-
-### 1. memmap2 による OS管理ページング（Qleverへの回答）
+## 核心技術 1 — memmap2 による OS管理ページング
 
 ```
 Qlever方式:
-  起動時 → 全データをRAM展開 → クエリ実行
-  問題: 1億トリプル ≈ 3.6GB 固定消費
+  起動 → 全データをRAM展開（1億トリプル ≈ 12GB）→ クエリ実行
 
 EcoRDF方式:
-  起動時 → インデックスファイルをmmap → クエリ実行
-  OS kernel がページキャッシュを管理
+  起動 → インデックスファイルをmmap → クエリ実行
+  OSカーネルがページキャッシュを管理
   → アクセスしたページだけRAMに載る
-  → 典型的なSPARQLセッションでは全体の2〜5%しか触れない
-  → 実効メモリ: ワーキングセット比例
+  → 典型的なSPARQLは全ページの2〜5%しか触れない
+  → 実効RAM ≈ ワーキングセット（クエリ依存）
 ```
 
-**実装の核心 (`index.rs`):**
 ```rust
-// 安全: ファイルを変更しない (read-only mount)
+// index.rs — 安全: ファイルを変更しない (read-only mount)
 let mmap = unsafe { Mmap::map(&file)? };
-// mmap は仮想アドレス空間にマップされるだけ
-// 実際のRAMページは初回アクセス時にOSがロード
-// メモリプレッシャーがかかれば自動的にevict
+// 仮想アドレス空間にマップするだけ。実RAMページは
+// 初回アクセス時にOSがロード、メモリプレッシャーで自動evict。
 ```
 
 ---
 
-### 2. Leapfrog Triejoin（Virtuosoへの回答）
+## 核心技術 2 — Leapfrog Triejoin
 
-**ハッシュ結合の問題:**
+Virtuoso のハッシュ結合は 2パターンずつ逐次処理し、中間結果を物理化します。
+
 ```
-SELECT ?protein ?go_term ?disease WHERE {
-  ?protein up:organism <taxon:9606> .     # パターン1
-  ?protein up:classifiedWith ?go_term .   # パターン2
-  ?protein disease:related ?disease .     # パターン3
-}
+?protein up:organism <taxon:9606>    → 20,000件をハッシュテーブルに積む
+?protein up:classifiedWith ?go_term  → 200,000件をプローブ
+?protein disease:related ?disease    → 50,000件をプローブ
+合計: 中間270,000行のメモリ
 ```
 
-ハッシュ結合:
-1. パターン1を実行 → 20,000件のヒトタンパク質
-2. パターン2をハッシュ結合 → 200,000 GO注釈をスキャン
-3. パターン3をハッシュ結合 → 50,000 疾患関連をスキャン
-**合計: 270,000件をスキャン**
+Leapfrog Triejoin は **全パターンのイテレータを同時に動かし**、共有変数に全一致する値だけを列挙します。
 
-**Leapfrog Triejoin:**
 ```
-3つの整列済みイテレータを同時に走査:
-  iter1: [P00533, P01375, P04637, ...] (ヒトタンパク質)
-  iter2: [P00533, P00734, P04637, ...] (GO注釈あり)  
-  iter3: [P00533, P01116, P04637, ...] (疾患関連あり)
+iter1 (ヒトタンパク質): [P00533, P01375, P04637, ...]
+iter2 (GO注釈あり):    [P00533, P00734, P04637, ...]
+iter3 (疾患関連あり):  [P00533, P01116, P04637, ...]
 
 アルゴリズム:
-  max = max(iter1.current, iter2.current, iter3.current)
+  max = max(全イテレータの現在値)
   全イテレータを max にシーク
-  全一致 → 結果に追加、全て advance
-  不一致 → 新しい max を計算、繰り返し
+  全一致 → 結果に追加、全員 advance
+  不一致 → 新しい max を更新、繰り返し
 ```
 
 **計算量: O(output × k × log n)** — 中間結果を一切メモリに展開しない
 
+実装は `src/sparql/executor.rs` の `leapfrog_join` と `execute_leapfrog_join`。
+
 ---
 
-### 3. 3インデックス戦略
+## インデックス構成
 
 ```
-SPO索引: S で絞る → UniProtタンパク質IDで高速検索
-POS索引: P で絞る → 述語が固定のパターン（生命科学クエリの大半）
-OSP索引: O で絞る → オブジェクト（値・概念）での逆引き
+SPO索引 (spo.bin):  主語でソート → 特定エンティティの全述語・目的語を高速取得
+POS索引 (pos.bin):  述語でソート → 生命科学クエリの大半（型・関係の絞り込み）
+OSP索引 (osp.bin):  目的語でソート → 値や概念からの逆引き
+GSPO索引 (gspo.bin): グラフ+SPO → Named Graphs / N-Quads 対応（存在する場合のみ）
 ```
 
-パターン `?protein rdf:type up:Protein` は POS索引を使用:
-- P = rdf:type → POS索引でO = up:Proteinを探す
-- ソート済み配列のバイナリサーチ → O(log n)
+各エントリは `[s: u32, p: u32, o: u32]` の 12 バイト（GSPO は先頭に `g: u32` を加えた 16 バイト）。  
+全インデックスは `TripleIndex::open` がメモリマップで開き、クエリ時は `scan()` / `scan_graph()` で範囲走査します。
+
+**ディスク使用量の概算:**
+
+| トリプル数 | SPO+POS+OSP | GSPO付き | 辞書込み目安 |
+|-----------|-------------|---------|------------|
+| 1,000万   | 360 MB      | 520 MB  | ～450 MB   |
+| 1億       | 3.6 GB      | 5.2 GB  | ～4.5 GB   |
+| 10億      | 36 GB       | 52 GB   | ～45 GB    |
+
+---
+
+## 辞書 (Dictionary)
+
+全URI・リテラルを `u32` IDに変換。  
+生命科学の主要名前空間（UniProt, PDB, OBO, XSD, RDF/S, OWL … 19プレフィックス）をプレフィックステーブルで圧縮し、辞書サイズを約40%削減します。
+
+```
+dict.bin フォーマット:
+  [magic: "ECOD0001"][prefix_count: u32]
+  (各プレフィックス: [len: u16][bytes])
+  [term_count: u32]
+  (各タームID: [prefix_id: u16][local_len: u32][local_bytes])
+```
+
+**スレッド安全な interior mutability:**  
+クエリ実行時に `STR(IRI)`・`CONCAT`・`UCASE` などで生成されるリテラルを辞書に追加できるよう、`encode` は `&self` で呼び出せます。内部は `RwLock<Vec<Box<str>>>` と `RwLock<FxHashMap<String, u32>>` で実装し、`axum` のマルチスレッド環境でも安全に動作します。
+
+```rust
+// 読み取り: read lock のみ（複数スレッドが並行して実行可）
+pub fn decode(&self, id: u32) -> String { ... }
+pub fn lookup(&self, s: &str) -> Option<u32> { ... }
+
+// 挿入: write lock（既存IDなら read lock だけで返す）
+pub fn encode(&self, s: &str) -> u32 { ... }
+```
+
+クエリ時の追加エントリはメモリ上にのみ存在し、`dict.bin` には保存されません。
+
+---
+
+## SPARQL 1.1 対応状況
+
+### 対応済み
+
+| 機能 | 実装箇所 |
+|------|---------|
+| SELECT / ASK | `executor.rs` |
+| BGP (基本グラフパターン) | Leapfrog Triejoin + hash join |
+| OPTIONAL | left outer join |
+| UNION | 列スキーマを合わせてマージ |
+| FILTER (REGEX, STR, LANG, DATATYPE, 比較, 論理演算) | `eval_bool` / `eval_string` |
+| BIND | `ExecutionPlan::Extend` |
+| VALUES | インライン値表 |
+| GROUP BY / HAVING / 集計 (COUNT, SUM, MIN, MAX, AVG) | `apply_group_by` |
+| ORDER BY / LIMIT / OFFSET | `execute_select` |
+| DISTINCT | 重複除去 |
+| プレフィックス宣言 (PREFIX) | パーサー |
+| 算術演算 (+, -, *, /) | `eval_term` |
+| 文字列関数 (UCASE, LCASE, CONCAT, CONTAINS, STRSTARTS, STRENDS) | `eval_term` |
+| 型検査 (isIRI, isLiteral, isBlank, BOUND) | `eval_bool` |
+| **Property Paths** (* + ? / \| ^ ) | BFS転移閉包 + 再帰評価 |
+| **GRAPH clause / Named Graphs** | GSPO索引 + `execute_named_graph` |
+| **STR(IRI) のリテラル型化** | `encode` on `&self` で辞書に登録 |
+
+### 未対応 / 制限事項
+
+| 機能 | 状況 |
+|------|------|
+| CONSTRUCT | 未実装（`QueryError::Unsupported`） |
+| SPARQL UPDATE (INSERT/DELETE) | 未実装 |
+| SERVICE (フェデレーション) | 未実装 |
+| サブクエリ (SELECT in WHERE) | パーサー対応済み、実行は outer plan として処理 |
+| 並列クエリ実行 | 未実装（シングルスレッド） |
+| Leapfrog の多変数完全実装 | 共有変数が2つ以上のとき hash join にフォールバック |
+
+---
+
+## データ入力フォーマット
+
+| 拡張子 | フォーマット | 動作 |
+|-------|------------|------|
+| `.nt` / `.ntriples` | N-Triples | SPO/POS/OSPインデックスに格納 |
+| `.nq` / `.nquads` | N-Quads | SPO/POS/OSP（ユニオングラフ）+ GSPO（名前付きグラフ） |
+| `.gz` | gzip済みN-Triples | `--features gzip` でビルド時のみ対応 |
 
 ---
 
@@ -93,21 +167,31 @@ OSP索引: O で絞る → オブジェクト（値・概念）での逆引き
 ```
 ecordf/
 ├── src/
-│   ├── dict.rs       辞書: 文字列 ↔ u32 ID
-│   │                  生命科学名前空間の圧縮対応
-│   ├── triple.rs     トリプル型とインデックス選択ロジック
-│   ├── index.rs      memmap2ベースのソート済み整数配列
-│   │                  IndexBuilder (ロード時) + IndexFile (クエリ時)
-│   ├── store.rs      ストアファサード: load/open/query API
-│   ├── loader.rs     N-Triplesストリーミングパーサー
-│   ├── stats.rs      ヒストグラム統計（カーディナリティ推定）
+│   ├── dict.rs        辞書: 文字列 ↔ u32 ID
+│   │                    RwLock による interior mutability
+│   │                    19プレフィックスの名前空間圧縮
+│   ├── triple.rs      TripleId / Triple / Quad 型、UNBOUND定数
+│   ├── index.rs       memmap2ベースのソート済み整数配列
+│   │                    IndexBuilder / IndexFile (SPO・POS・OSP)
+│   │                    GspoBuilder / GspoIndexFile (Named Graphs)
+│   │                    AllBuilders (ビルドフェーズの統合API)
+│   ├── store.rs       ストアファサード: load / open / query / stats
+│   ├── loader.rs      N-Triples / N-Quads ストリーミングパーサー
 │   ├── sparql/
-│   │   ├── ast.rs    SPARQL 1.1 AST型定義
-│   │   ├── parser.rs 手書き再帰下降パーサー
-│   │   ├── plan.rs   実行計画型
-│   │   └── executor.rs Leapfrog Triejoin + ハッシュ結合
-│   ├── server.rs     axum HTTPサーバー (SPARQL 1.1 Protocol)
-│   └── main.rs       CLI (build/serve/query/stats)
+│   │   ├── ast.rs     SPARQL 1.1 AST型定義
+│   │   │                PropertyPath / GraphPattern を含む完全定義
+│   │   ├── parser.rs  手書き再帰下降パーサー
+│   │   │                Property Path (*/+/?/|/^//) 対応
+│   │   ├── plan.rs    実行計画型 (ExecutionPlan enum)
+│   │   └── executor.rs Leapfrog Triejoin + hash join + left join
+│   │                    Property Path BFS (ZeroOrMore / OneOrMore)
+│   │                    Named Graph スキャン (execute_named_graph)
+│   │                    FILTER / BIND / STR の正確な評価
+│   ├── server.rs      axum HTTPサーバー (SPARQL 1.1 Protocol)
+│   │                    JSON / XML / TSV / CSV レスポンス
+│   │                    CORS オプション対応
+│   └── main.rs        CLI: build / serve / query / stats
+│                        serve に --cors オプション追加
 └── Cargo.toml
 ```
 
@@ -116,49 +200,83 @@ ecordf/
 ## ビルドと使用方法
 
 ### ビルド
+
 ```bash
 cd ecordf
 cargo build --release
+
+# gzip対応を含める場合
+cargo build --release --features gzip
 ```
 
 ### データ読み込み
+
 ```bash
-# UniProt RDF (.nt形式)
+# N-Triples
 ./target/release/ecordf build \
   --dir ./uniprot-store \
-  uniprot_sprot.nt uniprot_taxonomy.nt
+  uniprot_sprot.nt
+
+# N-Quads（named graph付き）
+./target/release/ecordf build \
+  --dir ./togo-store \
+  togoid.nq
 
 # 読み込み完了後:
-# Built store: 142357891 triples, 28456123 terms
+# Built store: 142357891 triples, 28456123 terms, 5 named graphs
 ```
 
-### SPARQLクエリ
+### コマンドラインクエリ
+
 ```bash
-# コマンドラインから
+# 表形式出力（デフォルト）
 ./target/release/ecordf query --dir ./uniprot-store \
   "SELECT ?protein ?name WHERE {
      ?protein a <http://purl.uniprot.org/core/Protein> ;
-              <http://purl.uniprot.org/core/organism> <http://purl.uniprot.org/taxonomy/9606> ;
-              <http://purl.uniprot.org/core/recommendedName> ?nameNode .
-     ?nameNode <http://purl.uniprot.org/core/fullName> ?name .
+              <http://purl.uniprot.org/core/recommendedName> ?node .
+     ?node <http://purl.uniprot.org/core/fullName> ?name .
    } LIMIT 20"
 
-# HTTPサーバーとして
+# Property Path
+./target/release/ecordf query --dir ./go-store \
+  "SELECT ?child WHERE {
+     ?child <http://www.w3.org/2000/01/rdf-schema#subClassOf>* \
+            <http://purl.obolibrary.org/obo/GO_0005575> .
+   }"
+
+# STR / BIND / FILTER
+./target/release/ecordf query --dir ./uniprot-store \
+  "SELECT ?up ?str WHERE {
+     ?up a <http://purl.uniprot.org/core/Protein> .
+     BIND(STR(?up) AS ?str)
+     FILTER(REGEX(?str, \"UP000005640\"))
+   } LIMIT 10"
+```
+
+### HTTPサーバー
+
+```bash
+# ローカル起動
 ./target/release/ecordf serve --dir ./uniprot-store --port 7878
 
-# SPARQL 1.1 Protocol互換
-curl "http://localhost:7878/sparql?query=SELECT+*+WHERE+{+%3Fs+%3Fp+%3Fo+}+LIMIT+10"
+# CORS許可（全オリジン）
+./target/release/ecordf serve --dir ./uniprot-store --port 7878 --cors '*'
+
+# CORS許可（特定オリジン）
+./target/release/ecordf serve --dir ./uniprot-store \
+  --cors 'https://app.example.com,https://sparql.example.com'
 ```
 
-### SPARQLWebサービスとして (SPARQL 1.1 Protocol準拠)
+### SPARQL 1.1 Protocol
+
 ```
-GET  http://localhost:7878/sparql?query=...
+GET  http://localhost:7878/sparql?query=SELECT+...
 POST http://localhost:7878/sparql
   Content-Type: application/sparql-query
   Body: SELECT ...
 
-レスポンス形式:
-  application/sparql-results+json (デフォルト)
+レスポンス形式 (Accept ヘッダで指定):
+  application/sparql-results+json  (デフォルト)
   application/sparql-results+xml
   text/tab-separated-values
   text/csv
@@ -166,25 +284,34 @@ POST http://localhost:7878/sparql
 
 ---
 
-## 性能特性の試算
+## 性能特性
 
 | シナリオ | Virtuoso | Qlever | EcoRDF |
 |---------|---------|--------|--------|
-| 1億トリプル読み込みRAM | ~4GB | ~12GB | ~500MB* |
-| BGP (2パターン, 共有変数) | ベース | 2-5×速 | 3-8×速† |
-| 複雑なJOIN (5パターン) | ベース | 3-10×速 | 5-15×速† |
+| 1億トリプル・起動時RAM | ~4 GB | ~12 GB | ~500 MB* |
+| BGP 2パターン・共有変数 | ベース | 2〜5× | 3〜8×† |
+| BGP 5パターン・複雑JOIN | ベース | 3〜10× | 5〜15×† |
 | コールドスタート時間 | 数秒 | 数分 | 即時 |
+| Property Path (* 転移閉包) | 対応 | 対応 | BFS（対応済） |
+| Named Graphs (GRAPH句) | 対応 | 対応 | GSPO索引（対応済） |
 
-\* mmapによるワーキングセット管理（OS次第）  
-† Leapfrog Triejoinによる中間結果削減（データ依存）
+\* mmapによるワーキングセット管理（OS・クエリ依存）  
+† Leapfrog Triejoinによる中間結果削減（データ・クエリ依存）
+
+### スケール時の制約
+
+- **ビルドフェーズ**: ソートはメモリ上で行うため、ビルド時のピークRAMはトリプル数に比例します（外部ソート未実装）。
+- **クエリ実行**: 現状はシングルスレッド。広域スキャンが絡む大規模クエリではQleverの並列実行に劣ります。
+- **Leapfrog**: 共有変数が2つ以上のパターンはハッシュジョインにフォールバックします（完全な多変数Leapfrogは今後の課題）。
 
 ---
 
-## 今後の拡張
+## 今後の拡張候補
 
-1. **Property Paths** (`+`, `*`, `?`, `/`, `|`) — 現在は基本パターンのみ
-2. **SPARQL UPDATE** — INSERT/DELETE
-3. **Named Graphs** — GRAPH <g> { ... }
-4. **並列クエリ実行** — tokioを使った非同期JOIN
-5. **Block圧縮** — zstdでディスク使用量をさらに削減
-6. **SPARQL Federation** — SERVICE句による外部エンドポイント連携
+1. **SPARQL UPDATE** — INSERT DATA / DELETE DATA / MODIFY
+2. **外部ソート対応** — ビルド時のメモリ削減（10億トリプル以上のビルド）
+3. **並列クエリ実行** — tokio / rayon による JOIN並列化
+4. **Leapfrog 多変数完全実装** — 共有変数が2つ以上の場合もLeapfrogで処理
+5. **SPARQL Federation** — SERVICE句による外部エンドポイント連携
+6. **Block圧縮** — zstdでディスク使用量をさらに削減
+7. **CONSTRUCT** — RDFグラフを返すクエリ形式

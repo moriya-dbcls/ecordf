@@ -1,0 +1,3 @@
+# EcoRDF
+
+Claudeが設計したVirtuosoより早くて、とQleverよりはメモリを使わないトリプルストア
