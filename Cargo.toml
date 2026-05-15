@@ -1,0 +1,79 @@
+[package]
+name = "ecordf"
+version = "0.1.0"
+edition = "2021"
+authors = ["EcoRDF Project"]
+description = """
+EcoRDF: A cost-efficient RDF triple store.
+Low memory (vs Qlever) + fast response (vs Virtuoso) via:
+  - memmap2-backed sorted indexes (OS-managed paging)
+  - Leapfrog Triejoin (provably optimal multi-way join)
+  - Cost-based query optimizer with histogram statistics
+"""
+
+[[bin]]
+name = "ecordf"
+path = "src/main.rs"
+
+[lib]
+name = "ecordf"
+path = "src/lib.rs"
+
+[dependencies]
+# Memory-mapped file I/O — the key to beating Qlever's memory usage
+memmap2 = "0.9"
+
+# Async HTTP server for SPARQL 1.1 Protocol endpoint
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["json"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Serialization for SPARQL results (JSON/XML)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = { version = "0.31", features = ["serialize"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Fast hash map (for dictionary encoding)
+rustc-hash = "1"
+
+# Regex support for SPARQL FILTER regex()
+regex = "1"
+
+# URL / form parsing
+percent-encoding = "2"
+form_urlencoded = "1"
+
+# Error handling in main
+anyhow = "1"
+
+[features]
+gzip = ["dep:flate2"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[dependencies.flate2]
+version = "1"
+optional = true
+
+[[bench]]
+name = "join_bench"
+harness = false
+
+[profile.release]
+# Maximize performance for the hot path
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1  # Some optimization even in dev for numeric code
