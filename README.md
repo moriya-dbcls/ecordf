@@ -1,3 +1,3 @@
 # EcoRDF
 
-Claudeが設計したVirtuosoより早くて、とQleverよりはメモリを使わないトリプルストア
+Claude (Sonnet 4.6)が設計したVirtuosoより速くて、とQleverよりはメモリを使わないトリプルストア
