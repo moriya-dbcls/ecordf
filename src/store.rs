@@ -15,7 +15,7 @@ use crate::dict::Dictionary;
 use crate::index::{AllBuilders, TripleIndex};
 use crate::loader::load_files;
 use crate::sparql::{parse_query, Executor, ResultSet};
-use crate::sparql::ast::QueryForm;
+use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
 
 pub struct Store {
     pub dict: Dictionary,
@@ -78,6 +78,15 @@ impl Store {
 
         let result = match ast.form {
             QueryForm::Select(ref sq) => {
+                // Validate GROUP BY consistency before executing.
+                // SPARQL 1.1 leaves the value of non-aggregate, non-GROUP-BY SELECT variables
+                // undefined when GROUP BY is present.  Rather than silently returning NULL or
+                // a random sample, we reject the query with a helpful suggestion.
+                if !sq.group_by.is_empty() {
+                    if let Some(err) = validate_group_by(sq) {
+                        return Err(QueryError::Parse(err));
+                    }
+                }
                 let rs = executor.execute_select(sq);
                 QueryResult::Select(rs)
             }
@@ -138,6 +147,59 @@ impl Store {
             dir: self.dir.clone(),
         }
     }
+}
+
+/// Check that every plain variable in SELECT is either a GROUP BY key or an aggregate alias.
+///
+/// Returns `Some(error_message)` when ungrouped variables are found, `None` when the query is valid.
+///
+/// Example error:
+///   "Variable(s) ?c, ?c_label appear in SELECT but not in GROUP BY or an aggregate.
+///    Add them to GROUP BY, e.g.: GROUP BY ?p ?c ?c_label"
+fn validate_group_by(sq: &crate::sparql::ast::SelectQuery) -> Option<String> {
+    // Collect all GROUP BY variable names
+    let group_by_vars: std::collections::HashSet<&str> = sq.group_by.iter()
+        .filter_map(|gc| {
+            if let Expression::Variable(v) = &gc.expr { Some(v.as_str()) } else { None }
+        })
+        .collect();
+
+    // Find SELECT variables that are neither a GROUP BY key nor an aggregate alias
+    let mut ungrouped: Vec<&str> = Vec::new();
+    if let Projection::Variables(items) = &sq.projection {
+        for item in items {
+            if let SelectItem::Variable(v) = item {
+                if !group_by_vars.contains(v.as_str()) {
+                    ungrouped.push(v.as_str());
+                }
+            }
+        }
+    }
+
+    if ungrouped.is_empty() {
+        return None;
+    }
+
+    // Build a suggested GROUP BY that includes both current keys and the missing variables,
+    // preserving the original order of GROUP BY keys first.
+    let mut suggested: Vec<&str> = sq.group_by.iter()
+        .filter_map(|gc| if let Expression::Variable(v) = &gc.expr { Some(v.as_str()) } else { None })
+        .collect();
+    for v in &ungrouped {
+        if !suggested.contains(v) {
+            suggested.push(v);
+        }
+    }
+
+    let ungrouped_display: Vec<String> = ungrouped.iter().map(|v| format!("?{}", v)).collect();
+    let suggested_display: Vec<String> = suggested.iter().map(|v| format!("?{}", v)).collect();
+
+    Some(format!(
+        "Variable(s) {} appear in SELECT but not in GROUP BY or an aggregate function. \
+         Add them to GROUP BY, e.g.: GROUP BY {}",
+        ungrouped_display.join(", "),
+        suggested_display.join(" "),
+    ))
 }
 
 pub enum QueryResult {

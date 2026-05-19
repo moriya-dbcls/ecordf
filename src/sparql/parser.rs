@@ -623,6 +623,23 @@ impl<'a> Parser<'a> {
                     patterns.push(GraphPattern::Subquery(Box::new(sq)));
                 }
 
+                // Solution modifiers (LIMIT, OFFSET, ORDER BY, GROUP BY, HAVING) are not
+                // valid inside a WHERE clause.  The user likely meant to put LIMIT inside
+                // the subquery `{ SELECT … LIMIT n }` or at the outer SELECT level.
+                // Return a clear error rather than silently misparssing the rest of the query.
+                Token::Kw(k) if matches!(
+                    k.to_ascii_lowercase().as_str(),
+                    "limit" | "offset" | "order" | "group" | "having"
+                ) => {
+                    let kl = k.to_ascii_lowercase();
+                    return Err(ParseError(format!(
+                        "'{}' is not allowed inside a WHERE clause. \
+                         If you meant to limit a subquery, place it inside the subquery braces: \
+                         {{ SELECT … WHERE {{ … }} {} n }}",
+                        kl.to_ascii_uppercase(), kl.to_ascii_uppercase()
+                    )));
+                }
+
                 // Nested group graph pattern
                 Token::LBrace => {
                     let inner = self.parse_group_graph_pattern()?;
@@ -770,7 +787,10 @@ impl<'a> Parser<'a> {
                 Token::Kw(k) => {
                     let kl = k.to_ascii_lowercase();
                     if matches!(kl.as_str(), "optional" | "union" | "filter" | "bind"
-                        | "values" | "graph" | "select") { break; }
+                        | "values" | "graph" | "select"
+                        // Solution modifiers — not valid inside a WHERE clause.
+                        // Stop here so they are not silently consumed as a subject term.
+                        | "limit" | "offset" | "order" | "group" | "having") { break; }
                 }
                 _ => {}
             }

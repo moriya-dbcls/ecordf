@@ -1,7 +1,7 @@
 //! Execution plan types — the output of the query optimizer.
 
 use crate::triple::{TriplePattern};
-use super::ast::{Expression, ValuesClause, TriplePatternAst, Term, PropertyPath};
+use super::ast::{Expression, SelectQuery, ValuesClause, TriplePatternAst, Term, PropertyPath};
 
 /// A physical execution plan node.
 #[derive(Debug, Clone)]
@@ -37,4 +37,7 @@ pub enum ExecutionPlan {
     /// GRAPH clause — execute inner plan restricted to a named graph.
     /// `graph` is either a concrete IRI (Term::Iri) or a variable (Term::Variable).
     NamedGraph { graph: Term, inner: Box<ExecutionPlan> },
+    /// { SELECT … } subquery — executed as a self-contained unit with its own
+    /// DISTINCT / GROUP BY / ORDER BY / LIMIT before being joined with the outer query.
+    Subquery(Box<SelectQuery>),
 }

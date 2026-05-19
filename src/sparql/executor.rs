@@ -231,7 +231,14 @@ impl<'a> Executor<'a> {
             });
         }
 
-        // 6. OFFSET + LIMIT
+        // 6. Apply DISTINCT before LIMIT (SPARQL 1.1 §18.2.5: DISTINCT/REDUCED are applied
+        //    before slicing with OFFSET/LIMIT — doing it after would give wrong row counts).
+        if query.distinct {
+            bindings.rows.sort_unstable();
+            bindings.rows.dedup();
+        }
+
+        // 7. OFFSET + LIMIT
         if let Some(off) = query.offset {
             if off as usize >= bindings.rows.len() {
                 bindings.rows.clear();
@@ -241,11 +248,6 @@ impl<'a> Executor<'a> {
         }
         if let Some(lim) = query.limit {
             bindings.rows.truncate(lim as usize);
-        }
-
-        // 7. Apply DISTINCT
-        if query.distinct {
-            bindings.rows.dedup();
         }
 
         // 8. Project output variables
@@ -284,9 +286,36 @@ impl<'a> Executor<'a> {
             ExecutionPlan::Join(left, right) => {
                 let left_rs = self.execute_plan_with_ctx(left, outer);
                 if left_rs.overflow { return left_rs; }
-                // Bind-join: if left side is small, probe right index for each left row
-                // instead of materializing the entire right side first.
-                // Threshold: 10_000 rows → nested-loop; above that → hash join.
+
+                // Subqueries are self-contained: they ignore the outer binding and always
+                // return the same rows.  Using bind_join would re-execute the subquery for
+                // every left row and produce a cross-product (shared variables are never
+                // substituted into the subquery).  Instead, execute once and hash_join.
+                if matches!(right.as_ref(), ExecutionPlan::Subquery(_)) {
+                    let right_rs = self.execute_plan_with_ctx(right, outer);
+                    if right_rs.overflow { return right_rs; }
+                    return self.hash_join(left_rs, right_rs);
+                }
+
+                // If the right plan contains ScanAsts that reference variables produced
+                // by the left side, bind_join MUST be used regardless of left size.
+                //
+                // Without this, when left > 10K rows we'd fall back to hash_join, which
+                // executes the right plan with an empty outer context.  Any ScanAst whose
+                // subject/predicate/object is one of the left variables would then become
+                // an unconstrained full scan.  For example:
+                //   left produces ?child, ?parent
+                //   right has  ?child up:mnemonic ?child_label
+                //              ?parent rdfs:label  ?parent_label
+                // Without binding, both ScanAsts do full scans and cross-join → OOM.
+                //
+                // Bind-join probes the right index once per left row using the bound
+                // values as constants, so it is always cheaper when right depends on left.
+                if plan_needs_outer_binding(right, &left_rs.variables) {
+                    return self.bind_join(left_rs, right, outer);
+                }
+
+                // Right side is independent of left variables → hash_join is fine.
                 const BIND_JOIN_THRESHOLD: usize = 10_000;
                 if left_rs.rows.len() <= BIND_JOIN_THRESHOLD {
                     return self.bind_join(left_rs, right, outer);
@@ -364,6 +393,13 @@ impl<'a> Executor<'a> {
                 let s_term = self.substitute_term(s, outer);
                 let o_term = self.substitute_term(o, outer);
                 self.execute_path_pattern(&s_term, path, &o_term)
+            }
+            ExecutionPlan::Subquery(sq) => {
+                // Execute the subquery as a fully self-contained SELECT:
+                // its DISTINCT / GROUP BY / ORDER BY / LIMIT are applied before
+                // the result is handed back to the outer query as a plain ResultSet.
+                // This is the correct SPARQL 1.1 semantics for { SELECT … } subqueries.
+                self.execute_select(sq)
             }
             ExecutionPlan::NamedGraph { graph, inner } => {
                 self.execute_named_graph(graph, inner)
@@ -817,14 +853,29 @@ impl<'a> Executor<'a> {
                         row[oi] = *left_row.get(li).unwrap_or(&None);
                     }
                 }
-                // Fill from right (non-overlapping)
+                // Fill from right — and check consistency on shared variables.
+                //
+                // Normally, ScanAst-based right plans substitute bound variables as
+                // constants (targeted index probes), so they can only return rows that
+                // already agree with the left row.  But for plans that ignore the outer
+                // binding (e.g. Subquery, Values), the right side may return rows with
+                // conflicting values for shared variables.  We must skip those rows to
+                // maintain correct inner-join semantics.
+                let mut consistent = true;
                 for (ri, rv) in right_rs.variables.iter().enumerate() {
                     if let Some(oi) = result.variable_index(rv) {
-                        if row[oi].is_none() {
-                            row[oi] = *right_row.get(ri).unwrap_or(&None);
+                        let right_val = *right_row.get(ri).unwrap_or(&None);
+                        match (row[oi], right_val) {
+                            // Conflict: both sides have different concrete values → skip row
+                            (Some(l), Some(r)) if l != r => { consistent = false; break; }
+                            // Right fills an empty slot
+                            (None, rv) => { row[oi] = rv; }
+                            // Both None, or both same value → no-op
+                            _ => {}
                         }
                     }
                 }
+                if !consistent { continue; }
                 result.rows.push(row);
                 if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
                     tracing::warn!(
@@ -1502,6 +1553,23 @@ impl<'a> Executor<'a> {
                 self.collect_plan_vars(i, out);
             }
             ExecutionPlan::NamedGraph { inner, .. } => self.collect_plan_vars(inner, out),
+            ExecutionPlan::Subquery(sq) => {
+                // Only the variables the subquery *exposes* via SELECT are visible outside.
+                match &sq.projection {
+                    Projection::Wildcard => self.collect_plan_vars(
+                        &optimize_bgp(&sq.pattern, self.index), out
+                    ),
+                    Projection::Variables(items) => {
+                        for item in items {
+                            let v = match item {
+                                SelectItem::Variable(v) => v.clone(),
+                                SelectItem::Alias(_, name) => name.clone(),
+                            };
+                            if !out.contains(&v) { out.push(v); }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1854,17 +1922,46 @@ fn optimize_bgp_with_bound(pattern: &GraphPattern, index: &TripleIndex, bound: &
             }
             optimize_triple_patterns(triples, index, bound)
         }
-        GraphPattern::Join(left, right) => {
-            // Variables produced by the left side become "bound" for the right side.
-            // This is especially important for: Join(Values(?s={...}), Bgp(?s ?p ?o ...))
-            // where ?s is bound by VALUES and should be treated as a constant in the BGP.
-            let left_vars = pattern_bound_vars(left);
-            let mut right_bound = bound.clone();
-            right_bound.extend(left_vars);
+        GraphPattern::Join(_, _) => {
+            // Flatten the entire left-deep Join sequence into a flat list of patterns,
+            // then reorder so that self-contained patterns (Subquery, Values) come first.
+            //
+            // Example: Join(Join(BGP1, Subquery), BGP2)
+            //   Flattened: [BGP1, Subquery, BGP2]
+            //   Hoisted:   [Subquery, BGP1, BGP2]
+            //   Plan tree: Join(Join(Subquery, BGP1_with_?parent_bound), BGP2_with_all_bound)
+            //
+            // Without hoisting, Subquery ends up on the right side of a large left result
+            // and the executor falls back to hash_join, executing right patterns with an
+            // empty outer context → unconstrained full scans → cross-products / OOM.
+            let mut flat: Vec<&GraphPattern> = Vec::new();
+            collect_join_patterns(pattern, &mut flat);
 
-            let lp = optimize_bgp_with_bound(left, index, bound);
-            let rp = optimize_bgp_with_bound(right, index, &right_bound);
-            ExecutionPlan::Join(Box::new(lp), Box::new(rp))
+            // Self-contained patterns first (they provide binding to subsequent patterns).
+            let mut ordered: Vec<&GraphPattern> = Vec::new();
+            for p in &flat {
+                if matches!(p, GraphPattern::Subquery(_) | GraphPattern::Values(_)) {
+                    ordered.push(p);
+                }
+            }
+            for p in &flat {
+                if !matches!(p, GraphPattern::Subquery(_) | GraphPattern::Values(_)) {
+                    ordered.push(p);
+                }
+            }
+
+            // Build optimized plans left-to-right, growing the bound-variable set.
+            let mut current_bound = bound.clone();
+            let mut plans: Vec<ExecutionPlan> = Vec::with_capacity(ordered.len());
+            for p in ordered {
+                plans.push(optimize_bgp_with_bound(p, index, &current_bound));
+                current_bound.extend(pattern_bound_vars(p));
+            }
+
+            // Fold into a left-deep Join tree.
+            plans.into_iter()
+                .reduce(|acc, p| ExecutionPlan::Join(Box::new(acc), Box::new(p)))
+                .unwrap_or(ExecutionPlan::Empty)
         }
         GraphPattern::Optional(main, opt) => {
             let main_vars = pattern_bound_vars(main);
@@ -1892,7 +1989,11 @@ fn optimize_bgp_with_bound(pattern: &GraphPattern, index: &TripleIndex, bound: &
             ExecutionPlan::Values(vc.clone())
         }
         GraphPattern::Subquery(sq) => {
-            optimize_bgp_with_bound(&sq.pattern, index, bound)
+            // A subquery is a self-contained SELECT that must be executed as a unit:
+            // its own SELECT projection, DISTINCT, GROUP BY, ORDER BY, LIMIT/OFFSET are
+            // all applied *inside* the subquery before its results join with the outer query.
+            // We do NOT recurse into sq.pattern here — the Executor will call execute_select.
+            ExecutionPlan::Subquery(sq.clone())
         }
         GraphPattern::Graph(graph_term, inner) => {
             let inner_plan = optimize_bgp_with_bound(inner, index, bound);
@@ -1959,6 +2060,54 @@ fn optimize_triple_patterns(triples: &[TriplePatternAst], index: &TripleIndex, i
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Flatten a left-deep `GraphPattern::Join` tree into a flat list of leaf patterns.
+/// Non-Join nodes (BGP, Subquery, Values, Optional, Union, …) are leaves.
+fn collect_join_patterns<'a>(pattern: &'a GraphPattern, out: &mut Vec<&'a GraphPattern>) {
+    match pattern {
+        GraphPattern::Join(left, right) => {
+            collect_join_patterns(left, out);
+            collect_join_patterns(right, out);
+        }
+        p => out.push(p),
+    }
+}
+
+/// Returns true if `plan` contains at least one ScanAst node whose subject,
+/// predicate, or object is a variable that appears in `left_vars`.
+///
+/// This is used to decide between bind_join and hash_join:
+/// - If true  → bind_join: the right plan benefits from having those variables
+///              substituted as constants (targeted index probes).
+/// - If false → hash_join: the right plan is independent of the left output and
+///              can be executed fully materialised.
+///
+/// Without this check, a large left side (> 10K rows) would force hash_join,
+/// which runs the right plan with an empty outer context.  Any ScanAst that
+/// references a left variable would then become an unconstrained full scan,
+/// causing cross-products and OOM.
+fn plan_needs_outer_binding(plan: &ExecutionPlan, left_vars: &[String]) -> bool {
+    match plan {
+        ExecutionPlan::ScanAst(p) => {
+            let has_var = |t: &Term| -> bool {
+                if let Term::Variable(v) = t { left_vars.contains(v) } else { false }
+            };
+            has_var(&p.s) || has_var(&p.p) || has_var(&p.o)
+        }
+        ExecutionPlan::Join(l, r)
+        | ExecutionPlan::Optional(l, r)
+        | ExecutionPlan::Union(l, r) => {
+            plan_needs_outer_binding(l, left_vars) || plan_needs_outer_binding(r, left_vars)
+        }
+        ExecutionPlan::Filter(inner, _) | ExecutionPlan::Extend(inner, _, _) => {
+            plan_needs_outer_binding(inner, left_vars)
+        }
+        ExecutionPlan::NamedGraph { inner, .. } => plan_needs_outer_binding(inner, left_vars),
+        // Subquery and Values are self-contained — they never look at left_vars.
+        ExecutionPlan::Subquery(_) | ExecutionPlan::Values(_) => false,
+        _ => false,
+    }
+}
 
 fn row_to_binding(variables: &[String], row: &[Option<TermId>]) -> Binding {
     let mut b = HashMap::new();
