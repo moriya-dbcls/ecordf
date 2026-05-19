@@ -103,6 +103,13 @@ impl Store {
     pub fn query_to_table(&self, sparql: &str) -> Result<Vec<Vec<String>>, QueryError> {
         match self.query(sparql)? {
             QueryResult::Select(rs) => {
+                if rs.overflow {
+                    return Err(QueryError::Unsupported(format!(
+                        "Query result exceeded memory limit ({} rows). \
+                         Add LIMIT / tighter FILTER to reduce result size.",
+                        rs.rows.len()
+                    )));
+                }
                 let mut rows = Vec::new();
                 // Header
                 rows.push(rs.variables.clone());

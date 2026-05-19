@@ -35,6 +35,18 @@ use crate::triple::{TermId, TriplePattern, UNBOUND};
 use super::ast::*;
 use super::plan::ExecutionPlan;
 
+// ── Safety limits ─────────────────────────────────────────────────────────────
+
+/// Maximum number of rows any intermediate result set may hold.
+///
+/// When a join would push a result past this threshold the join is cut short,
+/// a warning is logged, and the (truncated) result is returned.  This prevents
+/// pathological queries (e.g. unconstrained joins over large datasets) from
+/// exhausting RAM and causing the process to be OOM-killed.
+///
+/// 5 million rows × ~40 bytes ≈ 200 MB — a safe ceiling for most servers.
+const MAX_INTERMEDIATE_ROWS: usize = 5_000_000;
+
 // ── Result types ──────────────────────────────────────────────────────────────
 
 /// A single row of query results: variable name → term ID.
@@ -45,16 +57,18 @@ pub struct ResultSet {
     pub variables: Vec<String>,
     /// Row-major: rows[i][j] = value of variable j in row i.
     pub rows: Vec<Vec<Option<TermId>>>,
+    /// Set to true when the result was truncated due to MAX_INTERMEDIATE_ROWS.
+    pub overflow: bool,
 }
 
 impl ResultSet {
     pub fn empty(variables: Vec<String>) -> Self {
-        Self { variables, rows: Vec::new() }
+        Self { variables, rows: Vec::new(), overflow: false }
     }
 
     pub fn one_empty_row(variables: Vec<String>) -> Self {
         let n = variables.len();
-        Self { variables, rows: vec![vec![None; n]] }
+        Self { variables, rows: vec![vec![None; n]], overflow: false }
     }
 
     pub fn variable_index(&self, name: &str) -> Option<usize> {
@@ -177,6 +191,12 @@ impl<'a> Executor<'a> {
         // 2. Execute
         let mut bindings = self.execute_plan(&plan);
 
+        // Short-circuit: if execution was truncated, return immediately with the
+        // overflow flag set so the caller can return an error to the client.
+        if bindings.overflow {
+            return bindings;
+        }
+
         // 3. Apply GROUP BY + aggregates if present
         if !query.group_by.is_empty() {
             bindings = self.apply_group_by(&bindings, query);
@@ -240,43 +260,84 @@ impl<'a> Executor<'a> {
 
     // ── Pattern execution ─────────────────────────────────────────────────────
 
+    /// Execute a plan with no outer binding context.
     fn execute_plan(&self, plan: &ExecutionPlan) -> ResultSet {
+        self.execute_plan_with_ctx(plan, &HashMap::new())
+    }
+
+    /// Execute a plan, substituting any variables present in `outer` as constants.
+    ///
+    /// This is the key to bind-join (also called "index nested-loop join"):
+    /// when the left side of a join is small, we re-execute the right plan for
+    /// each left-side row with its variable bindings substituted as constants.
+    /// This turns a full table scan into a targeted index probe.
+    ///
+    /// Example: VALUES ?s { <Q9NYF8> } followed by ?s ?p ?o
+    ///   Without ctx: full scan of all triples → millions of rows in RAM
+    ///   With ctx {?s: <Q9NYF8>}: index probe (S=Q9NYF8, P=*, O=*) → ~50 rows
+    fn execute_plan_with_ctx(&self, plan: &ExecutionPlan, outer: &Binding) -> ResultSet {
         match plan {
             ExecutionPlan::Empty => ResultSet::one_empty_row(Vec::new()),
             ExecutionPlan::Scan { pattern, variables } => {
                 self.execute_scan(pattern, variables)
             }
             ExecutionPlan::Join(left, right) => {
-                let left_rs = self.execute_plan(left);
-                let right_rs = self.execute_plan(right);
+                let left_rs = self.execute_plan_with_ctx(left, outer);
+                if left_rs.overflow { return left_rs; }
+                // Bind-join: if left side is small, probe right index for each left row
+                // instead of materializing the entire right side first.
+                // Threshold: 10_000 rows → nested-loop; above that → hash join.
+                const BIND_JOIN_THRESHOLD: usize = 10_000;
+                if left_rs.rows.len() <= BIND_JOIN_THRESHOLD {
+                    return self.bind_join(left_rs, right, outer);
+                }
+                let right_rs = self.execute_plan_with_ctx(right, outer);
+                if right_rs.overflow { return right_rs; }
                 self.hash_join(left_rs, right_rs)
             }
             ExecutionPlan::LeapfrogJoin { patterns } => {
                 self.execute_leapfrog_join(patterns)
             }
             ExecutionPlan::Optional(main, opt) => {
-                let main_rs = self.execute_plan(main);
-                let opt_rs = self.execute_plan(opt);
+                let main_rs = self.execute_plan_with_ctx(main, outer);
+                if main_rs.overflow { return main_rs; }
+                const BIND_JOIN_THRESHOLD: usize = 10_000;
+                if main_rs.rows.len() <= BIND_JOIN_THRESHOLD {
+                    // bind_left_join: probe opt per main row, directly building
+                    // the LEFT JOIN result.  This avoids the duplicate-probe bug
+                    // that the old "collect combined + left_join" approach had:
+                    // when two main rows share the same ?o value, the old code
+                    // inserted opt rows twice into combined, causing left_join to
+                    // produce 2× too many output rows (and eventually OOM).
+                    return self.bind_left_join(main_rs, opt, outer);
+                }
+                let opt_rs = self.execute_plan_with_ctx(opt, outer);
+                if opt_rs.overflow { return opt_rs; }
                 self.left_join(main_rs, opt_rs)
             }
             ExecutionPlan::Union(left, right) => {
-                let mut left_rs = self.execute_plan(left);
-                let right_rs = self.execute_plan(right);
+                let mut left_rs = self.execute_plan_with_ctx(left, outer);
+                if left_rs.overflow { return left_rs; }
+                let right_rs = self.execute_plan_with_ctx(right, outer);
+                // Propagate overflow from right branch
+                let right_overflow = right_rs.overflow;
+                let right_vars = right_rs.variables.clone();
                 // Merge columns
                 for row in right_rs.rows {
                     // Re-align row to left_rs.variables
                     let mut new_row = vec![None; left_rs.variables.len()];
-                    for (j, var) in right_rs.variables.iter().enumerate() {
+                    for (j, var) in right_vars.iter().enumerate() {
                         if let Some(i) = left_rs.variable_index(var) {
                             new_row[i] = row.get(j).copied().flatten();
                         }
                     }
                     left_rs.rows.push(new_row);
                 }
+                if right_overflow { left_rs.overflow = true; }
                 left_rs
             }
             ExecutionPlan::Filter(inner, expr) => {
-                let mut rs = self.execute_plan(inner);
+                let mut rs = self.execute_plan_with_ctx(inner, outer);
                 let vars = rs.variables.clone();
                 rs.rows.retain(|row| {
                     let b = row_to_binding(&vars, row);
@@ -285,7 +346,7 @@ impl<'a> Executor<'a> {
                 rs
             }
             ExecutionPlan::Extend(inner, expr, var) => {
-                let mut rs = self.execute_plan(inner);
+                let mut rs = self.execute_plan_with_ctx(inner, outer);
                 rs.variables.push(var.clone());
                 let vars = rs.variables[..rs.variables.len()-1].to_vec();
                 for row in &mut rs.rows {
@@ -299,33 +360,50 @@ impl<'a> Executor<'a> {
                 self.execute_values(vc)
             }
             ExecutionPlan::PathPattern { s, path, o } => {
-                self.execute_path_pattern(s, path, o)
+                // Substitute outer bindings into path endpoints
+                let s_term = self.substitute_term(s, outer);
+                let o_term = self.substitute_term(o, outer);
+                self.execute_path_pattern(&s_term, path, &o_term)
             }
             ExecutionPlan::NamedGraph { graph, inner } => {
                 self.execute_named_graph(graph, inner)
             }
-            // ScanAst: encode AST-level triple pattern into dictionary IDs at runtime,
-            // then execute as a normal index scan.
+            // ScanAst: encode AST-level triple pattern into dictionary IDs at runtime.
             //
             // KEY CORRECTNESS RULE: if a *constant* term (IRI / literal) is not in the
             // dictionary, no triple can possibly match → return empty immediately.
             // Using UNBOUND as a fallback would turn the constant into a wildcard and
             // return spurious results (e.g. all objects when the predicate is unknown).
+            //
+            // BIND-JOIN RULE: if a Variable is bound in `outer`, treat it as a constant
+            // (targeted index probe instead of full scan).
             ExecutionPlan::ScanAst(ast_pat) => {
-                // Collect variable→position mappings (needed for the result set schema)
+                // Collect variable→position mappings for variables NOT bound in outer
                 let mut variables: Vec<(String, u8)> = Vec::new();
-                if let Term::Variable(v) = &ast_pat.s { variables.push((v.clone(), 0)); }
-                if let Term::Variable(v) = &ast_pat.p { variables.push((v.clone(), 1)); }
-                if let Term::Variable(v) = &ast_pat.o { variables.push((v.clone(), 2)); }
+                if let Term::Variable(v) = &ast_pat.s {
+                    if !outer.contains_key(v.as_str()) { variables.push((v.clone(), 0)); }
+                }
+                if let Term::Variable(v) = &ast_pat.p {
+                    if !outer.contains_key(v.as_str()) { variables.push((v.clone(), 1)); }
+                }
+                if let Term::Variable(v) = &ast_pat.o {
+                    if !outer.contains_key(v.as_str()) { variables.push((v.clone(), 2)); }
+                }
                 let var_names = || variables.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
 
                 // Encode one AST term to a TermId.
-                // Variables → UNBOUND (wildcard for index scan).
-                // Constants → dictionary ID, or None if absent from the dictionary.
-                //   None means no triple can possibly satisfy this pattern → empty result.
+                // Variables bound in `outer` → their bound TermId (index probe, not scan).
+                // Unbound variables → UNBOUND (wildcard for index scan).
+                // Constants → dictionary ID, or None if absent (→ empty result).
                 let encode = |term: &Term| -> Option<TermId> {
                     match term {
-                        Term::Variable(_) => Some(UNBOUND),
+                        Term::Variable(v) => {
+                            if let Some(&id) = outer.get(v.as_str()) {
+                                Some(id) // bound from outer context → targeted probe
+                            } else {
+                                Some(UNBOUND) // free variable → wildcard
+                            }
+                        }
                         Term::Iri(iri) => self.dict.lookup(iri.as_str()),
                         Term::Literal(lit) => self.dict.lookup(&lit.to_ntriples()),
                         Term::BlankNode(b) => self.dict.lookup(b.as_str()),
@@ -337,7 +415,43 @@ impl<'a> Executor<'a> {
                 let o_id = match encode(&ast_pat.o) { Some(id) => id, None => return ResultSet::empty(var_names()) };
 
                 let pattern = TriplePattern::new(s_id, p_id, o_id);
-                self.execute_scan(&pattern, &variables)
+                let scan_rs = self.execute_scan(&pattern, &variables);
+
+                // If outer has variables that were substituted as constants, we must
+                // re-inject them into each result row so that subsequent joins can
+                // match on them.  (The scan result only has the *unbound* variables.)
+                if outer.is_empty() {
+                    scan_rs
+                } else {
+                    // Build a combined result that includes both outer-bound vars and
+                    // newly scanned vars.
+                    let mut all_vars = scan_rs.variables.clone();
+                    let mut outer_additions: Vec<(String, TermId)> = Vec::new();
+                    for (var, &id) in outer.iter() {
+                        // Only include vars that belong to THIS pattern (s/p/o)
+                        let in_pat =
+                            matches!(&ast_pat.s, Term::Variable(v) if v == var) ||
+                            matches!(&ast_pat.p, Term::Variable(v) if v == var) ||
+                            matches!(&ast_pat.o, Term::Variable(v) if v == var);
+                        if in_pat && !all_vars.contains(var) {
+                            all_vars.push(var.clone());
+                            outer_additions.push((var.clone(), id));
+                        }
+                    }
+                    if outer_additions.is_empty() {
+                        scan_rs
+                    } else {
+                        let mut out = ResultSet::empty(all_vars);
+                        out.overflow = scan_rs.overflow;
+                        for mut row in scan_rs.rows {
+                            for (_, id) in &outer_additions {
+                                row.push(Some(*id));
+                            }
+                            out.rows.push(row);
+                        }
+                        out
+                    }
+                }
             }
         }
     }
@@ -519,6 +633,14 @@ impl<'a> Executor<'a> {
                         }
                     }
                     result.rows.push(row);
+                    if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
+                        tracing::warn!(
+                            rows = result.rows.len(),
+                            "leapfrog_join: intermediate result exceeded limit, truncating"
+                        );
+                        result.overflow = true;
+                        return result;
+                    }
                 }
             }
             return result;
@@ -553,6 +675,14 @@ impl<'a> Executor<'a> {
                         }
                     }
                     result.rows.push(row);
+                    if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
+                        tracing::warn!(
+                            rows = result.rows.len(),
+                            "hash_join: intermediate result exceeded limit, truncating"
+                        );
+                        result.overflow = true;
+                        return result;
+                    }
                 }
             }
         }
@@ -599,6 +729,14 @@ impl<'a> Executor<'a> {
                     }
                     result.rows.push(row);
                     matched = true;
+                    if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
+                        tracing::warn!(
+                            rows = result.rows.len(),
+                            "left_join: intermediate result exceeded limit, truncating"
+                        );
+                        result.overflow = true;
+                        return result;
+                    }
                 }
             }
 
@@ -609,6 +747,196 @@ impl<'a> Executor<'a> {
                     if let Some(oi) = result.variable_index(lv) { row[oi] = lr[li]; }
                 }
                 result.rows.push(row);
+                if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
+                    tracing::warn!(
+                        rows = result.rows.len(),
+                        "left_join: intermediate result exceeded limit, truncating"
+                    );
+                    result.overflow = true;
+                    return result;
+                }
+            }
+        }
+        result
+    }
+
+    // ── Bind-join (index nested-loop join) ────────────────────────────────────
+
+    /// For each row in `left`, re-execute `right_plan` with variables from that
+    /// row substituted as constants (targeted index probes).  Then hash-join the
+    /// partial right result with the single left row.
+    ///
+    /// This is O(|left| × probe_cost) vs hash_join's O(|left| + |right|), so it
+    /// is dramatically better when |right| is large but the probe produces few rows.
+    fn bind_join(&self, left: ResultSet, right_plan: &ExecutionPlan, outer: &Binding) -> ResultSet {
+        // Determine output variable set (union of left and right, discovered lazily)
+        let mut out_vars: Vec<String> = left.variables.clone();
+        let mut result = ResultSet::empty(out_vars.clone()); // will be grown below
+
+        for left_row in &left.rows {
+            // Build a binding from this left row + outer context
+            let mut row_binding = outer.clone();
+            for (i, var) in left.variables.iter().enumerate() {
+                if let Some(Some(id)) = left_row.get(i) {
+                    row_binding.insert(var.clone(), *id);
+                }
+            }
+
+            // Execute right plan with this row's bindings substituted
+            let right_rs = self.execute_plan_with_ctx(right_plan, &row_binding);
+            // Note: even if right_rs overflowed, we still process its partial rows
+            // before returning, so the error message shows a meaningful row count.
+            let right_overflow = right_rs.overflow;
+
+            // Merge output variable schema on first non-empty right result
+            for rv in &right_rs.variables {
+                if !out_vars.contains(rv) {
+                    out_vars.push(rv.clone());
+                }
+            }
+            // Grow result schema if needed
+            if result.variables.len() < out_vars.len() {
+                result.variables = out_vars.clone();
+                // Pad existing rows
+                let new_len = out_vars.len();
+                for row in &mut result.rows {
+                    row.resize(new_len, None);
+                }
+            }
+
+            let out_len = result.variables.len();
+            if right_rs.rows.is_empty() {
+                // No match for this left row → skip (inner join semantics)
+                continue;
+            }
+            for right_row in &right_rs.rows {
+                let mut row = vec![None; out_len];
+                // Fill from left
+                for (li, lv) in left.variables.iter().enumerate() {
+                    if let Some(oi) = result.variable_index(lv) {
+                        row[oi] = *left_row.get(li).unwrap_or(&None);
+                    }
+                }
+                // Fill from right (non-overlapping)
+                for (ri, rv) in right_rs.variables.iter().enumerate() {
+                    if let Some(oi) = result.variable_index(rv) {
+                        if row[oi].is_none() {
+                            row[oi] = *right_row.get(ri).unwrap_or(&None);
+                        }
+                    }
+                }
+                result.rows.push(row);
+                if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
+                    tracing::warn!(
+                        rows = result.rows.len(),
+                        "bind_join: intermediate result exceeded limit, truncating"
+                    );
+                    result.overflow = true;
+                    return result;
+                }
+            }
+            if right_overflow {
+                result.overflow = true;
+                return result;
+            }
+        }
+        result
+    }
+
+    /// Substitute a Term: if it's a Variable bound in `outer`, return an Iri term
+    /// with the decoded string.  Used for path pattern endpoints in bind-join context.
+    fn substitute_term(&self, term: &Term, outer: &Binding) -> Term {
+        match term {
+            Term::Variable(v) => {
+                if let Some(&id) = outer.get(v.as_str()) {
+                    let s = self.dict.decode(id);
+                    if s.starts_with('"') {
+                        Term::Literal(Literal::plain(s))
+                    } else {
+                        Term::Iri(s)
+                    }
+                } else {
+                    term.clone()
+                }
+            }
+            _ => term.clone(),
+        }
+    }
+
+    // ── bind_left_join (OPTIONAL nested-loop) ─────────────────────────────────
+
+    /// LEFT OUTER JOIN via index probing: for each main row, execute opt_plan
+    /// with that row's variables substituted as constants, then directly produce
+    /// the LEFT JOIN output (no intermediate flat table, no duplicate-probe issue).
+    fn bind_left_join(&self, main: ResultSet, opt_plan: &ExecutionPlan, outer: &Binding) -> ResultSet {
+        let mut out_vars = main.variables.clone();
+        let mut result = ResultSet::empty(out_vars.clone());
+        result.overflow = main.overflow;
+
+        for left_row in &main.rows {
+            // Build binding for this main row
+            let b = row_to_binding(&main.variables, left_row);
+            let mut row_binding = outer.clone();
+            row_binding.extend(b.iter().map(|(k, v)| (k.clone(), *v)));
+
+            // Probe the optional side
+            let partial = self.execute_plan_with_ctx(opt_plan, &row_binding);
+            // Note: overflow in opt is non-fatal for OPTIONAL — we treat it as
+            // "no match" for this row rather than aborting the entire query.
+            // The partial results we already have are still correct.
+
+            // Expand output schema if opt introduces new variables
+            for rv in &partial.variables {
+                if !out_vars.contains(rv) {
+                    out_vars.push(rv.clone());
+                }
+            }
+            if result.variables.len() < out_vars.len() {
+                result.variables = out_vars.clone();
+                let new_len = result.variables.len();
+                for row in &mut result.rows {
+                    row.resize(new_len, None);
+                }
+            }
+
+            let out_len = result.variables.len();
+
+            if partial.rows.is_empty() {
+                // No opt match → keep main row, NULLs for opt-only variables
+                let mut row = vec![None; out_len];
+                for (li, lv) in main.variables.iter().enumerate() {
+                    if let Some(oi) = result.variable_index(lv) {
+                        row[oi] = *left_row.get(li).unwrap_or(&None);
+                    }
+                }
+                result.rows.push(row);
+            } else {
+                // Opt matched → one output row per opt result
+                for opt_row in &partial.rows {
+                    let mut row = vec![None; out_len];
+                    for (li, lv) in main.variables.iter().enumerate() {
+                        if let Some(oi) = result.variable_index(lv) {
+                            row[oi] = *left_row.get(li).unwrap_or(&None);
+                        }
+                    }
+                    for (ri, rv) in partial.variables.iter().enumerate() {
+                        if let Some(oi) = result.variable_index(rv) {
+                            if row[oi].is_none() {
+                                row[oi] = *opt_row.get(ri).unwrap_or(&None);
+                            }
+                        }
+                    }
+                    result.rows.push(row);
+                }
+            }
+
+            if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
+                tracing::warn!(
+                    rows = result.rows.len(),
+                    "bind_left_join: intermediate result exceeded limit, truncating"
+                );
+                result.overflow = true;
+                return result;
             }
         }
         result
@@ -645,6 +973,7 @@ impl<'a> Executor<'a> {
         }
 
         let mut result = ResultSet::empty(out_vars.clone());
+        result.overflow = rs.overflow; // propagate truncation flag
 
         for (key, group_rows) in groups {
             let mut row = vec![None; out_vars.len()];
@@ -1447,6 +1776,7 @@ impl<'a> Executor<'a> {
                     SelectItem::Alias(_, name) => name.clone(),
                 }).collect();
                 let mut out_rs = ResultSet::empty(out_vars.clone());
+                out_rs.overflow = rs.overflow; // propagate truncation flag
                 for row in &rs.rows {
                     let b = row_to_binding(&rs.variables, row);
                     let out_row: Vec<Option<TermId>> = items.iter().map(|item| match item {
@@ -1476,48 +1806,96 @@ impl<'a> Executor<'a> {
 /// Analyze a graph pattern and produce an optimized execution plan.
 /// The key innovation vs Virtuoso: we use histogram-based cardinality estimation
 /// to pick the best join order, dramatically reducing intermediate result sizes.
+/// Collect the set of variables that a pattern will bind (output variables).
+fn pattern_bound_vars(pattern: &GraphPattern) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    collect_pattern_vars(pattern, &mut vars);
+    vars
+}
+
+fn collect_pattern_vars(pattern: &GraphPattern, out: &mut HashSet<String>) {
+    match pattern {
+        GraphPattern::Bgp(triples) => {
+            for t in triples {
+                if let Term::Variable(v) = &t.s { out.insert(v.clone()); }
+                if let Term::Variable(v) = &t.p { out.insert(v.clone()); }
+                if let Term::Variable(v) = &t.o { out.insert(v.clone()); }
+            }
+        }
+        GraphPattern::Values(vc) => {
+            for v in &vc.variables { out.insert(v.clone()); }
+        }
+        GraphPattern::Join(a, b) | GraphPattern::Union(a, b) => {
+            collect_pattern_vars(a, out);
+            collect_pattern_vars(b, out);
+        }
+        GraphPattern::Optional(main, _) => collect_pattern_vars(main, out),
+        GraphPattern::Filter(inner, _)
+        | GraphPattern::Extend(inner, _, _)
+        | GraphPattern::Graph(_, inner) => collect_pattern_vars(inner, out),
+        GraphPattern::Subquery(sq) => collect_pattern_vars(&sq.pattern, out),
+        GraphPattern::PathPattern { s, o, .. } => {
+            if let Term::Variable(v) = s { out.insert(v.clone()); }
+            if let Term::Variable(v) = o { out.insert(v.clone()); }
+        }
+        GraphPattern::Empty => {}
+    }
+}
+
 pub fn optimize_bgp(pattern: &GraphPattern, index: &TripleIndex) -> ExecutionPlan {
+    optimize_bgp_with_bound(pattern, index, &HashSet::new())
+}
+
+fn optimize_bgp_with_bound(pattern: &GraphPattern, index: &TripleIndex, bound: &HashSet<String>) -> ExecutionPlan {
     match pattern {
         GraphPattern::Bgp(triples) => {
             if triples.is_empty() {
                 return ExecutionPlan::Empty;
             }
-            optimize_triple_patterns(triples, index)
+            optimize_triple_patterns(triples, index, bound)
         }
         GraphPattern::Join(left, right) => {
-            let lp = optimize_bgp(left, index);
-            let rp = optimize_bgp(right, index);
+            // Variables produced by the left side become "bound" for the right side.
+            // This is especially important for: Join(Values(?s={...}), Bgp(?s ?p ?o ...))
+            // where ?s is bound by VALUES and should be treated as a constant in the BGP.
+            let left_vars = pattern_bound_vars(left);
+            let mut right_bound = bound.clone();
+            right_bound.extend(left_vars);
+
+            let lp = optimize_bgp_with_bound(left, index, bound);
+            let rp = optimize_bgp_with_bound(right, index, &right_bound);
             ExecutionPlan::Join(Box::new(lp), Box::new(rp))
         }
         GraphPattern::Optional(main, opt) => {
-            let mp = optimize_bgp(main, index);
-            let op = optimize_bgp(opt, index);
+            let main_vars = pattern_bound_vars(main);
+            let mut opt_bound = bound.clone();
+            opt_bound.extend(main_vars);
+
+            let mp = optimize_bgp_with_bound(main, index, bound);
+            let op = optimize_bgp_with_bound(opt, index, &opt_bound);
             ExecutionPlan::Optional(Box::new(mp), Box::new(op))
         }
         GraphPattern::Union(a, b) => {
-            let ap = optimize_bgp(a, index);
-            let bp = optimize_bgp(b, index);
+            let ap = optimize_bgp_with_bound(a, index, bound);
+            let bp = optimize_bgp_with_bound(b, index, bound);
             ExecutionPlan::Union(Box::new(ap), Box::new(bp))
         }
         GraphPattern::Filter(inner, expr) => {
-            // Push filter as close to the data as possible
-            let ip = optimize_bgp(inner, index);
+            let ip = optimize_bgp_with_bound(inner, index, bound);
             ExecutionPlan::Filter(Box::new(ip), expr.clone())
         }
         GraphPattern::Extend(inner, expr, var) => {
-            let ip = optimize_bgp(inner, index);
+            let ip = optimize_bgp_with_bound(inner, index, bound);
             ExecutionPlan::Extend(Box::new(ip), expr.clone(), var.clone())
         }
         GraphPattern::Values(vc) => {
             ExecutionPlan::Values(vc.clone())
         }
         GraphPattern::Subquery(sq) => {
-            // Treat as opaque — will be executed recursively
-            let inner = optimize_bgp(&sq.pattern, index);
-            inner
+            optimize_bgp_with_bound(&sq.pattern, index, bound)
         }
         GraphPattern::Graph(graph_term, inner) => {
-            let inner_plan = optimize_bgp(inner, index);
+            let inner_plan = optimize_bgp_with_bound(inner, index, bound);
             ExecutionPlan::NamedGraph {
                 graph: graph_term.clone(),
                 inner: Box::new(inner_plan),
@@ -1530,21 +1908,48 @@ pub fn optimize_bgp(pattern: &GraphPattern, index: &TripleIndex) -> ExecutionPla
     }
 }
 
-fn optimize_triple_patterns(triples: &[TriplePatternAst], index: &TripleIndex) -> ExecutionPlan {
-    // We work at the AST level here; proper binding requires the dictionary.
-    // This is a structural optimizer — order by bound-count (most selective first).
-    // The runtime executor does leapfrog for patterns sharing variables.
+fn optimize_triple_patterns(triples: &[TriplePatternAst], index: &TripleIndex, initially_bound: &HashSet<String>) -> ExecutionPlan {
+    // Greedy join ordering: at each step pick the pattern with the most already-bound
+    // variables (constants + variables bound by previously selected patterns).
+    // This avoids cross products and pushes constrained patterns to the front.
+    //
+    // "bound" starts with the set coming from outer context (e.g. VALUES variables),
+    // then grows as each pattern contributes its output variables.
 
-    let mut ordered: Vec<&TriplePatternAst> = triples.iter().collect();
-    // Sort by number of bound components (descending = most selective first)
-    // In a real system, we'd use dictionary-encoded patterns + cardinality estimates.
-    ordered.sort_by_key(|t| {
-        let bc =
-            (matches!(t.s, Term::Variable(_)) as u8) +
-            (matches!(t.p, Term::Variable(_)) as u8) +
-            (matches!(t.o, Term::Variable(_)) as u8);
-        bc // ascending: fewer variables = more selective = first
-    });
+    let mut remaining: Vec<&TriplePatternAst> = triples.iter().collect();
+    let mut bound = initially_bound.clone();
+    let mut ordered: Vec<&TriplePatternAst> = Vec::with_capacity(triples.len());
+
+    while !remaining.is_empty() {
+        // Selectivity scoring — position matters:
+        //   Subject bound  → +8  (SPO index probe: retrieves a small set per subject)
+        //   Predicate bound→ +2  (POS index: useful but predicate fanout can be huge)
+        //   Object bound   → +1  (OSP index: useful for reverse lookups)
+        // This ensures ?s ?p ?o (subject bound) beats ?p rdf:type ?c (predicate bound)
+        // even when both have one bound position.
+        let best_idx = remaining.iter().enumerate()
+            .max_by_key(|(_, t)| {
+                let is_bound = |term: &Term| -> bool {
+                    match term {
+                        Term::Variable(v) => bound.contains(v.as_str()),
+                        _ => true, // IRI / literal constant
+                    }
+                };
+                let s = if is_bound(&t.s) { 8u16 } else { 0 };
+                let p = if is_bound(&t.p) { 2u16 } else { 0 };
+                let o = if is_bound(&t.o) { 1u16 } else { 0 };
+                s + p + o
+            })
+            .map(|(i, _)| i)
+            .unwrap();
+
+        let best = remaining.remove(best_idx);
+        // Add variables this pattern introduces to the bound set
+        if let Term::Variable(v) = &best.s { bound.insert(v.clone()); }
+        if let Term::Variable(v) = &best.p { bound.insert(v.clone()); }
+        if let Term::Variable(v) = &best.o { bound.insert(v.clone()); }
+        ordered.push(best);
+    }
 
     // Build a left-deep join tree
     let first = ExecutionPlan::ScanAst(ordered[0].clone());
@@ -1637,6 +2042,7 @@ impl ResultSet {
         Self {
             variables: self.variables.clone(),
             rows: self.rows.clone(),
+            overflow: self.overflow,
         }
     }
 }

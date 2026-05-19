@@ -190,7 +190,19 @@ async fn handle_post(
 fn execute_query(store: &Store, query: &str, format: &str) -> Response {
     match store.query(query) {
         Ok(result) => match &result {
-            QueryResult::Select(rs) => format_select(rs, store, format),
+            QueryResult::Select(rs) => {
+                if rs.overflow {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!(
+                            "Query result exceeded memory limit ({} rows). \
+                             Add LIMIT / tighter FILTER to reduce result size.",
+                            rs.rows.len()
+                        ),
+                    );
+                }
+                format_select(rs, store, format)
+            }
             QueryResult::Ask(b) => format_ask(*b, format),
         },
         Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
