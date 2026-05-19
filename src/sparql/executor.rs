@@ -738,6 +738,27 @@ impl<'a> Executor<'a> {
                 let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#decimal>", avg);
                 Some(self.dict.encode(&s))
             }
+            // SAMPLE(?x) — return the first non-null binding of ?x in the group.
+            Expression::Sample { expr, .. } => {
+                for row in rows {
+                    let b = row_to_binding(&rs.variables, row);
+                    if let Some(id) = self.eval_term(expr, &b) {
+                        return Some(id);
+                    }
+                }
+                None
+            }
+            // GROUP_CONCAT(?x; separator="...") — concatenate all values.
+            Expression::GroupConcat { expr, separator, .. } => {
+                let sep = separator.as_deref().unwrap_or(" ");
+                let parts: Vec<String> = rows.iter().filter_map(|row| {
+                    let b = row_to_binding(&rs.variables, row);
+                    self.eval_string(expr, &b)
+                }).collect();
+                if parts.is_empty() { return None; }
+                let joined = parts.join(sep);
+                Some(self.dict.encode(&format!("\"{}\"", joined)))
+            }
             _ => None,
         }
     }
@@ -1430,7 +1451,15 @@ impl<'a> Executor<'a> {
                     let b = row_to_binding(&rs.variables, row);
                     let out_row: Vec<Option<TermId>> = items.iter().map(|item| match item {
                         SelectItem::Variable(v) => b.get(v.as_str()).copied(),
-                        SelectItem::Alias(expr, _) => self.eval_term(expr, &b),
+                        SelectItem::Alias(expr, name) => {
+                            // Fast path: if GROUP BY already computed this alias and stored
+                            // it in the binding under its alias name (e.g. ?o_count from
+                            // COUNT(?o)), use that value directly.  Re-evaluating the
+                            // aggregate expression here would fail because the original
+                            // grouping variables (e.g. ?o) are no longer in the binding.
+                            b.get(name.as_str()).copied()
+                                .or_else(|| self.eval_term(expr, &b))
+                        }
                     }).collect();
                     out_rs.rows.push(out_row);
                 }
