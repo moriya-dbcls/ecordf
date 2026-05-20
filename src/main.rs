@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
-use ecordf::{Config, Store};
+use ecordf::{Config, InputSpec, Store};
 
 #[derive(Parser)]
 #[command(
@@ -45,21 +45,26 @@ enum Command {
         #[arg(short, long, default_value = "./ecordf-data")]
         dir: PathBuf,
 
-        /// Input RDF files (.nt, .nq, .nt.gz, .nq.gz).
+            /// Input RDF files (.nt, .nq, .nt.gz, .nq.gz).
         /// May be omitted when --from-file is used.
+        /// These files are loaded into the union graph (no named graph).
         #[arg(value_name = "FILE")]
         files: Vec<PathBuf>,
 
-        /// Read additional file paths from a text file.
+        /// Read file paths (and optional graph IRIs) from a text file.
         ///
-        /// One file path per line. Lines starting with '#' and blank lines
-        /// are ignored. Use '-' to read the list from stdin.
-        /// May be specified multiple times.
+        /// Format — one entry per line:
         ///
-        /// Example file contents:
-        ///   # UniProt release 2024_04
-        ///   /data/uniprot/uniprot_sprot.nt.gz
-        ///   /data/uniprot/uniprot_trembl.nt.gz
+        ///   # comment (ignored)
+        ///   /path/to/file.nt
+        ///   /path/to/file.nt.gz  <http://graph.example.com/uniprot>
+        ///   /path/to/file.nt.gz  http://graph.example.com/pdb
+        ///
+        /// Lines starting with '#' and blank lines are ignored.
+        /// The graph IRI (second token) may be given with or without <…>.
+        /// When omitted, the file is loaded into the union graph only.
+        ///
+        /// Use '-' to read from stdin. May be specified multiple times.
         #[arg(long, value_name = "LIST_FILE", action = clap::ArgAction::Append)]
         from_file: Vec<PathBuf>,
     },
@@ -112,15 +117,31 @@ enum Command {
 
 // ── Input file resolution ─────────────────────────────────────────────────────
 
-/// Combine direct file arguments with paths read from `--from-file` list files.
+/// Combine direct file arguments with entries read from `--from-file` list files.
 ///
-/// Each list file contains one file path per line; lines starting with `#`
-/// and blank lines are ignored.  The special path `-` reads from stdin.
+/// Returns a `Vec<InputSpec>` where each spec carries a file path and an
+/// optional named graph IRI.
+///
+/// **List file format** (one entry per line):
+/// ```text
+/// # comment — ignored
+/// /path/to/file.nt
+/// /path/to/file.nt.gz  <http://graph.example.com/uniprot>
+/// /path/to/file.nt.gz  http://graph.example.com/pdb
+/// ```
+/// The graph IRI (second whitespace-separated token) is optional; files
+/// without one are loaded into the union graph only.
+/// Angle brackets around the IRI are accepted but not required.
+///
+/// The special list path `-` reads from stdin.
 fn resolve_input_files(
     direct: Vec<PathBuf>,
     list_files: Vec<PathBuf>,
-) -> anyhow::Result<Vec<PathBuf>> {
-    let mut all = direct;
+) -> anyhow::Result<Vec<InputSpec>> {
+    // Direct positional arguments → union graph (no named graph)
+    let mut all: Vec<InputSpec> = direct.into_iter()
+        .map(InputSpec::plain)
+        .collect();
 
     for list_path in list_files {
         let content = if list_path == Path::new("-") {
@@ -137,7 +158,15 @@ fn resolve_input_files(
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            all.push(PathBuf::from(line));
+            // Split into at most two tokens: path and optional graph IRI
+            let mut tokens = line.splitn(2, |c: char| c.is_ascii_whitespace());
+            let path = PathBuf::from(tokens.next().unwrap());
+            let graph = tokens.next().map(|g| g.trim().to_string());
+
+            all.push(match graph {
+                Some(g) if !g.is_empty() => InputSpec::with_graph(path, g),
+                _                        => InputSpec::plain(path),
+            });
         }
     }
 
@@ -159,15 +188,14 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Build { dir, files, from_file } => {
-            let all_files = resolve_input_files(files, from_file)?;
-            if all_files.is_empty() {
+            let inputs = resolve_input_files(files, from_file)?;
+            if inputs.is_empty() {
                 anyhow::bail!(
                     "no input files specified.\n\
                      Pass files directly, or use --from-file <list> (or --from-file - to read from stdin)."
                 );
             }
-            let file_refs: Vec<&Path> = all_files.iter().map(|p| p.as_path()).collect();
-            let store = Store::load(&dir, &file_refs)?;
+            let store = Store::load_with_graphs(&dir, &inputs)?;
             let stats = store.stats();
             if stats.graph_count > 0 {
                 println!(

@@ -14,7 +14,7 @@ use std::time::Instant;
 use crate::config::Config;
 use crate::dict::Dictionary;
 use crate::index::{AllBuilders, TripleIndex};
-use crate::loader::load_files;
+use crate::loader::{load_files, load_files_with_graphs, InputSpec};
 use crate::sparql::{parse_query, Executor, ResultSet};
 use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
 use crate::stats::StoreStatistics;
@@ -73,6 +73,51 @@ impl Store {
         let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
 
         Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats })
+    }
+
+    /// Build a new store from RDF input files with optional per-file named graph assignment.
+    ///
+    /// Each [`InputSpec`] carries a file path and an optional graph IRI.
+    /// N-Triples files with a graph IRI are loaded into both the union graph and
+    /// the named graph (GSPO index).  N-Quads files ignore the graph field.
+    ///
+    /// Use this instead of [`Store::load`] when you need named graph support
+    /// without preparing N-Quads files.
+    pub fn load_with_graphs(dir: &Path, inputs: &[InputSpec]) -> io::Result<Self> {
+        fs::create_dir_all(dir)?;
+
+        let t0 = Instant::now();
+        eprintln!("=== EcoRDF: loading {} file(s) ===", inputs.len());
+
+        let dict = Dictionary::new();
+        let mut builders = AllBuilders::new();
+
+        let stats = load_files_with_graphs(inputs, &dict, &mut builders)?;
+
+        eprintln!(
+            "Parsed {} triples in {:.1}s. Sorting and writing indexes...",
+            stats.triples_loaded,
+            t0.elapsed().as_secs_f64()
+        );
+
+        let t1 = Instant::now();
+        let index = builders.build(dir)?;
+        dict.save(&dir.join("dict.bin"))?;
+
+        eprintln!(
+            "Indexes written in {:.1}s. Total load time: {:.1}s",
+            t1.elapsed().as_secs_f64(),
+            t0.elapsed().as_secs_f64()
+        );
+        eprintln!(
+            "Dictionary: {} terms | Triples: {}",
+            dict.len(),
+            index.triple_count()
+        );
+
+        let config = Config::resolve(None, dir).map_err(io::Error::from)?;
+        let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats })
     }
 
     /// Reopen an existing store from its directory.

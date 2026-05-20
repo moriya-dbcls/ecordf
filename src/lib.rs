@@ -39,5 +39,6 @@ pub mod store;
 pub mod triple;
 
 pub use config::Config;
+pub use loader::InputSpec;
 pub use stats::StoreStatistics;
 pub use store::Store;

@@ -340,7 +340,7 @@ cargo build --release --features gzip
 ### データ読み込み
 
 ```bash
-# 直接ファイルを指定（少数ファイルの場合）
+# 直接ファイルを指定（少数ファイルの場合）—ユニオングラフのみ
 ./target/release/ecordf build \
   --dir ./uniprot-store \
   uniprot_sprot.nt uniprot_trembl.nt
@@ -351,7 +351,7 @@ cargo build --release --features gzip
   togoid.nq
 
 # --from-file: ファイルリストをテキストファイルで指定
-# （ファイル数が多くてコマンドラインに収まらない場合）
+# グラフ名なし（ユニオングラフのみ）
 cat > inputs.txt << 'EOF'
 # UniProt release 2024_04
 /data/uniprot/uniprot_sprot.nt.gz
@@ -360,17 +360,42 @@ cat > inputs.txt << 'EOF'
 EOF
 ./target/release/ecordf build --dir ./uniprot-store --from-file inputs.txt
 
-# --from-file -: find などのパイプから stdin 経由で渡す
+# N-Quads ファイルを用意せず、N-Triplesファイルにグラフ名を紐付け
+# 2列目にグラフIRI（< > あり・なし両方OK）
+cat > graphs.txt << 'EOF'
+# ファイルパス  グラフIRI
+/data/uniprot_sprot.nt.gz    <http://sparql.uniprot.org/uniprot>
+/data/go.nt.gz               <http://sparql.uniprot.org/go>
+/data/taxonomy.nt.gz         http://sparql.uniprot.org/taxonomy
+/data/shared.nt              # グラフ名なし → ユニオングラフのみ
+EOF
+./target/release/ecordf build --dir ./store --from-file graphs.txt
+
+# find などのパイプ（グラフ名なしの場合）
 find /data -name '*.nt.gz' | \
   ./target/release/ecordf build --dir ./store --from-file -
 
-# 直接指定と --from-file の混在も可
+# 複数リストファイルと直接指定の混在も可
 ./target/release/ecordf build --dir ./store \
-  --from-file batch1.txt --from-file batch2.txt \
+  --from-file core.txt --from-file optional.txt \
   extra.nt
 
 # 読み込み完了後:
 # Built store: 142357891 triples, 28456123 terms, 5 named graphs
+```
+
+ロードされたグラフは `GRAPH` 句でアクセスできます：
+
+```sparql
+# 特定グラフ内のみ
+SELECT ?s ?p ?o WHERE {
+  GRAPH <http://sparql.uniprot.org/uniprot> { ?s ?p ?o }
+} LIMIT 10
+
+# 全グラフを横断
+SELECT ?g ?s ?o WHERE {
+  GRAPH ?g { ?s a <http://purl.uniprot.org/core/Protein> }
+} LIMIT 10
 ```
 
 ### コマンドラインクエリ
