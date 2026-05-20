@@ -33,9 +33,11 @@
 //! ```
 
 use memmap2::Mmap;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use crate::triple::{IndexKind, Quad, TermId, Triple, TriplePattern, UNBOUND};
 
@@ -50,44 +52,230 @@ const QUAD_BYTES: usize = 16; // 4 × u32 : (g, s, p, o)
 // ── In-memory index (during build) ──────────────────────────────────────────
 
 /// Mutable index used during the load phase.
+///
+/// ## External-sort mode
+///
+/// When `chunk_size > 0` the builder uses **external sort**:
+///
+/// 1. Incoming triples are accumulated in a `Vec` up to `chunk_size` entries.
+/// 2. When the buffer is full it is sorted and flushed to a numbered `.tmp`
+///    file inside `chunk_dir` — the buffer is then cleared.
+/// 3. On `build()` any remaining buffered triples are flushed as a final chunk,
+///    and all chunks are merged via a k-way merge (binary heap) into the final
+///    index file.  Consecutive duplicate triples are dropped during the merge
+///    so the final index is a true set.
+/// 4. Temp files are removed after a successful merge; the entire `_ecordf_tmp`
+///    directory is cleaned up by `AllBuilders::build`.
+///
+/// Peak memory = `chunk_size × 12 bytes` per builder.
+///
+/// When `chunk_size == 0` the old behaviour is used: all triples stay in RAM
+/// and are sorted in a single pass.
 pub struct IndexBuilder {
     pub kind: IndexKind,
     triples: Vec<[u32; 3]>,
+    /// 0 = unbounded (in-memory); > 0 = external-sort chunk threshold.
+    chunk_size: usize,
+    /// Directory for temporary chunk files (set when chunk_size > 0).
+    chunk_dir: Option<PathBuf>,
+    /// Paths of flushed sorted chunk files.
+    chunks: Vec<PathBuf>,
 }
 
 impl IndexBuilder {
+    /// Create an unbounded in-memory builder (old behaviour).
     pub fn new(kind: IndexKind) -> Self {
         Self {
             kind,
             triples: Vec::new(),
+            chunk_size: 0,
+            chunk_dir: None,
+            chunks: Vec::new(),
         }
     }
 
-    pub fn push(&mut self, t: Triple) {
-        self.triples.push(reorder(t, self.kind));
+    /// Create a streaming builder that flushes sorted chunks to `chunk_dir`.
+    fn new_streaming(kind: IndexKind, chunk_dir: PathBuf, chunk_size: usize) -> Self {
+        let cap = chunk_size.min(4_000_000);
+        Self {
+            kind,
+            triples: Vec::with_capacity(cap),
+            chunk_size,
+            chunk_dir: Some(chunk_dir),
+            chunks: Vec::new(),
+        }
     }
+
+    /// Append a triple.  Returns `Err` only in streaming mode when a chunk
+    /// flush fails.
+    pub fn push(&mut self, t: Triple) -> io::Result<()> {
+        self.triples.push(reorder(t, self.kind));
+        if self.chunk_size > 0 && self.triples.len() >= self.chunk_size {
+            self.flush_chunk()?;
+        }
+        Ok(())
+    }
+
+    // ── Internal chunk management ─────────────────────────────────────────────
+
+    fn kind_str(&self) -> &'static str {
+        match self.kind {
+            IndexKind::Spo => "spo",
+            IndexKind::Pos => "pos",
+            IndexKind::Osp => "osp",
+        }
+    }
+
+    fn flush_chunk(&mut self) -> io::Result<()> {
+        if self.triples.is_empty() {
+            return Ok(());
+        }
+        let chunk_dir = self.chunk_dir.as_ref().expect("chunk_dir must be set");
+        let chunk_path = chunk_dir.join(
+            format!("{}_chunk_{:06}.tmp", self.kind_str(), self.chunks.len())
+        );
+        self.triples.sort_unstable();
+        write_triple_chunk(&self.triples, &chunk_path)?;
+        self.chunks.push(chunk_path);
+        self.triples.clear();
+        Ok(())
+    }
+
+    // ── build ─────────────────────────────────────────────────────────────────
 
     /// Sort and write to disk, then return a read-only `IndexFile`.
     pub fn build(mut self, path: &Path) -> io::Result<IndexFile> {
-        // Sort by the index key order
-        self.triples.sort_unstable();
-
-        // Write binary file
-        {
-            let file = File::create(path)?;
-            let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
-            w.write_all(INDEX_MAGIC)?;
-            let count = self.triples.len() as u64;
-            w.write_all(&count.to_le_bytes())?;
-            for t in &self.triples {
-                w.write_all(&t[0].to_le_bytes())?;
-                w.write_all(&t[1].to_le_bytes())?;
-                w.write_all(&t[2].to_le_bytes())?;
+        if self.chunks.is_empty() {
+            // ── In-memory path (chunk_size == 0 or dataset fits in one chunk)
+            self.triples.sort_unstable();
+            write_index_from_sorted(&self.triples, path)?;
+        } else {
+            // ── External-sort path: flush remaining buffer, k-way merge
+            self.flush_chunk()?;
+            eprintln!(
+                "  Merging {} sorted chunks → {:?} index…",
+                self.chunks.len(), self.kind
+            );
+            merge_triple_chunks(&self.chunks, path)?;
+            // Remove individual chunk files (the _ecordf_tmp dir is removed by
+            // AllBuilders::build once all indexes are written).
+            for chunk in &self.chunks {
+                let _ = std::fs::remove_file(chunk);
             }
-            w.flush()?;
         }
-
         IndexFile::open(path, self.kind)
+    }
+}
+
+// ── Triple chunk helpers ──────────────────────────────────────────────────────
+
+/// Write a pre-sorted slice of raw triples to a binary chunk file.
+///
+/// Format: `[count: u64][a0, b0, c0, a1, b1, c1, …  : u32 each]`
+fn write_triple_chunk(triples: &[[u32; 3]], path: &Path) -> io::Result<()> {
+    let file = File::create(path)?;
+    let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
+    w.write_all(&(triples.len() as u64).to_le_bytes())?;
+    for t in triples {
+        w.write_all(&t[0].to_le_bytes())?;
+        w.write_all(&t[1].to_le_bytes())?;
+        w.write_all(&t[2].to_le_bytes())?;
+    }
+    w.flush()
+}
+
+/// Write a sorted slice of raw triples as a final index file (with header).
+fn write_index_from_sorted(triples: &[[u32; 3]], path: &Path) -> io::Result<()> {
+    let file = File::create(path)?;
+    let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
+    w.write_all(INDEX_MAGIC)?;
+    w.write_all(&(triples.len() as u64).to_le_bytes())?;
+    for t in triples {
+        w.write_all(&t[0].to_le_bytes())?;
+        w.write_all(&t[1].to_le_bytes())?;
+        w.write_all(&t[2].to_le_bytes())?;
+    }
+    w.flush()
+}
+
+/// k-way merge of sorted triple chunk files into a single index file.
+///
+/// Consecutive duplicate triples are dropped so the output is a set.
+/// The count header is back-patched after writing all triples.
+fn merge_triple_chunks(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
+    // ── Open all chunk readers ────────────────────────────────────────────────
+    let mut readers: Vec<TripleChunkReader> = chunks.iter()
+        .map(|p| TripleChunkReader::open(p))
+        .collect::<io::Result<Vec<_>>>()?;
+
+    // ── Write output header (count placeholder, back-patched later) ───────────
+    let out_file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+    let mut w = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
+    w.write_all(INDEX_MAGIC)?;
+    w.write_all(&0u64.to_le_bytes())?; // placeholder
+
+    // ── Seed heap ─────────────────────────────────────────────────────────────
+    let mut heap: BinaryHeap<Reverse<([u32; 3], usize)>> = BinaryHeap::new();
+    for (i, reader) in readers.iter_mut().enumerate() {
+        if let Some(t) = reader.next()? {
+            heap.push(Reverse((t, i)));
+        }
+    }
+
+    // ── Merge with deduplication ──────────────────────────────────────────────
+    let mut count = 0u64;
+    let mut prev: Option<[u32; 3]> = None;
+    while let Some(Reverse((t, i))) = heap.pop() {
+        if Some(t) != prev {
+            w.write_all(&t[0].to_le_bytes())?;
+            w.write_all(&t[1].to_le_bytes())?;
+            w.write_all(&t[2].to_le_bytes())?;
+            count += 1;
+            prev = Some(t);
+        }
+        if let Some(next) = readers[i].next()? {
+            heap.push(Reverse((next, i)));
+        }
+    }
+    w.flush()?;
+
+    // ── Back-patch the count field (offset 8, after magic) ───────────────────
+    drop(w);
+    let mut f = OpenOptions::new().write(true).open(path)?;
+    f.seek(SeekFrom::Start(8))?;
+    f.write_all(&count.to_le_bytes())?;
+
+    Ok(())
+}
+
+/// Streaming reader for a binary triple chunk file.
+struct TripleChunkReader {
+    reader: BufReader<File>,
+    remaining: u64,
+}
+
+impl TripleChunkReader {
+    fn open(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
+        let mut count_buf = [0u8; 8];
+        reader.read_exact(&mut count_buf)?;
+        let remaining = u64::from_le_bytes(count_buf);
+        Ok(Self { reader, remaining })
+    }
+
+    fn next(&mut self) -> io::Result<Option<[u32; 3]>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let mut buf = [0u8; 12];
+        self.reader.read_exact(&mut buf)?;
+        self.remaining -= 1;
+        Ok(Some([
+            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+        ]))
     }
 }
 
@@ -347,37 +535,67 @@ fn pattern_to_raw(pat: TriplePattern, kind: IndexKind) -> [Option<TermId>; 3] {
 // ══════════════════════════════════════════════════════════════════════════════
 
 /// Build-phase GSPO quad index.
+///
+/// Supports the same external-sort pattern as [`IndexBuilder`]: when
+/// `chunk_size > 0` quads are flushed to sorted temp files and k-way
+/// merged on `build()`.
 pub struct GspoBuilder {
     quads: Vec<[u32; 4]>, // (g, s, p, o)
+    chunk_size: usize,
+    chunk_dir: Option<PathBuf>,
+    chunks: Vec<PathBuf>,
 }
 
 impl GspoBuilder {
     pub fn new() -> Self {
-        Self { quads: Vec::new() }
+        Self { quads: Vec::new(), chunk_size: 0, chunk_dir: None, chunks: Vec::new() }
     }
 
-    pub fn push(&mut self, q: Quad) {
+    fn new_streaming(chunk_dir: PathBuf, chunk_size: usize) -> Self {
+        let cap = chunk_size.min(4_000_000);
+        Self {
+            quads: Vec::with_capacity(cap),
+            chunk_size,
+            chunk_dir: Some(chunk_dir),
+            chunks: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, q: Quad) -> io::Result<()> {
         self.quads.push([q.g, q.s, q.p, q.o]);
+        if self.chunk_size > 0 && self.quads.len() >= self.chunk_size {
+            self.flush_chunk()?;
+        }
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.quads.is_empty()
+        self.quads.is_empty() && self.chunks.is_empty()
+    }
+
+    fn flush_chunk(&mut self) -> io::Result<()> {
+        if self.quads.is_empty() { return Ok(()); }
+        let chunk_dir = self.chunk_dir.as_ref().expect("chunk_dir must be set");
+        let chunk_path = chunk_dir.join(format!("gspo_chunk_{:06}.tmp", self.chunks.len()));
+        self.quads.sort_unstable();
+        write_quad_chunk(&self.quads, &chunk_path)?;
+        self.chunks.push(chunk_path);
+        self.quads.clear();
+        Ok(())
     }
 
     /// Sort and write to disk, returning a read-only GspoIndexFile.
     pub fn build(mut self, path: &Path) -> io::Result<GspoIndexFile> {
-        self.quads.sort_unstable();
-        {
-            let file = File::create(path)?;
-            let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
-            w.write_all(GSPO_MAGIC)?;
-            w.write_all(&(self.quads.len() as u64).to_le_bytes())?;
-            for q in &self.quads {
-                for v in q {
-                    w.write_all(&v.to_le_bytes())?;
-                }
+        if self.chunks.is_empty() {
+            self.quads.sort_unstable();
+            write_gspo_index_from_sorted(&self.quads, path)?;
+        } else {
+            self.flush_chunk()?;
+            eprintln!("  Merging {} sorted chunks → GSPO index…", self.chunks.len());
+            merge_quad_chunks(&self.chunks, path)?;
+            for chunk in &self.chunks {
+                let _ = std::fs::remove_file(chunk);
             }
-            w.flush()?;
         }
         GspoIndexFile::open(path)
     }
@@ -385,6 +603,96 @@ impl GspoBuilder {
 
 impl Default for GspoBuilder {
     fn default() -> Self { Self::new() }
+}
+
+// ── Quad chunk helpers ────────────────────────────────────────────────────────
+
+fn write_quad_chunk(quads: &[[u32; 4]], path: &Path) -> io::Result<()> {
+    let file = File::create(path)?;
+    let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
+    w.write_all(&(quads.len() as u64).to_le_bytes())?;
+    for q in quads {
+        for v in q { w.write_all(&v.to_le_bytes())?; }
+    }
+    w.flush()
+}
+
+fn write_gspo_index_from_sorted(quads: &[[u32; 4]], path: &Path) -> io::Result<()> {
+    let file = File::create(path)?;
+    let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
+    w.write_all(GSPO_MAGIC)?;
+    w.write_all(&(quads.len() as u64).to_le_bytes())?;
+    for q in quads {
+        for v in q { w.write_all(&v.to_le_bytes())?; }
+    }
+    w.flush()
+}
+
+fn merge_quad_chunks(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
+    let mut readers: Vec<QuadChunkReader> = chunks.iter()
+        .map(|p| QuadChunkReader::open(p))
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let out_file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+    let mut w = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
+    w.write_all(GSPO_MAGIC)?;
+    w.write_all(&0u64.to_le_bytes())?; // placeholder
+
+    let mut heap: BinaryHeap<Reverse<([u32; 4], usize)>> = BinaryHeap::new();
+    for (i, reader) in readers.iter_mut().enumerate() {
+        if let Some(q) = reader.next()? {
+            heap.push(Reverse((q, i)));
+        }
+    }
+
+    let mut count = 0u64;
+    let mut prev: Option<[u32; 4]> = None;
+    while let Some(Reverse((q, i))) = heap.pop() {
+        if Some(q) != prev {
+            for v in &q { w.write_all(&v.to_le_bytes())?; }
+            count += 1;
+            prev = Some(q);
+        }
+        if let Some(next) = readers[i].next()? {
+            heap.push(Reverse((next, i)));
+        }
+    }
+    w.flush()?;
+
+    drop(w);
+    let mut f = OpenOptions::new().write(true).open(path)?;
+    f.seek(SeekFrom::Start(8))?;
+    f.write_all(&count.to_le_bytes())?;
+
+    Ok(())
+}
+
+struct QuadChunkReader {
+    reader: BufReader<File>,
+    remaining: u64,
+}
+
+impl QuadChunkReader {
+    fn open(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
+        let mut count_buf = [0u8; 8];
+        reader.read_exact(&mut count_buf)?;
+        Ok(Self { reader, remaining: u64::from_le_bytes(count_buf) })
+    }
+
+    fn next(&mut self) -> io::Result<Option<[u32; 4]>> {
+        if self.remaining == 0 { return Ok(None); }
+        let mut buf = [0u8; 16];
+        self.reader.read_exact(&mut buf)?;
+        self.remaining -= 1;
+        Ok(Some([
+            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        ]))
+    }
 }
 
 /// Read-only mmap-backed GSPO quad index.
@@ -574,35 +882,73 @@ pub struct AllBuilders {
     pub osp: IndexBuilder,
     /// GSPO quad index — only built when quads are pushed.
     pub gspo: GspoBuilder,
+    /// Temp directory for external-sort chunk files (`<store-dir>/_ecordf_tmp`).
+    /// `None` when running in unbounded in-memory mode.
+    tmp_dir: Option<PathBuf>,
 }
 
 impl AllBuilders {
+    /// Unbounded in-memory builder (old behaviour, no chunking).
     pub fn new() -> Self {
         Self {
-            spo: IndexBuilder::new(IndexKind::Spo),
-            pos: IndexBuilder::new(IndexKind::Pos),
-            osp: IndexBuilder::new(IndexKind::Osp),
-            gspo: GspoBuilder::new(),
+            spo:     IndexBuilder::new(IndexKind::Spo),
+            pos:     IndexBuilder::new(IndexKind::Pos),
+            osp:     IndexBuilder::new(IndexKind::Osp),
+            gspo:    GspoBuilder::new(),
+            tmp_dir: None,
         }
     }
 
+    /// External-sort builder: flushes sorted chunks of `chunk_size` triples to
+    /// `<dir>/_ecordf_tmp/` and k-way merges them on `build()`.
+    ///
+    /// Creates the temp directory immediately; returns an error if it cannot be
+    /// created.  The caller is responsible for deleting the directory on
+    /// failure; on success `build()` removes it automatically.
+    pub fn new_streaming(dir: &Path, chunk_size: usize) -> io::Result<Self> {
+        if chunk_size == 0 {
+            return Ok(Self::new());
+        }
+        let tmp_dir = dir.join("_ecordf_tmp");
+        std::fs::create_dir_all(&tmp_dir)?;
+        Ok(Self {
+            spo:  IndexBuilder::new_streaming(IndexKind::Spo, tmp_dir.clone(), chunk_size),
+            pos:  IndexBuilder::new_streaming(IndexKind::Pos, tmp_dir.clone(), chunk_size),
+            osp:  IndexBuilder::new_streaming(IndexKind::Osp, tmp_dir.clone(), chunk_size),
+            gspo: GspoBuilder::new_streaming(tmp_dir.clone(), chunk_size),
+            tmp_dir: Some(tmp_dir),
+        })
+    }
+
     /// Push a plain triple (no named graph → union graph only, not GSPO).
-    pub fn push(&mut self, t: Triple) {
-        self.spo.push(t);
-        self.pos.push(t);
-        self.osp.push(t);
+    pub fn push(&mut self, t: Triple) -> io::Result<()> {
+        self.spo.push(t)?;
+        self.pos.push(t)?;
+        self.osp.push(t)?;
+        Ok(())
     }
 
     /// Push a quad (triple + named graph).
     /// The triple is also added to SPO/POS/OSP for union-graph queries.
-    pub fn push_quad(&mut self, q: Quad) {
-        self.spo.push(q.to_triple());
-        self.pos.push(q.to_triple());
-        self.osp.push(q.to_triple());
-        self.gspo.push(q);
+    pub fn push_quad(&mut self, q: Quad) -> io::Result<()> {
+        self.spo.push(q.to_triple())?;
+        self.pos.push(q.to_triple())?;
+        self.osp.push(q.to_triple())?;
+        self.gspo.push(q)?;
+        Ok(())
     }
 
     pub fn build(self, dir: &Path) -> io::Result<TripleIndex> {
+        let tmp_dir = self.tmp_dir.clone();
+        let result = self.build_internal(dir);
+        // Always clean up the temp directory (success or failure).
+        if let Some(td) = tmp_dir {
+            let _ = std::fs::remove_dir_all(&td);
+        }
+        result
+    }
+
+    fn build_internal(self, dir: &Path) -> io::Result<TripleIndex> {
         let spo = self.spo.build(&dir.join("spo.bin"))?;
         let pos = self.pos.build(&dir.join("pos.bin"))?;
         let osp = self.osp.build(&dir.join("osp.bin"))?;

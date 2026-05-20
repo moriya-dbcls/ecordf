@@ -11,6 +11,13 @@
 //! ## Example
 //!
 //! ```toml
+//! [build]
+//! # Flush triples to disk in sorted chunks of this size during index build.
+//! # Keeps peak memory to roughly: chunk_size × 40 bytes (3 indexes × 12 B + dict overhead).
+//! # Default: 5_000_000 (≈ 180 MB peak across SPO/POS/OSP builders).
+//! # Set to 0 to disable external sort (old in-memory behaviour; requires all triples in RAM).
+//! chunk_size = 5_000_000
+//!
 //! [query]
 //! max_intermediate_rows = 5_000_000
 //! bind_join_threshold   = 10_000
@@ -33,6 +40,8 @@ use std::path::Path;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    /// Index build tunables (chunk size for external sort, etc.).
+    pub build: BuildConfig,
     /// Query execution tunables.
     pub query: QueryConfig,
     /// HTTP server defaults (overridable via CLI flags).
@@ -42,6 +51,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            build: BuildConfig::default(),
             query: QueryConfig::default(),
             server: ServerConfig::default(),
         }
@@ -83,6 +93,40 @@ impl Config {
         }
         let auto = store_dir.join("ecordf.toml");
         Self::load_or_default(&auto)
+    }
+}
+
+// ── Build config ──────────────────────────────────────────────────────────────
+
+/// Tunables for the index build phase.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct BuildConfig {
+    /// Number of triples per sorted chunk during external-sort index build.
+    ///
+    /// During `ecordf build`, incoming triples are accumulated in memory in
+    /// sorted chunks of this size.  Each full chunk is flushed to a temporary
+    /// file, sorted, and later k-way merged into the final index.  This bounds
+    /// peak memory to approximately `chunk_size × 40 bytes` (the three
+    /// SPO/POS/OSP index buffers × 12 bytes each, plus dictionary overhead).
+    ///
+    /// | chunk_size | peak index-buffer RAM |
+    /// |------------|----------------------|
+    /// | 1_000_000  |  ≈ 36 MB             |
+    /// | 5_000_000  |  ≈ 180 MB  (default) |
+    /// | 20_000_000 |  ≈ 720 MB            |
+    ///
+    /// Set to `0` to disable external sort entirely and load all triples into
+    /// RAM before sorting (the old behaviour).  Only do this on machines with
+    /// many tens of GB of free memory and datasets that fit comfortably in RAM.
+    pub chunk_size: usize,
+}
+
+impl Default for BuildConfig {
+    fn default() -> Self {
+        Self {
+            chunk_size: 5_000_000,
+        }
     }
 }
 

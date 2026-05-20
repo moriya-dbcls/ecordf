@@ -36,11 +36,22 @@ impl Store {
     pub fn load(dir: &Path, input_files: &[&Path]) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
 
+        // Load config before building so chunk_size is available.
+        // At build time the config file may not exist yet — fall back to defaults.
+        let config = Config::resolve(None, dir).map_err(io::Error::from)?;
+
         let t0 = Instant::now();
         eprintln!("=== EcoRDF: loading {} file(s) ===", input_files.len());
+        if config.build.chunk_size > 0 {
+            eprintln!(
+                "External sort: chunk_size={} (~{} MB/index buffer)",
+                config.build.chunk_size,
+                config.build.chunk_size * 12 / (1024 * 1024),
+            );
+        }
 
         let dict = Dictionary::new();
-        let mut builders = AllBuilders::new();
+        let mut builders = AllBuilders::new_streaming(dir, config.build.chunk_size)?;
 
         let stats = load_files(input_files, &dict, &mut builders)?;
 
@@ -65,10 +76,6 @@ impl Store {
             index.triple_count()
         );
 
-        // Config is loaded from the store dir (if ecordf.toml exists there).
-        // At build time it may not exist yet — fall back to defaults in that case.
-        let config = Config::resolve(None, dir).map_err(io::Error::from)?;
-
         // Build predicate statistics and save to stats.bin for future runs.
         let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
 
@@ -86,11 +93,20 @@ impl Store {
     pub fn load_with_graphs(dir: &Path, inputs: &[InputSpec]) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
 
+        let config = Config::resolve(None, dir).map_err(io::Error::from)?;
+
         let t0 = Instant::now();
         eprintln!("=== EcoRDF: loading {} file(s) ===", inputs.len());
+        if config.build.chunk_size > 0 {
+            eprintln!(
+                "External sort: chunk_size={} (~{} MB/index buffer)",
+                config.build.chunk_size,
+                config.build.chunk_size * 12 / (1024 * 1024),
+            );
+        }
 
         let dict = Dictionary::new();
-        let mut builders = AllBuilders::new();
+        let mut builders = AllBuilders::new_streaming(dir, config.build.chunk_size)?;
 
         let stats = load_files_with_graphs(inputs, &dict, &mut builders)?;
 
@@ -115,7 +131,6 @@ impl Store {
             index.triple_count()
         );
 
-        let config = Config::resolve(None, dir).map_err(io::Error::from)?;
         let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
         Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats })
     }

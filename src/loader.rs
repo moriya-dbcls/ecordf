@@ -92,7 +92,7 @@ pub fn load_ntriples(
                 let si = dict.encode(&s);
                 let pi = dict.encode(&p);
                 let oi = dict.encode(&o);
-                builders.push(Triple::new(si, pi, oi));
+                builders.push(Triple::new(si, pi, oi))?;
                 stats.triples_loaded += 1;
                 if stats.triples_loaded % 1_000_000 == 0 {
                     eprintln!("  loaded {}M triples...", stats.triples_loaded / 1_000_000);
@@ -367,9 +367,9 @@ pub fn load_nquads(
                 let oi = dict.encode(&o);
                 if let Some(g) = g_opt {
                     let gi = dict.encode(&g);
-                    builders.push_quad(Quad::new(si, pi, oi, gi));
+                    builders.push_quad(Quad::new(si, pi, oi, gi))?;
                 } else {
-                    builders.push(Triple::new(si, pi, oi));
+                    builders.push(Triple::new(si, pi, oi))?;
                 }
                 stats.triples_loaded += 1;
                 if stats.triples_loaded % 1_000_000 == 0 {
@@ -492,7 +492,7 @@ pub fn load_ntriples_gz(
                 let si = dict.encode(&s);
                 let pi = dict.encode(&p);
                 let oi = dict.encode(&o);
-                builders.push(crate::triple::Triple::new(si, pi, oi));
+                builders.push(crate::triple::Triple::new(si, pi, oi))?;
                 stats.triples_loaded += 1;
             }
             None => { stats.errors += 1; }
@@ -540,9 +540,9 @@ pub fn load_nquads_gz(
                 let oi = dict.encode(&o);
                 if let Some(g) = g_opt {
                     let gi = dict.encode(&g);
-                    builders.push_quad(Quad::new(si, pi, oi, gi));
+                    builders.push_quad(Quad::new(si, pi, oi, gi))?;
                 } else {
-                    builders.push(Triple::new(si, pi, oi));
+                    builders.push(Triple::new(si, pi, oi))?;
                 }
                 stats.triples_loaded += 1;
                 if stats.triples_loaded % 1_000_000 == 0 {
@@ -596,7 +596,7 @@ pub fn load_ntriples_into_graph(
                 let si = dict.encode(&s);
                 let pi = dict.encode(&p);
                 let oi = dict.encode(&o);
-                builders.push_quad(Quad::new(si, pi, oi, gi));
+                builders.push_quad(Quad::new(si, pi, oi, gi))?;
                 stats.triples_loaded += 1;
                 if stats.triples_loaded % 1_000_000 == 0 {
                     eprintln!("  loaded {}M triples...", stats.triples_loaded / 1_000_000);
@@ -641,7 +641,7 @@ pub fn load_ntriples_into_graph_gz(
                 let si = dict.encode(&s);
                 let pi = dict.encode(&p);
                 let oi = dict.encode(&o);
-                builders.push_quad(Quad::new(si, pi, oi, gi));
+                builders.push_quad(Quad::new(si, pi, oi, gi))?;
                 stats.triples_loaded += 1;
                 if stats.triples_loaded % 1_000_000 == 0 {
                     eprintln!("  loaded {}M triples...", stats.triples_loaded / 1_000_000);
