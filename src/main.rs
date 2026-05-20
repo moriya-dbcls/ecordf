@@ -1,7 +1,8 @@
 //! EcoRDF CLI — build, serve, query from command line.
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
 use ecordf::{Config, Store};
@@ -21,14 +22,46 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Build a new store from RDF input files
+    /// Build a new store from RDF input files.
+    ///
+    /// Accepts N-Triples (.nt), N-Quads (.nq), and gzip-compressed
+    /// variants (.nt.gz, .nq.gz) when built with --features gzip.
+    ///
+    /// Examples:
+    ///
+    ///   # Direct file list
+    ///   ecordf build --dir ./store a.nt b.nq c.nt.gz
+    ///
+    ///   # Read paths from a file (one path per line, # = comment)
+    ///   ecordf build --dir ./store --from-file inputs.txt
+    ///
+    ///   # Pipe a path list from find
+    ///   find /data -name '*.nt.gz' | ecordf build --dir ./store --from-file -
+    ///
+    ///   # Mix: explicit files + a list file
+    ///   ecordf build --dir ./store --from-file batch.txt extra.nt
     Build {
         /// Directory to store indexes (created if missing)
         #[arg(short, long, default_value = "./ecordf-data")]
         dir: PathBuf,
-        /// Input RDF files (N-Triples .nt format)
-        #[arg(required = true)]
+
+        /// Input RDF files (.nt, .nq, .nt.gz, .nq.gz).
+        /// May be omitted when --from-file is used.
+        #[arg(value_name = "FILE")]
         files: Vec<PathBuf>,
+
+        /// Read additional file paths from a text file.
+        ///
+        /// One file path per line. Lines starting with '#' and blank lines
+        /// are ignored. Use '-' to read the list from stdin.
+        /// May be specified multiple times.
+        ///
+        /// Example file contents:
+        ///   # UniProt release 2024_04
+        ///   /data/uniprot/uniprot_sprot.nt.gz
+        ///   /data/uniprot/uniprot_trembl.nt.gz
+        #[arg(long, value_name = "LIST_FILE", action = clap::ArgAction::Append)]
+        from_file: Vec<PathBuf>,
     },
 
     /// Start the SPARQL 1.1 HTTP endpoint
@@ -77,6 +110,42 @@ enum Command {
     },
 }
 
+// ── Input file resolution ─────────────────────────────────────────────────────
+
+/// Combine direct file arguments with paths read from `--from-file` list files.
+///
+/// Each list file contains one file path per line; lines starting with `#`
+/// and blank lines are ignored.  The special path `-` reads from stdin.
+fn resolve_input_files(
+    direct: Vec<PathBuf>,
+    list_files: Vec<PathBuf>,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut all = direct;
+
+    for list_path in list_files {
+        let content = if list_path == Path::new("-") {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            s
+        } else {
+            std::fs::read_to_string(&list_path)
+                .map_err(|e| anyhow::anyhow!("cannot read list file {:?}: {}", list_path, e))?
+        };
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            all.push(PathBuf::from(line));
+        }
+    }
+
+    Ok(all)
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize logging (RUST_LOG=ecordf=debug for verbose output)
@@ -89,8 +158,15 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Build { dir, files } => {
-            let file_refs: Vec<&std::path::Path> = files.iter().map(|p| p.as_path()).collect();
+        Command::Build { dir, files, from_file } => {
+            let all_files = resolve_input_files(files, from_file)?;
+            if all_files.is_empty() {
+                anyhow::bail!(
+                    "no input files specified.\n\
+                     Pass files directly, or use --from-file <list> (or --from-file - to read from stdin)."
+                );
+            }
+            let file_refs: Vec<&Path> = all_files.iter().map(|p| p.as_path()).collect();
             let store = Store::load(&dir, &file_refs)?;
             let stats = store.stats();
             if stats.graph_count > 0 {
@@ -131,7 +207,6 @@ async fn main() -> anyhow::Result<()> {
         Command::Query { dir, query, format, config } => {
             let store = Store::open_with_config(&dir, config.as_deref())?;
             let sparql = if query == "-" {
-                use std::io::Read;
                 let mut s = String::new();
                 std::io::stdin().read_to_string(&mut s)?;
                 s

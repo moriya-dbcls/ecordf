@@ -340,15 +340,34 @@ cargo build --release --features gzip
 ### データ読み込み
 
 ```bash
-# N-Triples
+# 直接ファイルを指定（少数ファイルの場合）
 ./target/release/ecordf build \
   --dir ./uniprot-store \
-  uniprot_sprot.nt
+  uniprot_sprot.nt uniprot_trembl.nt
 
 # N-Quads（named graph付き）
 ./target/release/ecordf build \
   --dir ./togo-store \
   togoid.nq
+
+# --from-file: ファイルリストをテキストファイルで指定
+# （ファイル数が多くてコマンドラインに収まらない場合）
+cat > inputs.txt << 'EOF'
+# UniProt release 2024_04
+/data/uniprot/uniprot_sprot.nt.gz
+/data/uniprot/uniprot_trembl.nt.gz
+/data/uniparc/uniparc.nt.gz
+EOF
+./target/release/ecordf build --dir ./uniprot-store --from-file inputs.txt
+
+# --from-file -: find などのパイプから stdin 経由で渡す
+find /data -name '*.nt.gz' | \
+  ./target/release/ecordf build --dir ./store --from-file -
+
+# 直接指定と --from-file の混在も可
+./target/release/ecordf build --dir ./store \
+  --from-file batch1.txt --from-file batch2.txt \
+  extra.nt
 
 # 読み込み完了後:
 # Built store: 142357891 triples, 28456123 terms, 5 named graphs
