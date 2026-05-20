@@ -147,7 +147,6 @@ pub fn encode(&self, s: &str) -> u32 { ... }
 | SPARQL UPDATE (INSERT/DELETE) | 未実装 |
 | SERVICE (フェデレーション) | 未実装 |
 | サブクエリ (SELECT in WHERE) | パーサー対応済み、実行は outer plan として処理 |
-| 並列クエリ実行 | 未実装（シングルスレッド） |
 | Leapfrog の多変数完全実装 | 共有変数が2つ以上のとき hash join にフォールバック |
 
 ---
@@ -167,6 +166,9 @@ pub fn encode(&self, s: &str) -> u32 { ... }
 ```
 ecordf/
 ├── src/
+│   ├── config.rs      設定: Config / QueryConfig / ServerConfig
+│   │                    ecordf.toml を serde+toml でデシリアライズ
+│   │                    ファイル探索順: --config > <store-dir>/ecordf.toml > デフォルト値
 │   ├── dict.rs        辞書: 文字列 ↔ u32 ID
 │   │                    RwLock による interior mutability
 │   │                    19プレフィックスの名前空間圧縮
@@ -175,7 +177,8 @@ ecordf/
 │   │                    IndexBuilder / IndexFile (SPO・POS・OSP)
 │   │                    GspoBuilder / GspoIndexFile (Named Graphs)
 │   │                    AllBuilders (ビルドフェーズの統合API)
-│   ├── store.rs       ストアファサード: load / open / query / stats
+│   ├── store.rs       ストアファサード: load / open / open_with_config / query / stats
+│   │                    Config を保持し Executor に QueryConfig を渡す
 │   ├── loader.rs      N-Triples / N-Quads ストリーミングパーサー
 │   ├── sparql/
 │   │   ├── ast.rs     SPARQL 1.1 AST型定義
@@ -184,14 +187,21 @@ ecordf/
 │   │   │                Property Path (*/+/?/|/^//) 対応
 │   │   ├── plan.rs    実行計画型 (ExecutionPlan enum)
 │   │   └── executor.rs Leapfrog Triejoin + hash join + left join
+│   │                    QueryConfig (max_intermediate_rows / bind_join_threshold)
 │   │                    Property Path BFS (ZeroOrMore / OneOrMore)
 │   │                    Named Graph スキャン (execute_named_graph)
 │   │                    FILTER / BIND / STR の正確な評価
 │   ├── server.rs      axum HTTPサーバー (SPARQL 1.1 Protocol)
+│   │                    AppState (Arc<Store> + Option<Semaphore>)
+│   │                    spawn_blocking でクエリをブロッキングプールに委譲
+│   │                    Semaphore による同時クエリ数制限
 │   │                    JSON / XML / TSV / CSV レスポンス
 │   │                    CORS オプション対応
 │   └── main.rs        CLI: build / serve / query / stats
-│                        serve に --cors オプション追加
+│                        serve: --host / --port / --cors / --config
+│                        query: --config
+├── ecordf.toml        設定ファイルのサンプル（全パラメータ・説明付き）
+├── DESIGN.md          本ドキュメント
 └── Cargo.toml
 ```
 
@@ -253,14 +263,39 @@ cargo build --release --features gzip
    } LIMIT 10"
 ```
 
+### 設定ファイル
+
+```bash
+# store-dir に ecordf.toml を置くと自動読み込み
+cp ecordf.toml ./uniprot-store/ecordf.toml
+$EDITOR ./uniprot-store/ecordf.toml
+
+# 明示的に指定する場合
+./target/release/ecordf serve --dir ./uniprot-store --config /etc/ecordf.toml
+```
+
+主な設定項目（デフォルト値）:
+
+| キー | デフォルト | 説明 |
+|------|-----------|------|
+| `query.max_intermediate_rows` | 5,000,000 | 中間結果の行数上限（OOM防止） |
+| `query.bind_join_threshold` | 10,000 | bind_join / hash_join の切り替え閾値 |
+| `server.host` | `127.0.0.1` | バインドアドレス |
+| `server.port` | `7878` | TCPポート |
+| `server.cors_origins` | `""` | CORS設定（`"*"` or カンマ区切りオリジン） |
+| `server.max_concurrent_queries` | `0` | 同時クエリ数上限（0=無制限） |
+
 ### HTTPサーバー
 
 ```bash
-# ローカル起動
-./target/release/ecordf serve --dir ./uniprot-store --port 7878
+# ローカル起動（設定はecordf.tomlまたはデフォルト値）
+./target/release/ecordf serve --dir ./uniprot-store
+
+# CLIフラグはconfigファイルより優先
+./target/release/ecordf serve --dir ./uniprot-store --host 0.0.0.0 --port 8080
 
 # CORS許可（全オリジン）
-./target/release/ecordf serve --dir ./uniprot-store --port 7878 --cors '*'
+./target/release/ecordf serve --dir ./uniprot-store --cors '*'
 
 # CORS許可（特定オリジン）
 ./target/release/ecordf serve --dir ./uniprot-store \
@@ -292,16 +327,29 @@ POST http://localhost:7878/sparql
 | BGP 2パターン・共有変数 | ベース | 2〜5× | 3〜8×† |
 | BGP 5パターン・複雑JOIN | ベース | 3〜10× | 5〜15×† |
 | コールドスタート時間 | 数秒 | 数分 | 即時 |
+| 並列クエリ処理 | 対応 | 対応 | **対応**（tokio blocking pool） |
 | Property Path (* 転移閉包) | 対応 | 対応 | BFS（対応済） |
 | Named Graphs (GRAPH句) | 対応 | 対応 | GSPO索引（対応済） |
 
 \* mmapによるワーキングセット管理（OS・クエリ依存）  
 † Leapfrog Triejoinによる中間結果削減（データ・クエリ依存）
 
+### 並列クエリ処理
+
+1クエリの内部処理はシングルスレッドですが、**複数クエリは並列に処理されます**。
+
+```
+tokio worker threads (num_cpus):  HTTPコネクション管理・I/O
+tokio blocking pool (最大512):    クエリ実行 (spawn_blocking)
+Semaphore (max_concurrent_queries): アプリ層の同時数キャップ
+```
+
+各クエリは `spawn_blocking` でブロッキング専用スレッドプールに委譲されるため、非同期ワーカースレッドをブロックしません。`max_concurrent_queries = 0`（デフォルト）の場合はtokioの上限（512）まで並列実行できます。重いクエリが多い場合は `max_concurrent_queries = 2 × CPUコア数` を推奨します。
+
 ### スケール時の制約
 
 - **ビルドフェーズ**: ソートはメモリ上で行うため、ビルド時のピークRAMはトリプル数に比例します（外部ソート未実装）。
-- **クエリ実行**: 現状はシングルスレッド。広域スキャンが絡む大規模クエリではQleverの並列実行に劣ります。
+- **1クエリの内部処理**: シングルスレッド。広域スキャンが絡む単一クエリではQleverの内部並列実行に劣ります。
 - **Leapfrog**: 共有変数が2つ以上のパターンはハッシュジョインにフォールバックします（完全な多変数Leapfrogは今後の課題）。
 
 ---
@@ -310,8 +358,9 @@ POST http://localhost:7878/sparql
 
 1. **SPARQL UPDATE** — INSERT DATA / DELETE DATA / MODIFY
 2. **外部ソート対応** — ビルド時のメモリ削減（10億トリプル以上のビルド）
-3. **並列クエリ実行** — tokio / rayon による JOIN並列化
+3. **クエリ内部の並列化** — rayon による JOIN内部のスレッド並列化（クエリ間並列は実装済み）
 4. **Leapfrog 多変数完全実装** — 共有変数が2つ以上の場合もLeapfrogで処理
 5. **SPARQL Federation** — SERVICE句による外部エンドポイント連携
 6. **Block圧縮** — zstdでディスク使用量をさらに削減
 7. **CONSTRUCT** — RDFグラフを返すクエリ形式
+8. **クエリタイムアウト** — 長時間クエリを自動キャンセルする機能
