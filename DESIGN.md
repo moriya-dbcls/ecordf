@@ -157,7 +157,9 @@ pub fn encode(&self, s: &str) -> u32 { ... }
 |-------|------------|------|
 | `.nt` / `.ntriples` | N-Triples | SPO/POS/OSPインデックスに格納 |
 | `.nq` / `.nquads` | N-Quads | SPO/POS/OSP（ユニオングラフ）+ GSPO（名前付きグラフ） |
-| `.gz` | gzip済みN-Triples | `--features gzip` でビルド時のみ対応 |
+| `.nt.gz` / `.ntriples.gz` | gzip済みN-Triples | `--features gzip` でビルド時のみ対応 |
+| `.nq.gz` / `.nquads.gz` | gzip済みN-Quads | `--features gzip` でビルド時のみ対応 |
+| `.gz`（単体） | gzip済みN-Triples | 後方互換。ダブル拡張子推奨 |
 
 ---
 

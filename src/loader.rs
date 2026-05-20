@@ -4,9 +4,13 @@
 //! Streams line by line — constant memory regardless of file size.
 //!
 //! Supported formats:
-//!   .nt / .ntriples  — N-Triples  (triples → union graph only)
-//!   .nq / .nquads    — N-Quads    (quads   → union graph + GSPO named-graph index)
-//!   .gz              — gzipped N-Triples (with gzip feature)
+//!   .nt / .ntriples     — N-Triples  (triples → union graph only)
+//!   .nq / .nquads       — N-Quads    (quads   → union graph + GSPO named-graph index)
+//!   .nt.gz / .ntriples.gz — gzipped N-Triples (with gzip feature)
+//!   .nq.gz / .nquads.gz   — gzipped N-Quads   (with gzip feature)
+//!
+//! Extension resolution: the full filename stem is checked for a double extension
+//! (e.g. `foo.nt.gz`) before falling back to the last extension alone (`foo.gz`).
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -174,6 +178,53 @@ fn unescape_char(c: char) -> char {
     }
 }
 
+// ── Extension classification ──────────────────────────────────────────────────
+
+enum FileKind {
+    NTriples,
+    NQuads,
+    NTriplesGz,
+    NQuadsGz,
+    Unknown(String),
+}
+
+/// Classify a file path by its extension(s).
+///
+/// Double extensions (`.nt.gz`, `.nq.gz`) are recognised first so that a file
+/// named `data.nq.gz` routes to N-Quads gzip rather than plain N-Triples gzip.
+fn classify_extension(path: &Path) -> FileKind {
+    // Full filename as lowercase string for suffix matching
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // ── Double extensions (.nt.gz / .nq.gz / .ntriples.gz / .nquads.gz) ──────
+    if name.ends_with(".nt.gz") || name.ends_with(".ntriples.gz") {
+        return FileKind::NTriplesGz;
+    }
+    if name.ends_with(".nq.gz") || name.ends_with(".nquads.gz") {
+        return FileKind::NQuadsGz;
+    }
+
+    // ── Single extension ──────────────────────────────────────────────────────
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "nt" | "ntriples" => FileKind::NTriples,
+        "nq" | "nquads"   => FileKind::NQuads,
+        // Bare .gz without a recognised inner extension → assume N-Triples
+        // (backward compatibility with old behaviour)
+        "gz"              => FileKind::NTriplesGz,
+        other             => FileKind::Unknown(other.to_string()),
+    }
+}
+
 /// Load multiple files, auto-detecting format from extension.
 pub fn load_files(
     paths: &[&Path],
@@ -183,12 +234,12 @@ pub fn load_files(
     let mut total = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
     for path in paths {
         eprintln!("Loading {:?}...", path.file_name().unwrap_or_default());
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let stats = match ext.to_ascii_lowercase().as_str() {
-            "nt" | "ntriples" => load_ntriples(path, dict, builders)?,
-            "nq" | "nquads"   => load_nquads(path, dict, builders)?,
-            "gz"              => load_ntriples_gz(path, dict, builders)?,
-            other => {
+        let stats = match classify_extension(path) {
+            FileKind::NTriples       => load_ntriples(path, dict, builders)?,
+            FileKind::NQuads         => load_nquads(path, dict, builders)?,
+            FileKind::NTriplesGz     => load_ntriples_gz(path, dict, builders)?,
+            FileKind::NQuadsGz       => load_nquads_gz(path, dict, builders)?,
+            FileKind::Unknown(other) => {
                 eprintln!("  Warning: unknown extension '{}', trying N-Triples", other);
                 load_ntriples(path, dict, builders)?
             }
@@ -369,6 +420,60 @@ pub fn load_ntriples_gz(
 
 #[cfg(not(feature = "gzip"))]
 pub fn load_ntriples_gz(
+    _path: &Path,
+    _dict: &Dictionary,
+    _builders: &mut AllBuilders,
+) -> io::Result<LoadStats> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "gzip support not compiled in — rebuild with: cargo build --features gzip",
+    ))
+}
+
+/// Load gzipped N-Quads (.nq.gz).
+/// Enable with: `cargo build --features gzip`
+#[cfg(feature = "gzip")]
+pub fn load_nquads_gz(
+    path: &Path,
+    dict: &Dictionary,
+    builders: &mut AllBuilders,
+) -> io::Result<LoadStats> {
+    use flate2::read::GzDecoder;
+    let file = File::open(path)?;
+    let gz = GzDecoder::new(file);
+    let reader = BufReader::new(gz);
+    let mut stats = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
+
+    for line in reader.lines() {
+        let line = line?;
+        stats.lines_processed += 1;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+
+        match parse_nq_line(line) {
+            Some((s, p, o, g_opt)) => {
+                let si = dict.encode(&s);
+                let pi = dict.encode(&p);
+                let oi = dict.encode(&o);
+                if let Some(g) = g_opt {
+                    let gi = dict.encode(&g);
+                    builders.push_quad(Quad::new(si, pi, oi, gi));
+                } else {
+                    builders.push(Triple::new(si, pi, oi));
+                }
+                stats.triples_loaded += 1;
+                if stats.triples_loaded % 1_000_000 == 0 {
+                    eprintln!("  loaded {}M quads...", stats.triples_loaded / 1_000_000);
+                }
+            }
+            None => { stats.errors += 1; }
+        }
+    }
+    Ok(stats)
+}
+
+#[cfg(not(feature = "gzip"))]
+pub fn load_nquads_gz(
     _path: &Path,
     _dict: &Dictionary,
     _builders: &mut AllBuilders,
