@@ -540,6 +540,24 @@ impl TripleIndex {
         }
     }
 
+    /// Scan all triples in natural SPO order.
+    ///
+    /// Used by `StoreStatistics::build_from_index` (pass 2) to count distinct
+    /// `(subject, predicate)` pairs per predicate.
+    pub fn spo_scan_all(&self) -> TripleScan {
+        let pat = TriplePattern { s: UNBOUND, p: UNBOUND, o: UNBOUND };
+        self.spo.scan(&pat)
+    }
+
+    /// Scan all triples in natural POS order (P, O, S).
+    ///
+    /// Used by `StoreStatistics::build_from_index` (pass 1) to count triples
+    /// and distinct objects per predicate without allocating a hash set.
+    pub fn pos_scan_all(&self) -> TripleScan {
+        let pat = TriplePattern { s: UNBOUND, p: UNBOUND, o: UNBOUND };
+        self.pos.scan(&pat)
+    }
+
     pub fn triple_count(&self) -> usize { self.spo.len() }
 
     /// Number of named graphs (0 if no GSPO index).

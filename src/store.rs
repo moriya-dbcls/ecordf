@@ -17,12 +17,16 @@ use crate::index::{AllBuilders, TripleIndex};
 use crate::loader::load_files;
 use crate::sparql::{parse_query, Executor, ResultSet};
 use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
+use crate::stats::StoreStatistics;
 
 pub struct Store {
     pub dict: Dictionary,
     pub index: TripleIndex,
     pub dir: PathBuf,
     pub config: Config,
+    /// Per-predicate statistics for join ordering.
+    /// Loaded from `stats.bin` or built on first open.
+    pub stats: StoreStatistics,
 }
 
 impl Store {
@@ -64,7 +68,11 @@ impl Store {
         // Config is loaded from the store dir (if ecordf.toml exists there).
         // At build time it may not exist yet — fall back to defaults in that case.
         let config = Config::resolve(None, dir).map_err(io::Error::from)?;
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config })
+
+        // Build predicate statistics and save to stats.bin for future runs.
+        let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
+
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats })
     }
 
     /// Reopen an existing store from its directory.
@@ -72,7 +80,8 @@ impl Store {
         let dict = Dictionary::load(&dir.join("dict.bin"))?;
         let index = TripleIndex::open(dir)?;
         let config = Config::resolve(None, dir).map_err(io::Error::from)?;
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config })
+        let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats })
     }
 
     /// Reopen an existing store and apply an explicit config file (overrides
@@ -81,7 +90,8 @@ impl Store {
         let dict = Dictionary::load(&dir.join("dict.bin"))?;
         let index = TripleIndex::open(dir)?;
         let config = Config::resolve(config_path, dir).map_err(io::Error::from)?;
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config })
+        let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats })
     }
 
     /// Replace the active configuration without reopening indexes.
@@ -94,7 +104,12 @@ impl Store {
         let t0 = Instant::now();
         let ast = parse_query(sparql).map_err(|e| QueryError::Parse(e.to_string()))?;
 
-        let executor = Executor::with_config(&self.index, &self.dict, self.config.query.clone());
+        let executor = Executor::with_config_and_stats(
+            &self.index,
+            &self.dict,
+            self.config.query.clone(),
+            Some(&self.stats),
+        );
 
         let result = match ast.form {
             QueryForm::Select(ref sq) => {

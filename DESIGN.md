@@ -161,6 +161,114 @@ pub fn encode(&self, s: &str) -> u32 { ... }
 
 ---
 
+## オプティマイザ — カーディナリティ推定による JOIN 順序決定
+
+### 設計概要
+
+BGP（基本グラフパターン）内の複数のトリプルパターンを結合する順番は、クエリ性能に最も大きく影響します。EcoRDF は **2段階のカーディナリティ推定**を組み合わせて、クロスプロダクトを避けながら小さな中間結果が得られる順序を貪欲法で選びます。
+
+### 段階 1 — インデックスプローブ（常に利用）
+
+パターン中の定数 IRI / リテラルを辞書でエンコードし、ソート済みインデックスに対してバイナリサーチで一致範囲を数えます。
+
+```
+?child up:proteome <chr:1>
+  → TriplePattern { s: UNBOUND, p: up:proteome_id, o: chr1_id }
+  → POS索引の (up:proteome, chr1) 範囲をバイナリサーチ
+  → 推定値: ~2,000 件（ヒトプロテオーム内のタンパク質数）
+
+?parent rdfs:subClassOf <GO:0005575>
+  → TriplePattern { s: UNBOUND, p: subClassOf_id, o: GO_id }
+  → 推定値: ~3,000 件（細胞成分 GO の子孫数）
+```
+
+2,000 < 3,000 なので `up:proteome <chr:1>` を先に評価 → クロスプロダクト回避。
+
+**コスト: O(log N) / パターン。余分なメモリゼロ。**
+
+### 段階 2 — 述語統計ファイル（stats.bin）
+
+述語が定数で S/O が変数のパターン（`?child up:classifiedWith ?go`）はインデックスプローブが述語の全トリプル数を返してしまいます。`stats.bin` には各述語について以下を保持します。
+
+| フィールド | 意味 |
+|----------|------|
+| `triple_count` | 述語の総トリプル数 |
+| `subject_count` | 述語に現れる主語の異なり数 |
+| `object_count` | 述語に現れる目的語の異なり数 |
+
+これにより SP / PO パターンの平均ファンアウトを推定できます。
+
+```
+?child up:classifiedWith ?go   (どちらも変数)
+  → stats.estimate(None, Some(up:classifiedWith), None)
+  → triple_count = 3,200,000
+  ↓
+?child rdfs:label ?label        (どちらも変数)
+  → stats.estimate(None, Some(rdfs:label), None)
+  → triple_count = 500,000
+```
+
+`rdfs:label` の方がトリプル数が少ない → `rdfs:label` を先に評価してラベルで絞り込む。
+
+### stats.bin の構築
+
+`stats.bin` は初回の `Store::load` / `Store::open` 時に **2パスのO(N)スキャン**で構築し、以降は再利用します。
+
+```
+Pass 1 — POS索引を順走査 (P, O, S 順):
+  Pが変わったとき → 新述語。P内でOが変わったとき → object_count++。triple_count++。
+
+Pass 2 — SPO索引を順走査 (S, P, O 順):
+  (S, P) のペアが変わったとき → subject_count++ (述語Pの)。
+```
+
+両パスとも追加メモリは `HashMap<TermId, PredicateStats>`（述語数 × 28 バイト）のみ。
+
+**ファイルフォーマット (`stats.bin`):**
+
+```
+offset  0: magic          [u8; 8]  = "ECOSTAT1"
+offset  8: total_triples  u64
+offset 16: n_predicates   u64
+offset 24: (28バイト × n_predicates):
+             pred_id       u32
+             triple_count  u64
+             subject_count u64
+             object_count  u64
+```
+
+### 既バインド変数の割引（Tier 1 のみ）
+
+Tier 1（インデックスプローブ）を使う場合、すでに外側のパターンでバインドされた変数はその位置の選択性を大幅に上げますが、推定値にはその情報が含まれません。そこで **バインド済み変数の位置 1つにつき推定値を 1/100 に割り引き**ます。
+
+Tier 2（述語統計）は SP / PO / SPO の match arm がすでにバインド位置を織り込んだ値を返すので割引は行いません。
+
+### 例：問題クエリの JOIN 順序
+
+```sparql
+WHERE {
+  VALUES ?proteome { <chr:1> <chr:2> ... }
+  ?child up:classifiedWith ?parent ;
+         up:proteome ?proteome .
+  ?parent rdfs:subClassOf <GO:0005575> .
+  ?child  up:mnemonic ?child_label .
+  ?parent rdfs:label  ?parent_label .
+}
+```
+
+| ステップ | 選択パターン | 推定値 | 根拠 |
+|---------|-----------|-------|------|
+| 1 | VALUES (hoisted) | — | 自己完結パターンは常に最初 |
+| 2 | `?child up:proteome ?proteome` | ~2,000 | Tier 1: PO索引プローブ (chr:1 等が定数) |
+| 3 | `?parent rdfs:subClassOf GO:0005575` | ~3,000 | Tier 1: PO索引プローブ |
+| 4 | `?child up:classifiedWith ?parent` | ~30* | Tier 1: ?child, ?parent バインド済 → /100 × 2 |
+| 5 | `?child up:mnemonic ?child_label` | 1* | Tier 2 or Tier 1: ?child バインド済 |
+| 6 | `?parent rdfs:label ?parent_label` | 1* | Tier 2 or Tier 1: ?parent バインド済 |
+
+\* バインド済み変数による割引後の推定値
+
+---
+
 ## ファイル構成
 
 ```
@@ -177,8 +285,14 @@ ecordf/
 │   │                    IndexBuilder / IndexFile (SPO・POS・OSP)
 │   │                    GspoBuilder / GspoIndexFile (Named Graphs)
 │   │                    AllBuilders (ビルドフェーズの統合API)
-│   ├── store.rs       ストアファサード: load / open / open_with_config / query / stats
-│   │                    Config を保持し Executor に QueryConfig を渡す
+│   │                    spo_scan_all / pos_scan_all (統計構築用全スキャン)
+│   ├── stats.rs       述語統計: StoreStatistics / PredicateStats
+│   │                    build_from_index (2パスO(N)スキャン)
+│   │                    save / load / load_or_build
+│   │                    estimate (SP/PO/P/SPO ファンアウト推定)
+│   ├── store.rs       ストアファサード: load / open / open_with_config / query
+│   │                    Config / StoreStatistics を保持
+│   │                    Executor に QueryConfig + StoreStatistics を渡す
 │   ├── loader.rs      N-Triples / N-Quads ストリーミングパーサー
 │   ├── sparql/
 │   │   ├── ast.rs     SPARQL 1.1 AST型定義
@@ -188,6 +302,8 @@ ecordf/
 │   │   ├── plan.rs    実行計画型 (ExecutionPlan enum)
 │   │   └── executor.rs Leapfrog Triejoin + hash join + left join
 │   │                    QueryConfig (max_intermediate_rows / bind_join_threshold)
+│   │                    optimize_bgp / estimate_pattern_cardinality
+│   │                    2段階カーディナリティ推定 (index probe + stats)
 │   │                    Property Path BFS (ZeroOrMore / OneOrMore)
 │   │                    Named Graph スキャン (execute_named_graph)
 │   │                    FILTER / BIND / STR の正確な評価
@@ -364,3 +480,5 @@ Semaphore (max_concurrent_queries): アプリ層の同時数キャップ
 6. **Block圧縮** — zstdでディスク使用量をさらに削減
 7. **CONSTRUCT** — RDFグラフを返すクエリ形式
 8. **クエリタイムアウト** — 長時間クエリを自動キャンセルする機能
+9. **HyperLogLog** — subject_count / object_count の厳密カウント（現在は全スキャン）
+10. **BOUND_VAR_FACTOR の自動調整** — 述語の distinctiveness から動的に推定倍率を計算

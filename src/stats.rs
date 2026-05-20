@@ -1,17 +1,59 @@
-//! Histogram-based statistics for query optimization.
+//! Per-predicate statistics for query optimization.
 //!
-//! The optimizer uses these statistics to estimate triple pattern cardinality.
+//! ## Two-tier cardinality estimation
+//!
+//! **Tier 1 – index probing** (`index.estimate()`):
+//!   For patterns that have constant IRIs/literals in at least one position, the
+//!   optimizer calls `TripleIndex::estimate()` which does a binary search over the
+//!   sorted index to count the matching range.  This is exact for the two leading
+//!   key positions and approximate (~50% discount) for the third.
+//!   Cost: O(log N) per pattern, zero memory.
+//!
+//! **Tier 2 – predicate statistics** (`StoreStatistics::estimate()`):
+//!   For patterns whose only bound position is the predicate, index probing
+//!   returns the full predicate fanout (potentially millions of rows).  The
+//!   predicate statistics file provides per-predicate subject/object counts so
+//!   the optimizer can also reason about SP and PO fanout for variable positions.
+//!   Cost: O(N) to build once at load time; O(1) thereafter.
+//!
+//! ## File format (`stats.bin`)
+//!
+//! ```text
+//! offset  0: magic        [u8; 8]  = b"ECOSTAT1"
+//! offset  8: total_triples  u64
+//! offset 16: n_predicates   u64
+//! offset 24: per-predicate records (28 bytes each):
+//!            pred_id       u32
+//!            triple_count  u64
+//!            subject_count u64
+//!            object_count  u64
+//! ```
 
 use std::collections::HashMap;
-use crate::triple::TermId;
+use std::io::{self, BufWriter, Write, Read};
+use std::path::Path;
 
-/// Per-predicate statistics: subject count, object count, triple count.
+use crate::index::TripleIndex;
+use crate::triple::{TermId, UNBOUND};
+
+const STATS_MAGIC: &[u8; 8] = b"ECOSTAT1";
+const RECORD_BYTES: usize = 4 + 8 + 8 + 8; // pred_id + triple + subject + object
+
+// ── Per-predicate statistics ──────────────────────────────────────────────────
+
+/// Per-predicate statistics: triple count, distinct subject count, distinct
+/// object count.  Collected by scanning the SPO and POS indexes in order.
 #[derive(Default)]
 pub struct PredicateStats {
+    /// Total number of triples with this predicate.
     pub triple_count: u64,
-    pub subject_count: u64,    // approx distinct subjects
-    pub object_count: u64,     // approx distinct objects
+    /// Approximate number of distinct subjects that appear with this predicate.
+    pub subject_count: u64,
+    /// Approximate number of distinct objects that appear with this predicate.
+    pub object_count: u64,
 }
+
+// ── Store-wide statistics ─────────────────────────────────────────────────────
 
 pub struct StoreStatistics {
     pub total_triples: u64,
@@ -26,35 +68,198 @@ impl StoreStatistics {
         }
     }
 
+    // ── Construction ──────────────────────────────────────────────────────────
+
+    /// Build statistics by making two O(N) passes over the in-memory indexes.
+    ///
+    /// Pass 1 — POS order (P, O, S): counts triples and distinct objects per
+    /// predicate by detecting when the raw O key changes within a predicate group.
+    ///
+    /// Pass 2 — SPO order (S, P, O): counts distinct subjects per predicate by
+    /// detecting when the (S, P) pair changes.  This is exact because SPO is
+    /// sorted so identical (S, P) pairs are always consecutive.
+    ///
+    /// For large datasets (~1 B triples) each pass takes roughly 5–30 s
+    /// depending on available I/O bandwidth.  The result is saved to `stats.bin`
+    /// so subsequent `Store::open()` calls load it in milliseconds.
+    pub fn build_from_index(index: &TripleIndex) -> Self {
+        let total_triples = index.triple_count() as u64;
+        let mut predicate_stats: HashMap<TermId, PredicateStats> = HashMap::new();
+
+        // ── Pass 1: POS scan ──────────────────────────────────────────────────
+        // The POS index is stored as (P, O, S) in sorted order.  Iterating it
+        // with all-UNBOUND returns triples in that physical order, so triples with
+        // the same P are consecutive, and within each P the O values are sorted.
+        {
+            let mut current_p: TermId = UNBOUND;
+            let mut current_o: TermId = UNBOUND;
+
+            for triple in index.pos_scan_all() {
+                if triple.p != current_p {
+                    current_p = triple.p;
+                    current_o = UNBOUND;
+                }
+                // Count every triple (predicate changes or not)
+                predicate_stats.entry(triple.p).or_default().triple_count += 1;
+                // Count each distinct object value (O changes within P)
+                if triple.o != current_o {
+                    current_o = triple.o;
+                    predicate_stats.entry(triple.p).or_default().object_count += 1;
+                }
+            }
+        }
+
+        // ── Pass 2: SPO scan ──────────────────────────────────────────────────
+        // SPO is stored as (S, P, O).  Count distinct (S, P) transitions per
+        // predicate to approximate the number of distinct subjects.
+        {
+            let mut current_s: TermId = UNBOUND;
+            let mut current_p: TermId = UNBOUND;
+
+            for triple in index.spo_scan_all() {
+                if triple.s != current_s || triple.p != current_p {
+                    current_s = triple.s;
+                    current_p = triple.p;
+                    if let Some(ps) = predicate_stats.get_mut(&triple.p) {
+                        ps.subject_count += 1;
+                    }
+                }
+            }
+        }
+
+        Self { total_triples, predicate_stats }
+    }
+
+    /// Load stats from `stats.bin` if it exists, otherwise build from the index
+    /// and save the result so future calls are fast.
+    pub fn load_or_build(path: &Path, index: &TripleIndex) -> io::Result<Self> {
+        if path.exists() {
+            match Self::load(path) {
+                Ok(s) => return Ok(s),
+                Err(e) => {
+                    eprintln!("Warning: could not read stats.bin ({e}); rebuilding.");
+                }
+            }
+        }
+
+        eprintln!("Building predicate statistics (two index passes)…");
+        let s = Self::build_from_index(index);
+        eprintln!(
+            "Statistics built: {} predicates over {} triples.",
+            s.predicate_stats.len(),
+            s.total_triples
+        );
+
+        // Save for next time — non-fatal if the write fails.
+        if let Err(e) = s.save(path) {
+            eprintln!("Warning: could not save stats.bin ({e}).");
+        }
+
+        Ok(s)
+    }
+
+    // ── Serialisation ─────────────────────────────────────────────────────────
+
+    /// Write statistics to a binary file.
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let f = std::fs::File::create(path)?;
+        let mut w = BufWriter::new(f);
+
+        w.write_all(STATS_MAGIC)?;
+        w.write_all(&self.total_triples.to_le_bytes())?;
+        w.write_all(&(self.predicate_stats.len() as u64).to_le_bytes())?;
+
+        for (pred_id, ps) in &self.predicate_stats {
+            w.write_all(&pred_id.to_le_bytes())?;
+            w.write_all(&ps.triple_count.to_le_bytes())?;
+            w.write_all(&ps.subject_count.to_le_bytes())?;
+            w.write_all(&ps.object_count.to_le_bytes())?;
+        }
+        w.flush()
+    }
+
+    /// Read statistics from a binary file previously written by `save()`.
+    pub fn load(path: &Path) -> io::Result<Self> {
+        let mut data = Vec::new();
+        std::fs::File::open(path)?.read_to_end(&mut data)?;
+
+        if data.len() < 24 || &data[0..8] != STATS_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid or corrupt stats.bin",
+            ));
+        }
+
+        let total_triples = u64::from_le_bytes(data[8..16].try_into().unwrap());
+        let n = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
+
+        if data.len() < 24 + n * RECORD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stats.bin truncated",
+            ));
+        }
+
+        let mut predicate_stats = HashMap::with_capacity(n);
+        let mut off = 24usize;
+        for _ in 0..n {
+            let pred_id  = u32::from_le_bytes(data[off..off+ 4].try_into().unwrap());
+            let tc       = u64::from_le_bytes(data[off+ 4..off+12].try_into().unwrap());
+            let sc       = u64::from_le_bytes(data[off+12..off+20].try_into().unwrap());
+            let oc       = u64::from_le_bytes(data[off+20..off+28].try_into().unwrap());
+            predicate_stats.insert(pred_id, PredicateStats {
+                triple_count:  tc,
+                subject_count: sc,
+                object_count:  oc,
+            });
+            off += RECORD_BYTES;
+        }
+
+        Ok(Self { total_triples, predicate_stats })
+    }
+
+    // ── Cardinality estimation ────────────────────────────────────────────────
+
     /// Estimate the number of results for a triple pattern.
-    /// Used by the optimizer for join ordering.
+    ///
+    /// `None` for a position means the position is an unbound variable.
+    /// `Some(id)` means the position is constrained (either a constant or a
+    /// bound variable that will be probed per outer row).
+    ///
+    /// Uses predicate-level fanout statistics for SP and PO patterns where
+    /// index-based probing would return the full predicate cardinality.
     pub fn estimate(&self, s: Option<TermId>, p: Option<TermId>, o: Option<TermId>) -> u64 {
         let n = self.total_triples.max(1);
         match (s, p, o) {
-            (Some(_), Some(p_id), Some(_)) => {
-                // SPO: at most 1 result
-                1
-            }
-            (Some(_), Some(p_id), None) => {
-                // SP: estimate by predicate object count
-                let ps = self.predicate_stats.get(&p_id);
-                ps.map(|s| (s.triple_count / s.subject_count.max(1)).max(1))
-                  .unwrap_or(n / 100)
-            }
-            (None, Some(p_id), Some(_)) => {
-                // PO
-                let ps = self.predicate_stats.get(&p_id);
-                ps.map(|s| (s.triple_count / s.object_count.max(1)).max(1))
-                  .unwrap_or(n / 100)
-            }
-            (Some(_), None, None) => n / 1000,   // S pattern
-            (None, Some(p_id), None) => {
-                self.predicate_stats.get(&p_id)
-                    .map(|s| s.triple_count)
-                    .unwrap_or(n / 10)
-            }
-            (None, None, Some(_)) => n / 100,    // O pattern (rare)
-            _ => n,                               // Full scan
+            // SPO: single triple lookup
+            (Some(_), Some(_), Some(_)) => 1,
+
+            // SP pattern: how many objects does this subject have for this predicate?
+            (Some(_), Some(p_id), None) => self.predicate_stats
+                .get(&p_id)
+                .map(|ps| (ps.triple_count / ps.subject_count.max(1)).max(1))
+                .unwrap_or(n / 100),
+
+            // PO pattern: how many subjects share this predicate/object?
+            (None, Some(p_id), Some(_)) => self.predicate_stats
+                .get(&p_id)
+                .map(|ps| (ps.triple_count / ps.object_count.max(1)).max(1))
+                .unwrap_or(n / 100),
+
+            // S only: coarse estimate
+            (Some(_), None, None) => n / 1_000,
+
+            // P only: exact triple count for this predicate
+            (None, Some(p_id), None) => self.predicate_stats
+                .get(&p_id)
+                .map(|ps| ps.triple_count)
+                .unwrap_or(n / 10),
+
+            // O only: coarse estimate
+            (None, None, Some(_)) => n / 100,
+
+            // Full scan
+            _ => n,
         }
     }
 }

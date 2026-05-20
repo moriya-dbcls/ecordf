@@ -32,6 +32,7 @@ use std::collections::{HashMap, HashSet};
 use crate::config::QueryConfig;
 use crate::dict::Dictionary;
 use crate::index::{GspoIndexFile, TripleIndex};
+use crate::stats::StoreStatistics;
 use crate::triple::{TermId, TriplePattern, UNBOUND};
 use super::ast::*;
 use super::plan::ExecutionPlan;
@@ -166,21 +167,33 @@ pub struct Executor<'a> {
     pub index: &'a TripleIndex,
     pub dict: &'a Dictionary,
     pub config: QueryConfig,
+    /// Optional predicate statistics for join ordering.
+    /// When `None`, the optimizer falls back to index-probe estimates only.
+    pub stats: Option<&'a StoreStatistics>,
 }
 
 impl<'a> Executor<'a> {
     pub fn new(index: &'a TripleIndex, dict: &'a Dictionary) -> Self {
-        Self { index, dict, config: QueryConfig::default() }
+        Self { index, dict, config: QueryConfig::default(), stats: None }
     }
 
     pub fn with_config(index: &'a TripleIndex, dict: &'a Dictionary, config: QueryConfig) -> Self {
-        Self { index, dict, config }
+        Self { index, dict, config, stats: None }
+    }
+
+    pub fn with_config_and_stats(
+        index: &'a TripleIndex,
+        dict: &'a Dictionary,
+        config: QueryConfig,
+        stats: Option<&'a StoreStatistics>,
+    ) -> Self {
+        Self { index, dict, config, stats }
     }
 
     /// Execute a full query and return results as a ResultSet.
     pub fn execute_select(&self, query: &SelectQuery) -> ResultSet {
         // 1. Optimize the join order
-        let plan = optimize_bgp(&query.pattern, self.index);
+        let plan = optimize_bgp(&query.pattern, self.index, self.dict, self.stats);
 
         // 2. Execute
         let mut bindings = self.execute_plan(&plan);
@@ -249,7 +262,7 @@ impl<'a> Executor<'a> {
     }
 
     pub fn execute_ask(&self, query: &AskQuery) -> bool {
-        let plan = optimize_bgp(&query.pattern, self.index);
+        let plan = optimize_bgp(&query.pattern, self.index, self.dict, self.stats);
         let results = self.execute_plan(&plan);
         !results.rows.is_empty()
     }
@@ -1539,7 +1552,7 @@ impl<'a> Executor<'a> {
                 // Only the variables the subquery *exposes* via SELECT are visible outside.
                 match &sq.projection {
                     Projection::Wildcard => self.collect_plan_vars(
-                        &optimize_bgp(&sq.pattern, self.index), out
+                        &optimize_bgp(&sq.pattern, self.index, self.dict, self.stats), out
                     ),
                     Projection::Variables(items) => {
                         for item in items {
@@ -1892,17 +1905,28 @@ fn collect_pattern_vars(pattern: &GraphPattern, out: &mut HashSet<String>) {
     }
 }
 
-pub fn optimize_bgp(pattern: &GraphPattern, index: &TripleIndex) -> ExecutionPlan {
-    optimize_bgp_with_bound(pattern, index, &HashSet::new())
+pub fn optimize_bgp(
+    pattern: &GraphPattern,
+    index: &TripleIndex,
+    dict: &Dictionary,
+    stats: Option<&StoreStatistics>,
+) -> ExecutionPlan {
+    optimize_bgp_with_bound(pattern, index, dict, stats, &HashSet::new())
 }
 
-fn optimize_bgp_with_bound(pattern: &GraphPattern, index: &TripleIndex, bound: &HashSet<String>) -> ExecutionPlan {
+fn optimize_bgp_with_bound(
+    pattern: &GraphPattern,
+    index: &TripleIndex,
+    dict: &Dictionary,
+    stats: Option<&StoreStatistics>,
+    bound: &HashSet<String>,
+) -> ExecutionPlan {
     match pattern {
         GraphPattern::Bgp(triples) => {
             if triples.is_empty() {
                 return ExecutionPlan::Empty;
             }
-            optimize_triple_patterns(triples, index, bound)
+            optimize_triple_patterns(triples, index, dict, stats, bound)
         }
         GraphPattern::Join(_, _) => {
             // Flatten the entire left-deep Join sequence into a flat list of patterns,
@@ -1936,7 +1960,7 @@ fn optimize_bgp_with_bound(pattern: &GraphPattern, index: &TripleIndex, bound: &
             let mut current_bound = bound.clone();
             let mut plans: Vec<ExecutionPlan> = Vec::with_capacity(ordered.len());
             for p in ordered {
-                plans.push(optimize_bgp_with_bound(p, index, &current_bound));
+                plans.push(optimize_bgp_with_bound(p, index, dict, stats, &current_bound));
                 current_bound.extend(pattern_bound_vars(p));
             }
 
@@ -1950,21 +1974,21 @@ fn optimize_bgp_with_bound(pattern: &GraphPattern, index: &TripleIndex, bound: &
             let mut opt_bound = bound.clone();
             opt_bound.extend(main_vars);
 
-            let mp = optimize_bgp_with_bound(main, index, bound);
-            let op = optimize_bgp_with_bound(opt, index, &opt_bound);
+            let mp = optimize_bgp_with_bound(main, index, dict, stats, bound);
+            let op = optimize_bgp_with_bound(opt, index, dict, stats, &opt_bound);
             ExecutionPlan::Optional(Box::new(mp), Box::new(op))
         }
         GraphPattern::Union(a, b) => {
-            let ap = optimize_bgp_with_bound(a, index, bound);
-            let bp = optimize_bgp_with_bound(b, index, bound);
+            let ap = optimize_bgp_with_bound(a, index, dict, stats, bound);
+            let bp = optimize_bgp_with_bound(b, index, dict, stats, bound);
             ExecutionPlan::Union(Box::new(ap), Box::new(bp))
         }
         GraphPattern::Filter(inner, expr) => {
-            let ip = optimize_bgp_with_bound(inner, index, bound);
+            let ip = optimize_bgp_with_bound(inner, index, dict, stats, bound);
             ExecutionPlan::Filter(Box::new(ip), expr.clone())
         }
         GraphPattern::Extend(inner, expr, var) => {
-            let ip = optimize_bgp_with_bound(inner, index, bound);
+            let ip = optimize_bgp_with_bound(inner, index, dict, stats, bound);
             ExecutionPlan::Extend(Box::new(ip), expr.clone(), var.clone())
         }
         GraphPattern::Values(vc) => {
@@ -1978,7 +2002,7 @@ fn optimize_bgp_with_bound(pattern: &GraphPattern, index: &TripleIndex, bound: &
             ExecutionPlan::Subquery(sq.clone())
         }
         GraphPattern::Graph(graph_term, inner) => {
-            let inner_plan = optimize_bgp_with_bound(inner, index, bound);
+            let inner_plan = optimize_bgp_with_bound(inner, index, dict, stats, bound);
             ExecutionPlan::NamedGraph {
                 graph: graph_term.clone(),
                 inner: Box::new(inner_plan),
@@ -1991,50 +2015,143 @@ fn optimize_bgp_with_bound(pattern: &GraphPattern, index: &TripleIndex, bound: &
     }
 }
 
-fn optimize_triple_patterns(triples: &[TriplePatternAst], index: &TripleIndex, initially_bound: &HashSet<String>) -> ExecutionPlan {
-    // Greedy join ordering: at each step pick the pattern with the most already-bound
-    // variables (constants + variables bound by previously selected patterns).
-    // This avoids cross products and pushes constrained patterns to the front.
+/// Estimate cardinality for a triple pattern at optimization time.
+///
+/// ## Two-tier strategy
+///
+/// **Tier 1 — index probing** (always applied):
+/// Constant IRIs and literals in the pattern are encoded to TermIds via dictionary
+/// lookup.  `TripleIndex::estimate()` performs a binary-search range count over the
+/// best-matching sorted index.  This gives exact-to-near-exact counts for patterns
+/// that have at least one constant in the leading key positions.
+///
+/// **Tier 2 — predicate statistics** (applied when `stats` is `Some`):
+/// When the predicate is a constant but subject or object are variables, index
+/// probing returns the full predicate fanout.  `StoreStatistics::estimate()` uses
+/// pre-computed per-predicate subject/object counts to model SP and PO fanout,
+/// giving much better estimates for `?s pred ?o`-style patterns.
+///
+/// **Bound variable discount**:
+/// Variables already bound by earlier patterns in the join will be substituted at
+/// runtime, sharply reducing result count.  Each such position reduces the estimate
+/// by `BOUND_VAR_FACTOR`.  This is a deliberate underestimate — we prefer to plan
+/// as if the pattern is cheap rather than generating a cross product.
+fn estimate_pattern_cardinality(
+    t: &TriplePatternAst,
+    bound: &HashSet<String>,
+    index: &TripleIndex,
+    dict: &Dictionary,
+    stats: Option<&StoreStatistics>,
+) -> u64 {
+    // Encode constant (non-variable) terms to TermIds for index probing.
+    // Returns None for variables and for constants not (yet) in the dictionary.
+    let resolve_const = |term: &Term| -> Option<TermId> {
+        match term {
+            Term::Variable(_) | Term::BlankNode(_) => None,
+            Term::Iri(iri)     => dict.lookup(iri.as_str()),
+            Term::Literal(lit) => dict.lookup(&lit.to_ntriples()),
+        }
+    };
+
+    let s_id = resolve_const(&t.s);
+    let p_id = resolve_const(&t.p);
+    let o_id = resolve_const(&t.o);
+
+    let is_bound_var = |term: &Term| -> bool {
+        matches!(term, Term::Variable(v) if bound.contains(v.as_str()))
+    };
+
+    // ── Base estimate ─────────────────────────────────────────────────────────
     //
-    // "bound" starts with the set coming from outer context (e.g. VALUES variables),
-    // then grows as each pattern contributes its output variables.
+    // Tier 2 (stats) is preferred when the predicate is a known constant.
+    // It models bound-variable positions via SP/PO/SPO match arms, so it already
+    // accounts for the selectivity introduced by a bound variable — no further
+    // discount is applied.
+    //
+    // Tier 1 (index probe) is used when no stats are available or the predicate is
+    // a variable.  The index estimate ignores bound-variable context, so we apply
+    // a conservative discount for each bound-variable position.
+    let est: u64 = if let (Some(stats), Some(p)) = (stats, p_id) {
+        // ── Tier 2: predicate-aware statistics ───────────────────────────────
+        // The stats.estimate() match arms map (s_opt, Some(p), o_opt) to:
+        //   SP  → triple_count / subject_count  (avg objects per subject)
+        //   PO  → triple_count / object_count   (avg subjects per object)
+        //   SPO → 1  (direct triple check)
+        //   P   → total triples for predicate
+        // This is already conditioned on the bound positions, so no extra discount.
+        let s_opt = if s_id.is_some() || is_bound_var(&t.s) { Some(0u32) } else { None };
+        let o_opt = if o_id.is_some() || is_bound_var(&t.o) { Some(0u32) } else { None };
+        stats.estimate(s_opt, Some(p), o_opt)
+    } else {
+        // ── Tier 1: index binary-search range count ───────────────────────────
+        // Build a TriplePattern with the constant positions encoded and variables
+        // as UNBOUND.  estimate() does a binary search over the sorted index.
+        let pat = TriplePattern {
+            s: s_id.unwrap_or(UNBOUND),
+            p: p_id.unwrap_or(UNBOUND),
+            o: o_id.unwrap_or(UNBOUND),
+        };
+        let mut raw = index.estimate(&pat);
+
+        // ── Bound-variable discount ───────────────────────────────────────────
+        // The index estimate for a variable position assumes a full-range scan.
+        // A bound variable will be probed once per outer row, so the actual
+        // contribution to the result is much smaller.  Divide by BOUND_VAR_FACTOR
+        // for each bound-variable position to model this selectivity.
+        // This is intentionally conservative — we prefer to under-estimate so
+        // the optimizer places constrained patterns before unconstrained ones.
+        const BOUND_VAR_FACTOR: u64 = 100;
+        if s_id.is_none() && is_bound_var(&t.s) { raw = (raw / BOUND_VAR_FACTOR).max(1); }
+        if p_id.is_none() && is_bound_var(&t.p) { raw = (raw / BOUND_VAR_FACTOR).max(1); }
+        if o_id.is_none() && is_bound_var(&t.o) { raw = (raw / BOUND_VAR_FACTOR).max(1); }
+        raw
+    };
+
+    est.max(1)
+}
+
+fn optimize_triple_patterns(
+    triples: &[TriplePatternAst],
+    index: &TripleIndex,
+    dict: &Dictionary,
+    stats: Option<&StoreStatistics>,
+    initially_bound: &HashSet<String>,
+) -> ExecutionPlan {
+    // Greedy join ordering driven by cardinality estimation:
+    //   At each step pick the remaining pattern with the lowest estimated result
+    //   count given the variables already bound by previously selected patterns.
+    //
+    // Estimation priority (see `estimate_pattern_cardinality`):
+    //   1. Index probe for constant positions (O(log N), always used)
+    //   2. Predicate-fanout statistics for variable positions (when stats.bin exists)
+    //   3. Bound-variable discount: each already-bound variable reduces the estimate
+    //      by ×1/100 to reflect runtime substitution.
+    //
+    // "bound" starts with variables provided by the outer context (e.g. VALUES),
+    // then grows as each pattern is selected and contributes its own variables.
 
     let mut remaining: Vec<&TriplePatternAst> = triples.iter().collect();
     let mut bound = initially_bound.clone();
     let mut ordered: Vec<&TriplePatternAst> = Vec::with_capacity(triples.len());
 
     while !remaining.is_empty() {
-        // Selectivity scoring — position matters:
-        //   Subject bound  → +8  (SPO index probe: retrieves a small set per subject)
-        //   Predicate bound→ +2  (POS index: useful but predicate fanout can be huge)
-        //   Object bound   → +1  (OSP index: useful for reverse lookups)
-        // This ensures ?s ?p ?o (subject bound) beats ?p rdf:type ?c (predicate bound)
-        // even when both have one bound position.
+        // Pick the pattern with the smallest estimated cardinality.
+        // `min_by_key` returns the *first* minimum on ties, preserving the original
+        // parse order for equally-estimated patterns (stable, no random tie-breaking).
         let best_idx = remaining.iter().enumerate()
-            .max_by_key(|(_, t)| {
-                let is_bound = |term: &Term| -> bool {
-                    match term {
-                        Term::Variable(v) => bound.contains(v.as_str()),
-                        _ => true, // IRI / literal constant
-                    }
-                };
-                let s = if is_bound(&t.s) { 8u16 } else { 0 };
-                let p = if is_bound(&t.p) { 2u16 } else { 0 };
-                let o = if is_bound(&t.o) { 1u16 } else { 0 };
-                s + p + o
-            })
+            .min_by_key(|(_, t)| estimate_pattern_cardinality(t, &bound, index, dict, stats))
             .map(|(i, _)| i)
             .unwrap();
 
         let best = remaining.remove(best_idx);
-        // Add variables this pattern introduces to the bound set
+        // Add variables this pattern introduces to the bound set.
         if let Term::Variable(v) = &best.s { bound.insert(v.clone()); }
         if let Term::Variable(v) = &best.p { bound.insert(v.clone()); }
         if let Term::Variable(v) = &best.o { bound.insert(v.clone()); }
         ordered.push(best);
     }
 
-    // Build a left-deep join tree
+    // Build a left-deep join tree.
     let first = ExecutionPlan::ScanAst(ordered[0].clone());
     ordered[1..].iter().fold(first, |acc, pat| {
         ExecutionPlan::Join(Box::new(acc), Box::new(ExecutionPlan::ScanAst((*pat).clone())))
