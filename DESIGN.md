@@ -278,7 +278,7 @@ $EDITOR ./uniprot-store/ecordf.toml
 
 | キー | デフォルト | 説明 |
 |------|-----------|------|
-| `query.max_intermediate_rows` | 5,000,000 | 中間結果の行数上限（OOM防止） |
+| `query.max_intermediate_rows` | 50,000,000 | 中間結果の行数上限（OOM防止） |
 | `query.bind_join_threshold` | 10,000 | bind_join / hash_join の切り替え閾値 |
 | `server.host` | `127.0.0.1` | バインドアドレス |
 | `server.port` | `7878` | TCPポート |

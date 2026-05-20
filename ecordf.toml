@@ -20,13 +20,14 @@
 #
 # Memory estimate (approximate):
 #   max_intermediate_rows × ~40 bytes
-#     1_000_000  →  ~40 MB
-#     5_000_000  → ~200 MB   ← default
-#    10_000_000  → ~400 MB
+#      1_000_000  →   ~40 MB
+#      5_000_000  →  ~200 MB
+#     50_000_000  → ~2000 MB ← default
+#    100_000_000  → ~4000 MB
 #
 # Raise on servers with plentiful RAM and complex analytical queries.
 # Lower on memory-constrained environments (containers, shared hosts).
-max_intermediate_rows = 5_000_000
+max_intermediate_rows = 50_000_000
 
 # Row threshold for choosing bind-join over hash-join.
 #

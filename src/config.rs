@@ -100,9 +100,10 @@ pub struct QueryConfig {
     /// returned to the client.
     ///
     /// Memory estimate: `max_intermediate_rows × ~40 bytes`
-    ///   - 1_000_000 rows ≈  40 MB
-    ///   - 5_000_000 rows ≈ 200 MB  ← default
-    ///  10_000_000 rows ≈ 400 MB
+    ///   -  1_000_000 rows ≈   40 MB
+    ///   -  5_000_000 rows ≈  200 MB
+    ///   - 50_000_000 rows ≈ 2000 MB ← default
+    ///   -100_000_000 rows ≈ 4000 MB
     ///
     /// Raise on servers with plentiful RAM.
     /// Lower on memory-constrained environments (embedded, shared hosts).
@@ -129,7 +130,7 @@ pub struct QueryConfig {
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
-            max_intermediate_rows: 5_000_000,
+            max_intermediate_rows: 50_000_000,
             bind_join_threshold: 10_000,
         }
     }
