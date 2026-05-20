@@ -8,6 +8,30 @@
 #
 # Command-line flags (--host, --port, --cors) override the [server] section.
 
+# ── Index build tunables ─────────────────────────────────────────────────────
+
+[build]
+
+# Number of triples per sorted chunk during index build (external sort).
+#
+# During `ecordf build`, incoming triples are accumulated in memory up to this
+# count, then sorted and flushed to a temporary file.  After all input is read,
+# the chunk files are merged via a k-way merge (binary heap) into the final
+# index.  This bounds peak memory to roughly:
+#
+#   chunk_size × 12 bytes × 3 indexes  (SPO + POS + OSP buffers)
+#
+# Approximate peak memory guide:
+#   chunk_size    peak index-buffer RAM
+#   ----------    ---------------------
+#    1_000_000    ≈  36 MB
+#    5_000_000    ≈ 180 MB  ← default
+#   20_000_000    ≈ 720 MB
+#
+# Set to 0 to disable external sort entirely and load all triples into RAM
+# before sorting — use this only on machines with tens of GB of free memory.
+chunk_size = 5_000_000
+
 # ── Query execution tunables ──────────────────────────────────────────────────
 
 [query]
