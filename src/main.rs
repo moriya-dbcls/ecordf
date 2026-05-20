@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
-use ecordf::{Store};
+use ecordf::{Config, Store};
 
 #[derive(Parser)]
 #[command(
@@ -36,13 +36,13 @@ enum Command {
         /// Store directory
         #[arg(short, long, default_value = "./ecordf-data")]
         dir: PathBuf,
-        /// Bind host
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        /// Bind port
-        #[arg(short, long, default_value = "7878")]
-        port: u16,
-        /// Allow cross-origin requests (CORS).
+        /// Bind host (overrides server.host in config file)
+        #[arg(long)]
+        host: Option<String>,
+        /// Bind port (overrides server.port in config file)
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Allow cross-origin requests (overrides server.cors_origins in config file).
         /// Use '*' to allow all origins, or a comma-separated list of specific origins.
         /// Examples:
         ///   --cors '*'
@@ -50,6 +50,9 @@ enum Command {
         ///   --cors 'https://a.example.com,https://b.example.com'
         #[arg(long, value_name = "ORIGINS")]
         cors: Option<String>,
+        /// Path to the config file (default: <store-dir>/ecordf.toml)
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
     },
 
     /// Execute a SPARQL query from command line
@@ -62,6 +65,9 @@ enum Command {
         /// Output format: json (default), tsv, csv, table
         #[arg(short, long, default_value = "table")]
         format: String,
+        /// Path to the config file (default: <store-dir>/ecordf.toml)
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
     },
 
     /// Show store statistics
@@ -100,18 +106,30 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Command::Serve { dir, host, port, cors } => {
-            let store = Store::open(&dir)?;
+        Command::Serve { dir, host, port, cors, config } => {
+            let store = Store::open_with_config(&dir, config.as_deref())?;
             let stats = store.stats();
             eprintln!(
                 "Opened store: {} triples, {} terms",
                 stats.triple_count, stats.term_count
             );
-            ecordf::server::serve(store, &host, port, cors.as_deref()).await?;
+            // CLI flags override config file values
+            let effective_host = host.unwrap_or_else(|| store.config.server.host.clone());
+            let effective_port = port.unwrap_or(store.config.server.port);
+            let effective_cors = cors.or_else(|| {
+                let s = &store.config.server.cors_origins;
+                if s.is_empty() { None } else { Some(s.clone()) }
+            });
+            eprintln!(
+                "Config: max_intermediate_rows={}, bind_join_threshold={}",
+                store.config.query.max_intermediate_rows,
+                store.config.query.bind_join_threshold,
+            );
+            ecordf::server::serve(store, &effective_host, effective_port, effective_cors.as_deref()).await?;
         }
 
-        Command::Query { dir, query, format } => {
-            let store = Store::open(&dir)?;
+        Command::Query { dir, query, format, config } => {
+            let store = Store::open_with_config(&dir, config.as_deref())?;
             let sparql = if query == "-" {
                 use std::io::Read;
                 let mut s = String::new();

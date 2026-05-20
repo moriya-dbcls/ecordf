@@ -28,6 +28,7 @@
 //!   [Dictionary] ── string ↔ u32 with namespace compression
 //! ```
 
+pub mod config;
 pub mod dict;
 pub mod index;
 pub mod loader;
@@ -37,4 +38,5 @@ pub mod stats;
 pub mod store;
 pub mod triple;
 
+pub use config::Config;
 pub use store::Store;

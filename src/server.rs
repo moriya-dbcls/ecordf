@@ -25,11 +25,20 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::store::{QueryResult, Store};
 
 pub type SharedStore = Arc<Store>;
+
+/// Shared server state: the store plus an optional concurrency limiter.
+#[derive(Clone)]
+pub struct AppState {
+    pub store: SharedStore,
+    /// `None` = unlimited.  `Some(sem)` = at most N concurrent queries.
+    pub semaphore: Option<Arc<Semaphore>>,
+}
 
 // ── Request types ─────────────────────────────────────────────────────────────
 
@@ -54,12 +63,12 @@ pub struct SparqlFormParams {
 ///   - `None`  → no CORS headers added (default, safe for local-only use)
 ///   - `Some("*")` → `Access-Control-Allow-Origin: *`
 ///   - `Some("https://example.com,https://app.example.com")` → specific origins
-pub fn build_router(store: SharedStore, cors_origins: Option<&str>) -> Router {
+pub fn build_router(state: AppState, cors_origins: Option<&str>) -> Router {
     let router = Router::new()
         .route("/sparql", get(handle_get).post(handle_post))
         .route("/", get(handle_root))
         .route("/stats", get(handle_stats))
-        .with_state(store);
+        .with_state(state);
 
     match cors_origins {
         None => router,
@@ -124,8 +133,8 @@ async fn handle_root() -> impl IntoResponse {
     )
 }
 
-async fn handle_stats(State(store): State<SharedStore>) -> impl IntoResponse {
-    let stats = store.stats();
+async fn handle_stats(State(state): State<AppState>) -> impl IntoResponse {
+    let stats = state.store.stats();
     let body = json!({
         "triples": stats.triple_count,
         "terms": stats.term_count,
@@ -139,7 +148,7 @@ async fn handle_stats(State(store): State<SharedStore>) -> impl IntoResponse {
 }
 
 async fn handle_get(
-    State(store): State<SharedStore>,
+    State(state): State<AppState>,
     AxumQuery(params): AxumQuery<SparqlGetParams>,
     headers: HeaderMap,
 ) -> Response {
@@ -151,11 +160,11 @@ async fn handle_get(
         .or_else(|| accept_format(&headers))
         .unwrap_or_else(|| "json".to_string());
 
-    execute_query(&store, &query, &format)
+    run_query(state, query, format).await
 }
 
 async fn handle_post(
-    State(store): State<SharedStore>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -184,7 +193,40 @@ async fn handle_post(
     if query.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "missing query");
     }
-    execute_query(&store, &query, &format)
+    run_query(state, query, format).await
+}
+
+/// Offload the synchronous, CPU-bound query execution to tokio's blocking
+/// thread pool so that async worker threads remain free for I/O.
+///
+/// `store.query()` is entirely synchronous.  Calling it directly from an
+/// async handler would block a tokio worker thread for the full duration of
+/// the query, limiting concurrency to the number of CPU cores and starving
+/// the async runtime.  `spawn_blocking` moves the work to a dedicated pool
+/// (default: up to 512 threads), allowing many queries to run in parallel.
+///
+/// If `state.semaphore` is set, at most N queries are admitted simultaneously;
+/// excess requests wait until a slot is released.
+async fn run_query(state: AppState, query: String, format: String) -> Response {
+    // Acquire a concurrency slot if a limit is configured.
+    // The permit is held for the lifetime of the query and released on drop.
+    let _permit = if let Some(ref sem) = state.semaphore {
+        match sem.clone().acquire_owned().await {
+            Ok(p) => Some(p),
+            Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "server shutting down"),
+        }
+    } else {
+        None
+    };
+
+    let store = Arc::clone(&state.store);
+    match tokio::task::spawn_blocking(move || execute_query(&store, &query, &format)).await {
+        Ok(response) => response,
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "query execution panicked",
+        ),
+    }
 }
 
 fn execute_query(store: &Store, query: &str, format: &str) -> Response {
@@ -457,8 +499,19 @@ fn csv_escape(s: &str) -> String {
 ///
 /// `cors_origins`: passed directly to `build_router` — see its doc for accepted values.
 pub async fn serve(store: Store, host: &str, port: u16, cors_origins: Option<&str>) -> io::Result<()> {
-    let shared = Arc::new(store);
-    let app = build_router(shared, cors_origins);
+    let max_concurrent = store.config.server.max_concurrent_queries;
+    let semaphore = if max_concurrent > 0 {
+        eprintln!("Concurrency limit: {} simultaneous queries", max_concurrent);
+        Some(Arc::new(Semaphore::new(max_concurrent)))
+    } else {
+        eprintln!("Concurrency limit: unlimited (bounded by tokio blocking pool, default 512)");
+        None
+    };
+    let state = AppState {
+        store: Arc::new(store),
+        semaphore,
+    };
+    let app = build_router(state, cors_origins);
     let addr = format!("{}:{}", host, port);
 
     if let Some(origins) = cors_origins {

@@ -783,7 +783,11 @@ impl<'a> Parser<'a> {
             }
             // Stop at block-ending tokens
             match self.lexer.peek() {
-                Token::RBrace | Token::Eof => break,
+                // LBrace starts a nested group / subquery — never a triple subject.
+                // Without this check, parse_var_or_term would unconditionally consume
+                // the `{` via lexer.next() before returning Err, silently eating the
+                // opening brace of `{ SELECT ... }` blocks.
+                Token::RBrace | Token::Eof | Token::LBrace => break,
                 Token::Kw(k) => {
                     let kl = k.to_ascii_lowercase();
                     if matches!(kl.as_str(), "optional" | "union" | "filter" | "bind"

@@ -29,23 +29,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::config::QueryConfig;
 use crate::dict::Dictionary;
 use crate::index::{GspoIndexFile, TripleIndex};
 use crate::triple::{TermId, TriplePattern, UNBOUND};
 use super::ast::*;
 use super::plan::ExecutionPlan;
-
-// ── Safety limits ─────────────────────────────────────────────────────────────
-
-/// Maximum number of rows any intermediate result set may hold.
-///
-/// When a join would push a result past this threshold the join is cut short,
-/// a warning is logged, and the (truncated) result is returned.  This prevents
-/// pathological queries (e.g. unconstrained joins over large datasets) from
-/// exhausting RAM and causing the process to be OOM-killed.
-///
-/// 5 million rows × ~40 bytes ≈ 200 MB — a safe ceiling for most servers.
-const MAX_INTERMEDIATE_ROWS: usize = 5_000_000;
 
 // ── Result types ──────────────────────────────────────────────────────────────
 
@@ -57,7 +46,7 @@ pub struct ResultSet {
     pub variables: Vec<String>,
     /// Row-major: rows[i][j] = value of variable j in row i.
     pub rows: Vec<Vec<Option<TermId>>>,
-    /// Set to true when the result was truncated due to MAX_INTERMEDIATE_ROWS.
+    /// Set to true when the result was truncated due to `QueryConfig::max_intermediate_rows`.
     pub overflow: bool,
 }
 
@@ -176,11 +165,16 @@ fn leapfrog_join(mut iters: Vec<SortedIter>) -> Vec<TermId> {
 pub struct Executor<'a> {
     pub index: &'a TripleIndex,
     pub dict: &'a Dictionary,
+    pub config: QueryConfig,
 }
 
 impl<'a> Executor<'a> {
     pub fn new(index: &'a TripleIndex, dict: &'a Dictionary) -> Self {
-        Self { index, dict }
+        Self { index, dict, config: QueryConfig::default() }
+    }
+
+    pub fn with_config(index: &'a TripleIndex, dict: &'a Dictionary, config: QueryConfig) -> Self {
+        Self { index, dict, config }
     }
 
     /// Execute a full query and return results as a ResultSet.
@@ -287,6 +281,8 @@ impl<'a> Executor<'a> {
                 let left_rs = self.execute_plan_with_ctx(left, outer);
                 if left_rs.overflow { return left_rs; }
 
+                let needs_binding = plan_needs_outer_binding(right, &left_rs.variables);
+
                 // Subqueries are self-contained: they ignore the outer binding and always
                 // return the same rows.  Using bind_join would re-execute the subquery for
                 // every left row and produce a cross-product (shared variables are never
@@ -299,25 +295,12 @@ impl<'a> Executor<'a> {
 
                 // If the right plan contains ScanAsts that reference variables produced
                 // by the left side, bind_join MUST be used regardless of left size.
-                //
-                // Without this, when left > 10K rows we'd fall back to hash_join, which
-                // executes the right plan with an empty outer context.  Any ScanAst whose
-                // subject/predicate/object is one of the left variables would then become
-                // an unconstrained full scan.  For example:
-                //   left produces ?child, ?parent
-                //   right has  ?child up:mnemonic ?child_label
-                //              ?parent rdfs:label  ?parent_label
-                // Without binding, both ScanAsts do full scans and cross-join → OOM.
-                //
-                // Bind-join probes the right index once per left row using the bound
-                // values as constants, so it is always cheaper when right depends on left.
-                if plan_needs_outer_binding(right, &left_rs.variables) {
+                if needs_binding {
                     return self.bind_join(left_rs, right, outer);
                 }
 
                 // Right side is independent of left variables → hash_join is fine.
-                const BIND_JOIN_THRESHOLD: usize = 10_000;
-                if left_rs.rows.len() <= BIND_JOIN_THRESHOLD {
+                if left_rs.rows.len() <= self.config.bind_join_threshold {
                     return self.bind_join(left_rs, right, outer);
                 }
                 let right_rs = self.execute_plan_with_ctx(right, outer);
@@ -330,8 +313,7 @@ impl<'a> Executor<'a> {
             ExecutionPlan::Optional(main, opt) => {
                 let main_rs = self.execute_plan_with_ctx(main, outer);
                 if main_rs.overflow { return main_rs; }
-                const BIND_JOIN_THRESHOLD: usize = 10_000;
-                if main_rs.rows.len() <= BIND_JOIN_THRESHOLD {
+                if main_rs.rows.len() <= self.config.bind_join_threshold {
                     // bind_left_join: probe opt per main row, directly building
                     // the LEFT JOIN result.  This avoids the duplicate-probe bug
                     // that the old "collect combined + left_join" approach had:
@@ -669,7 +651,7 @@ impl<'a> Executor<'a> {
                         }
                     }
                     result.rows.push(row);
-                    if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
+                    if result.rows.len() >= self.config.max_intermediate_rows {
                         tracing::warn!(
                             rows = result.rows.len(),
                             "leapfrog_join: intermediate result exceeded limit, truncating"
@@ -711,7 +693,7 @@ impl<'a> Executor<'a> {
                         }
                     }
                     result.rows.push(row);
-                    if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
+                    if result.rows.len() >= self.config.max_intermediate_rows {
                         tracing::warn!(
                             rows = result.rows.len(),
                             "hash_join: intermediate result exceeded limit, truncating"
@@ -765,7 +747,7 @@ impl<'a> Executor<'a> {
                     }
                     result.rows.push(row);
                     matched = true;
-                    if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
+                    if result.rows.len() >= self.config.max_intermediate_rows {
                         tracing::warn!(
                             rows = result.rows.len(),
                             "left_join: intermediate result exceeded limit, truncating"
@@ -783,7 +765,7 @@ impl<'a> Executor<'a> {
                     if let Some(oi) = result.variable_index(lv) { row[oi] = lr[li]; }
                 }
                 result.rows.push(row);
-                if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
+                if result.rows.len() >= self.config.max_intermediate_rows {
                     tracing::warn!(
                         rows = result.rows.len(),
                         "left_join: intermediate result exceeded limit, truncating"
@@ -877,7 +859,7 @@ impl<'a> Executor<'a> {
                 }
                 if !consistent { continue; }
                 result.rows.push(row);
-                if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
+                if result.rows.len() >= self.config.max_intermediate_rows {
                     tracing::warn!(
                         rows = result.rows.len(),
                         "bind_join: intermediate result exceeded limit, truncating"
@@ -981,7 +963,7 @@ impl<'a> Executor<'a> {
                 }
             }
 
-            if result.rows.len() >= MAX_INTERMEDIATE_ROWS {
+            if result.rows.len() >= self.config.max_intermediate_rows {
                 tracing::warn!(
                     rows = result.rows.len(),
                     "bind_left_join: intermediate result exceeded limit, truncating"
@@ -2193,5 +2175,74 @@ impl ResultSet {
             rows: self.rows.clone(),
             overflow: self.overflow,
         }
+    }
+}
+
+// ── Debug helpers ──────────────────────────────────────────────────────────────
+
+/// Return a short type name for an ExecutionPlan node (no recursion).
+fn plan_type_name(plan: &ExecutionPlan) -> &'static str {
+    match plan {
+        ExecutionPlan::Empty           => "Empty",
+        ExecutionPlan::Scan { .. }     => "Scan",
+        ExecutionPlan::ScanAst(_)      => "ScanAst",
+        ExecutionPlan::LeapfrogJoin{..}=> "LeapfrogJoin",
+        ExecutionPlan::Join(_, _)      => "Join",
+        ExecutionPlan::Optional(_, _)  => "Optional",
+        ExecutionPlan::Union(_, _)     => "Union",
+        ExecutionPlan::Filter(_, _)    => "Filter",
+        ExecutionPlan::Extend(_, _, _) => "Extend",
+        ExecutionPlan::Values(_)       => "Values",
+        ExecutionPlan::PathPattern{..} => "PathPattern",
+        ExecutionPlan::NamedGraph{..}  => "NamedGraph",
+        ExecutionPlan::Subquery(_)     => "Subquery",
+    }
+}
+
+/// Recursively build a human-readable plan tree string (indented).
+fn describe_plan(plan: &ExecutionPlan, indent: usize) -> String {
+    let pad = "  ".repeat(indent);
+    match plan {
+        ExecutionPlan::ScanAst(p) => {
+            let s = match &p.s { Term::Variable(v) => format!("?{}", v), Term::Iri(i) => format!("<{}>", i), _ => format!("{:?}", p.s) };
+            let pp = match &p.p { Term::Variable(v) => format!("?{}", v), Term::Iri(i) => format!("<{}>", i), _ => format!("{:?}", p.p) };
+            let o = match &p.o { Term::Variable(v) => format!("?{}", v), Term::Iri(i) => format!("<{}>", i), _ => format!("{:?}", p.o) };
+            format!("{}ScanAst({} {} {})", pad, s, pp, o)
+        }
+        ExecutionPlan::Join(l, r) => {
+            format!("{}Join\n{}\n{}", pad,
+                describe_plan(l, indent + 1),
+                describe_plan(r, indent + 1))
+        }
+        ExecutionPlan::Optional(l, r) => {
+            format!("{}Optional\n{}\n{}", pad,
+                describe_plan(l, indent + 1),
+                describe_plan(r, indent + 1))
+        }
+        ExecutionPlan::Filter(inner, _) => {
+            format!("{}Filter\n{}", pad, describe_plan(inner, indent + 1))
+        }
+        ExecutionPlan::Extend(inner, _, var) => {
+            format!("{}Extend(?{})\n{}", pad, var, describe_plan(inner, indent + 1))
+        }
+        ExecutionPlan::Subquery(sq) => {
+            let proj = match &sq.projection {
+                Projection::Wildcard => "*".to_string(),
+                Projection::Variables(items) => items.iter().map(|i| match i {
+                    SelectItem::Variable(v) => format!("?{}", v),
+                    SelectItem::Alias(_, n) => format!("?{}", n),
+                }).collect::<Vec<_>>().join(" "),
+            };
+            format!("{}Subquery(SELECT {} DISTINCT={} LIMIT={:?})", pad, proj, sq.distinct, sq.limit)
+        }
+        ExecutionPlan::PathPattern { s, path: _, o } => {
+            let sv = match s { Term::Variable(v) => format!("?{}", v), Term::Iri(i) => format!("<{}>", i), _ => "?".to_string() };
+            let ov = match o { Term::Variable(v) => format!("?{}", v), Term::Iri(i) => format!("<{}>", i), _ => "?".to_string() };
+            format!("{}PathPattern({} path {})", pad, sv, ov)
+        }
+        ExecutionPlan::Values(vc) => {
+            format!("{}Values({:?})", pad, vc.variables)
+        }
+        other => format!("{}{}", pad, plan_type_name(other)),
     }
 }

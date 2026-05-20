@@ -1,0 +1,93 @@
+# EcoRDF configuration file
+#
+# Place this file in the store directory (e.g. ./ecordf-data/ecordf.toml)
+# or pass an explicit path with --config <path>.
+#
+# All keys are optional. Missing keys fall back to the built-in defaults
+# shown in the comments below.
+#
+# Command-line flags (--host, --port, --cors) override the [server] section.
+
+# ── Query execution tunables ──────────────────────────────────────────────────
+
+[query]
+
+# Maximum number of rows any intermediate result may hold.
+#
+# Protects against out-of-memory (OOM) on pathological queries such as
+# unconstrained cross-joins over large datasets. When a join would push the row
+# count past this limit, execution is aborted and an error is returned.
+#
+# Memory estimate (approximate):
+#   max_intermediate_rows × ~40 bytes
+#     1_000_000  →  ~40 MB
+#     5_000_000  → ~200 MB   ← default
+#    10_000_000  → ~400 MB
+#
+# Raise on servers with plentiful RAM and complex analytical queries.
+# Lower on memory-constrained environments (containers, shared hosts).
+max_intermediate_rows = 5_000_000
+
+# Row threshold for choosing bind-join over hash-join.
+#
+# When the left-side result has ≤ this many rows AND the right-side plan does
+# not need to be re-evaluated with left-side variable bindings, the executor
+# uses bind-join: it probes the index once per left row, substituting the
+# current binding. This lets the index prune based on the bound value and is
+# typically faster than materialising the entire right side.
+#
+# When the left-side row count exceeds this threshold, hash-join is used
+# instead (materialise both sides, probe with a hash map). Hash-join has lower
+# latency for large, unconstrained right sides, but higher peak memory use.
+#
+# Raise if your queries produce moderate-to-large left results that still
+# benefit from selective index probing (e.g. highly selective predicates).
+# Lower to switch to hash-join earlier (lower peak memory, more scans).
+bind_join_threshold = 10_000
+
+# ── HTTP server defaults ──────────────────────────────────────────────────────
+
+[server]
+
+# Bind address for the SPARQL HTTP endpoint.
+#
+# "127.0.0.1" — loopback only; safe for local / development use.
+# "0.0.0.0"   — all interfaces; required when serving over a network.
+#
+# Overridable with --host on the command line.
+host = "127.0.0.1"
+
+# TCP port for the SPARQL HTTP endpoint.
+#
+# Choose a port ≥ 1024 to avoid requiring root privileges.
+# Common choices: 7878 (default), 8080, 3030.
+#
+# Overridable with --port on the command line.
+port = 7878
+
+# Maximum number of queries that may execute concurrently.
+#
+# Each query runs in tokio's blocking thread pool (spawn_blocking).
+# This cap prevents a burst of slow queries from exhausting system resources.
+#
+#   0  — no limit; bounded only by tokio's blocking pool (default 512).
+#   N  — at most N queries run in parallel; excess requests are queued.
+#
+# Rule of thumb: 2 × number_of_CPU_cores.
+# Raise for short / I/O-bound queries.
+# Lower for RAM-heavy analytical queries to avoid memory pressure.
+max_concurrent_queries = 0
+
+# Allowed CORS origins for the HTTP endpoint.
+#
+# Controls the Access-Control-Allow-Origin response header:
+#
+#   ""        — CORS disabled; no ACAO header is sent.
+#               Use this for local or intranet deployments (safest).
+#   "*"       — Allow any origin.  Convenient for public read-only APIs.
+#               Do NOT use with authentication cookies or private data.
+#   "https://app.example.com,https://other.example.com"
+#             — Whitelist specific origins (comma-separated, no spaces).
+#
+# Overridable with --cors on the command line.
+cors_origins = ""

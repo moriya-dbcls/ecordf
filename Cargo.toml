@@ -54,6 +54,9 @@ form_urlencoded = "1"
 # Error handling in main
 anyhow = "1"
 
+# Configuration file parsing
+toml = "0.8"
+
 [features]
 gzip = ["dep:flate2"]
 

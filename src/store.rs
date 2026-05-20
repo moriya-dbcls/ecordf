@@ -11,6 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use crate::config::Config;
 use crate::dict::Dictionary;
 use crate::index::{AllBuilders, TripleIndex};
 use crate::loader::load_files;
@@ -21,6 +22,7 @@ pub struct Store {
     pub dict: Dictionary,
     pub index: TripleIndex,
     pub dir: PathBuf,
+    pub config: Config,
 }
 
 impl Store {
@@ -59,14 +61,32 @@ impl Store {
             index.triple_count()
         );
 
-        Ok(Self { dict, index, dir: dir.to_path_buf() })
+        // Config is loaded from the store dir (if ecordf.toml exists there).
+        // At build time it may not exist yet — fall back to defaults in that case.
+        let config = Config::resolve(None, dir).map_err(io::Error::from)?;
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config })
     }
 
     /// Reopen an existing store from its directory.
     pub fn open(dir: &Path) -> io::Result<Self> {
         let dict = Dictionary::load(&dir.join("dict.bin"))?;
         let index = TripleIndex::open(dir)?;
-        Ok(Self { dict, index, dir: dir.to_path_buf() })
+        let config = Config::resolve(None, dir).map_err(io::Error::from)?;
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config })
+    }
+
+    /// Reopen an existing store and apply an explicit config file (overrides
+    /// the auto-detected `<store-dir>/ecordf.toml`).
+    pub fn open_with_config(dir: &Path, config_path: Option<&std::path::Path>) -> io::Result<Self> {
+        let dict = Dictionary::load(&dir.join("dict.bin"))?;
+        let index = TripleIndex::open(dir)?;
+        let config = Config::resolve(config_path, dir).map_err(io::Error::from)?;
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config })
+    }
+
+    /// Replace the active configuration without reopening indexes.
+    pub fn set_config(&mut self, config: Config) {
+        self.config = config;
     }
 
     /// Execute a SPARQL query string and return the result set.
@@ -74,7 +94,7 @@ impl Store {
         let t0 = Instant::now();
         let ast = parse_query(sparql).map_err(|e| QueryError::Parse(e.to_string()))?;
 
-        let executor = Executor::new(&self.index, &self.dict);
+        let executor = Executor::with_config(&self.index, &self.dict, self.config.query.clone());
 
         let result = match ast.form {
             QueryForm::Select(ref sq) => {
