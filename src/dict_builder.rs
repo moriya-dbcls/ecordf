@@ -38,8 +38,8 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
@@ -50,6 +50,15 @@ use crate::dict::KNOWN_PREFIXES;
 // ── constants ─────────────────────────────────────────────────────────────────
 
 const SORTED_MAGIC: &[u8; 8] = b"ESRT0001";
+
+/// Maximum number of chunk files opened simultaneously in a single k-way merge pass.
+///
+/// When the total chunk count exceeds this, a **hierarchical merge** is used:
+/// chunks are merged in batches of `MAX_FAN_IN` into intermediate chunk files,
+/// which are then merged in a final pass.  This keeps open-file-descriptor
+/// usage to at most `MAX_FAN_IN + handful` at any moment, avoiding EMFILE even
+/// on systems with low fd limits (macOS default soft limit = 256).
+const MAX_FAN_IN: usize = 64;
 
 /// Strings in the hot cache after this many entries, new entries are dropped.
 /// At ~80 bytes per entry (key Box<str> + value u32 + HashMap overhead) this
@@ -198,8 +207,43 @@ impl StringChunkReader {
 
 /// K-way merge of sorted string chunks → write `dict_sorted.bin`.
 ///
+/// When `chunks.len() > MAX_FAN_IN` a **hierarchical merge** is performed
+/// automatically: chunks are merged in batches into intermediate chunk files,
+/// which are then merged in a final pass.  This bounds the number of
+/// simultaneously open file descriptors to `MAX_FAN_IN + a few`, preventing
+/// EMFILE (`Too many open files`) on large datasets such as UniProt.
+///
 /// Called by [`DictBuilder::finish`] for single-threaded loads, and directly
 /// from the parallel loader after collecting chunks from all per-file threads.
+pub(crate) fn merge_string_chunks(chunks: &[PathBuf], out_path: &Path) -> io::Result<u32> {
+    if chunks.len() <= MAX_FAN_IN {
+        return merge_string_chunks_direct(chunks, out_path);
+    }
+
+    // ── Hierarchical pass: merge groups of MAX_FAN_IN into intermediate chunks ──
+    let mut intermediates: Vec<PathBuf> = Vec::new();
+    for (i, batch) in chunks.chunks(MAX_FAN_IN).enumerate() {
+        let tmp = append_suffix(out_path, &format!(".__merge_{:04}.tmp", i));
+        merge_string_chunks_to_chunk(batch, &tmp)?;
+        intermediates.push(tmp);
+    }
+
+    // ── Final pass: merge intermediate chunks → dict_sorted.bin ───────────────
+    let result = if intermediates.len() <= MAX_FAN_IN {
+        merge_string_chunks_direct(&intermediates, out_path)
+    } else {
+        // More than MAX_FAN_IN² input chunks (rare); recurse.
+        merge_string_chunks(&intermediates, out_path)
+    };
+
+    for p in &intermediates {
+        let _ = fs::remove_file(p);
+    }
+
+    result
+}
+
+/// Merge up to `MAX_FAN_IN` chunks directly into a `dict_sorted.bin` file.
 ///
 /// Uses two temporary files to avoid holding all offsets in RAM:
 /// - `*.strings.tmp`: string bytes in sorted order
@@ -207,7 +251,7 @@ impl StringChunkReader {
 ///
 /// After the merge both temporaries are concatenated into the final file and
 /// removed.
-pub(crate) fn merge_string_chunks(chunks: &[PathBuf], out_path: &Path) -> io::Result<u32> {
+fn merge_string_chunks_direct(chunks: &[PathBuf], out_path: &Path) -> io::Result<u32> {
     let mut readers: Vec<StringChunkReader> = chunks
         .iter()
         .map(|p| StringChunkReader::open(p))
@@ -305,6 +349,57 @@ fn write_empty_sorted_dict(out_path: &Path) -> io::Result<()> {
     w.write_all(&0u64.to_le_bytes())?;  // count = 0
     w.write_all(&24u64.to_le_bytes())?; // offsets_start = 24 (right after header)
     w.flush()
+}
+
+/// Merge up to `MAX_FAN_IN` chunk files into a **new chunk file** at `path`.
+///
+/// The output uses the same format as the input chunks
+/// (`[count: u64][len: u32][bytes…]…`), sorted and deduped, so it can be fed
+/// back into another merge pass.  The count field is back-patched after
+/// writing all strings.
+fn merge_string_chunks_to_chunk(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
+    let mut readers: Vec<StringChunkReader> = chunks
+        .iter()
+        .map(|p| StringChunkReader::open(p))
+        .collect::<io::Result<_>>()?;
+
+    let mut heap: BinaryHeap<Reverse<(String, usize)>> = BinaryHeap::new();
+    for (i, r) in readers.iter_mut().enumerate() {
+        if let Some(s) = r.next_string()? {
+            heap.push(Reverse((s, i)));
+        }
+    }
+
+    let file = File::create(path)?;
+    let mut w = BufWriter::new(file);
+    w.write_all(&0u64.to_le_bytes())?; // count placeholder — back-patched below
+
+    let mut count: u64 = 0;
+    let mut prev: Option<String> = None;
+
+    while let Some(Reverse((s, i))) = heap.pop() {
+        let is_dup = prev.as_deref() == Some(s.as_str());
+        if let Some(next) = readers[i].next_string()? {
+            heap.push(Reverse((next, i)));
+        }
+        if is_dup {
+            continue;
+        }
+        let b = s.as_bytes();
+        w.write_all(&(b.len() as u32).to_le_bytes())?;
+        w.write_all(b)?;
+        count += 1;
+        prev = Some(s);
+    }
+    w.flush()?;
+    drop(w);
+
+    // Back-patch the count field at offset 0.
+    let mut f = OpenOptions::new().write(true).open(path)?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&count.to_le_bytes())?;
+
+    Ok(())
 }
 
 /// Append a suffix to a path's file name (e.g. `foo.bin` → `foo.bin.strings.tmp`).

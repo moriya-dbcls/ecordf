@@ -67,6 +67,17 @@ enum Command {
         /// Use '-' to read from stdin. May be specified multiple times.
         #[arg(long, value_name = "LIST_FILE", action = clap::ArgAction::Append)]
         from_file: Vec<PathBuf>,
+
+        /// Phase 1 (文字列収集) をスキップして Phase 2 (インデックス構築) から再開する。
+        ///
+        /// Phase 1 が完了した後に Phase 2 が中断した場合に使用します。
+        /// `<--dir>/_ecordf_tmp/dict_sorted.bin` が存在している必要があります。
+        ///
+        /// 例:
+        ///
+        ///   ecordf build --dir ./store --resume-phase2 --from-file inputs.txt
+        #[arg(long, default_value_t = false)]
+        resume_phase2: bool,
     },
 
     /// Start the SPARQL 1.1 HTTP endpoint
@@ -187,7 +198,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Build { dir, files, from_file } => {
+        Command::Build { dir, files, from_file, resume_phase2 } => {
             let inputs = resolve_input_files(files, from_file)?;
             if inputs.is_empty() {
                 anyhow::bail!(
@@ -195,7 +206,11 @@ async fn main() -> anyhow::Result<()> {
                      Pass files directly, or use --from-file <list> (or --from-file - to read from stdin)."
                 );
             }
-            let store = Store::load_with_graphs(&dir, &inputs)?;
+            let store = if resume_phase2 {
+                Store::load_with_graphs_resume_phase2(&dir, &inputs)?
+            } else {
+                Store::load_with_graphs(&dir, &inputs)?
+            };
             let stats = store.stats();
             if stats.graph_count > 0 {
                 println!(

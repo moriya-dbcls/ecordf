@@ -2,10 +2,11 @@
 //!
 //! ## Design Goals
 //!
-//! | System   | Problem                        | Our solution                        |
-//! |----------|--------------------------------|-------------------------------------|
-//! | Virtuoso | Slow on complex SPARQL JOINs   | Leapfrog Triejoin (optimal)         |
-//! | Qlever   | Loads entire dataset into RAM  | memmap2: OS-managed paging          |
+//! - **Virtuoso** の複雑な SPARQL JOIN における遅さを、Leapfrog Triejoin（最悪ケース最適）で解決する。
+//! - **低メモリ・低依存** な構成で大規模 RDF データを扱えるようにする。
+//!
+//! memmap2 による OS 管理ページング、外部ソートによるビルド時 RAM バウンド、
+//! ヒストグラムベースの結合順序最適化が主な特徴です。
 //!
 //! ## Architecture
 //!

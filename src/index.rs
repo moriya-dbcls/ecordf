@@ -1,15 +1,14 @@
 //! # Index Layer: Memory-mapped sorted triple arrays
 //!
-//! ## Why this beats Qlever on memory
+//! ## Index storage: memory-mapped files
 //!
-//! Qlever loads the *entire* dataset into RAM at startup.
-//! We use `memmap2::Mmap` instead: the file is mapped into the virtual address space
-//! but actual RAM pages are only allocated by the OS on first access.
-//! The OS page cache evicts cold pages under memory pressure automatically.
+//! Each index file is mapped into the virtual address space via `memmap2::Mmap`.
+//! Actual RAM pages are allocated by the OS only on first access and evicted
+//! automatically under memory pressure (OS page cache).
 //!
 //! Result: working-set memory = only the triples your queries actually touch.
 //! For typical SPARQL workloads over large bio datasets (UniProt ~1B triples),
-//! only ~2-5% of the dataset is touched per query session.
+//! only a small fraction of the dataset is touched per query session.
 //!
 //! ## Index structure
 //!
@@ -51,6 +50,13 @@ const TRIPLE_BYTES: usize = 12; // 3 × u32
 // ── GSPO quad index constants ─────────────────────────────────────────────────
 const GSPO_MAGIC: &[u8; 8] = b"ECOG0001";
 const QUAD_BYTES: usize = 16; // 4 × u32 : (g, s, p, o)
+
+/// Maximum number of chunk files opened simultaneously in a single k-way merge pass.
+///
+/// Prevents EMFILE (`Too many open files`) on systems with low fd limits.
+/// When chunk count exceeds this, a hierarchical merge is used automatically.
+/// With three indexes merging in parallel the peak fd usage is 3 × MAX_FAN_IN.
+const MAX_FAN_IN: usize = 64;
 
 // ── In-memory index (during build) ──────────────────────────────────────────
 
@@ -218,12 +224,42 @@ pub(crate) fn write_index_from_sorted(triples: &[[u32; 3]], path: &Path) -> io::
 
 /// k-way merge of sorted triple chunk files into a single index file.
 ///
-/// Also called by [`AllBuilders::build_from_parallel_chunks`] to merge chunks
-/// gathered from multiple parallel worker threads.
+/// When `chunks.len() > MAX_FAN_IN` a **hierarchical merge** is performed
+/// automatically to keep open-file-descriptor usage bounded (EMFILE-safe).
 ///
 /// Consecutive duplicate triples are dropped so the output is a set.
-/// The count header is back-patched after writing all triples.
 pub(crate) fn merge_triple_chunks(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
+    if chunks.len() <= MAX_FAN_IN {
+        return merge_triple_chunks_direct(chunks, path);
+    }
+
+    // ── Hierarchical pass: merge batches → intermediate chunk files ───────────
+    let mut intermediates: Vec<PathBuf> = Vec::new();
+    for (i, batch) in chunks.chunks(MAX_FAN_IN).enumerate() {
+        let tmp = append_path_suffix(path, &format!(".__merge_{:04}.tmp", i));
+        merge_triple_chunks_to_chunk(batch, &tmp)?;
+        intermediates.push(tmp);
+    }
+
+    // ── Final pass ────────────────────────────────────────────────────────────
+    let result = if intermediates.len() <= MAX_FAN_IN {
+        merge_triple_chunks_direct(&intermediates, path)
+    } else {
+        merge_triple_chunks(&intermediates, path)
+    };
+
+    for p in &intermediates {
+        let _ = std::fs::remove_file(p);
+    }
+
+    result
+}
+
+/// Merge up to `MAX_FAN_IN` chunk files directly into a final index file.
+///
+/// The output has the full index-file header (`INDEX_MAGIC` + count).
+/// The count is back-patched after writing all triples.
+fn merge_triple_chunks_direct(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
     // ── Open all chunk readers ────────────────────────────────────────────────
     let mut readers: Vec<TripleChunkReader> = chunks.iter()
         .map(|p| TripleChunkReader::open(p))
@@ -267,6 +303,59 @@ pub(crate) fn merge_triple_chunks(chunks: &[PathBuf], path: &Path) -> io::Result
     f.write_all(&count.to_le_bytes())?;
 
     Ok(())
+}
+
+/// Merge up to `MAX_FAN_IN` chunk files into a **new chunk file** at `path`.
+///
+/// Output format: `[count: u64][triple data…]` (no index magic header),
+/// identical to the input chunk format so it can be fed into another pass.
+/// The count field is back-patched after writing all triples.
+fn merge_triple_chunks_to_chunk(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
+    let mut readers: Vec<TripleChunkReader> = chunks.iter()
+        .map(|p| TripleChunkReader::open(p))
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let out_file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+    let mut w = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
+    w.write_all(&0u64.to_le_bytes())?; // count placeholder
+
+    let mut heap: BinaryHeap<Reverse<([u32; 3], usize)>> = BinaryHeap::new();
+    for (i, reader) in readers.iter_mut().enumerate() {
+        if let Some(t) = reader.next()? {
+            heap.push(Reverse((t, i)));
+        }
+    }
+
+    let mut count = 0u64;
+    let mut prev: Option<[u32; 3]> = None;
+    while let Some(Reverse((t, i))) = heap.pop() {
+        if Some(t) != prev {
+            w.write_all(&t[0].to_le_bytes())?;
+            w.write_all(&t[1].to_le_bytes())?;
+            w.write_all(&t[2].to_le_bytes())?;
+            count += 1;
+            prev = Some(t);
+        }
+        if let Some(next) = readers[i].next()? {
+            heap.push(Reverse((next, i)));
+        }
+    }
+    w.flush()?;
+    drop(w);
+
+    // Back-patch count at offset 0.
+    let mut f = OpenOptions::new().write(true).open(path)?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&count.to_le_bytes())?;
+
+    Ok(())
+}
+
+/// Append a suffix to a path's filename (e.g. `spo.bin` → `spo.bin.__merge_0000.tmp`).
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
 }
 
 /// Streaming reader for a binary triple chunk file.
@@ -655,7 +744,35 @@ fn write_gspo_index_from_sorted(quads: &[[u32; 4]], path: &Path) -> io::Result<(
     w.flush()
 }
 
+/// k-way merge of sorted quad chunk files into a single GSPO index file.
+///
+/// Hierarchical merge is applied automatically when `chunks.len() > MAX_FAN_IN`.
 pub(crate) fn merge_quad_chunks(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
+    if chunks.len() <= MAX_FAN_IN {
+        return merge_quad_chunks_direct(chunks, path);
+    }
+
+    let mut intermediates: Vec<PathBuf> = Vec::new();
+    for (i, batch) in chunks.chunks(MAX_FAN_IN).enumerate() {
+        let tmp = append_path_suffix(path, &format!(".__merge_{:04}.tmp", i));
+        merge_quad_chunks_to_chunk(batch, &tmp)?;
+        intermediates.push(tmp);
+    }
+
+    let result = if intermediates.len() <= MAX_FAN_IN {
+        merge_quad_chunks_direct(&intermediates, path)
+    } else {
+        merge_quad_chunks(&intermediates, path)
+    };
+
+    for p in &intermediates {
+        let _ = std::fs::remove_file(p);
+    }
+
+    result
+}
+
+fn merge_quad_chunks_direct(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
     let mut readers: Vec<QuadChunkReader> = chunks.iter()
         .map(|p| QuadChunkReader::open(p))
         .collect::<io::Result<Vec<_>>>()?;
@@ -689,6 +806,47 @@ pub(crate) fn merge_quad_chunks(chunks: &[PathBuf], path: &Path) -> io::Result<(
     drop(w);
     let mut f = OpenOptions::new().write(true).open(path)?;
     f.seek(SeekFrom::Start(8))?;
+    f.write_all(&count.to_le_bytes())?;
+
+    Ok(())
+}
+
+/// Merge up to `MAX_FAN_IN` quad chunk files into a new chunk file at `path`.
+///
+/// Output: `[count: u64][quad data…]` (no GSPO magic header).
+fn merge_quad_chunks_to_chunk(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
+    let mut readers: Vec<QuadChunkReader> = chunks.iter()
+        .map(|p| QuadChunkReader::open(p))
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let out_file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+    let mut w = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
+    w.write_all(&0u64.to_le_bytes())?; // count placeholder
+
+    let mut heap: BinaryHeap<Reverse<([u32; 4], usize)>> = BinaryHeap::new();
+    for (i, reader) in readers.iter_mut().enumerate() {
+        if let Some(q) = reader.next()? {
+            heap.push(Reverse((q, i)));
+        }
+    }
+
+    let mut count = 0u64;
+    let mut prev: Option<[u32; 4]> = None;
+    while let Some(Reverse((q, i))) = heap.pop() {
+        if Some(q) != prev {
+            for v in &q { w.write_all(&v.to_le_bytes())?; }
+            count += 1;
+            prev = Some(q);
+        }
+        if let Some(next) = readers[i].next()? {
+            heap.push(Reverse((next, i)));
+        }
+    }
+    w.flush()?;
+    drop(w);
+
+    let mut f = OpenOptions::new().write(true).open(path)?;
+    f.seek(SeekFrom::Start(0))?;
     f.write_all(&count.to_le_bytes())?;
 
     Ok(())

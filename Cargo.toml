@@ -5,10 +5,10 @@ edition = "2021"
 authors = ["EcoRDF Project"]
 description = """
 EcoRDF: A cost-efficient RDF triple store.
-Low memory (vs Qlever) + fast response (vs Virtuoso) via:
   - memmap2-backed sorted indexes (OS-managed paging)
   - Leapfrog Triejoin (provably optimal multi-way join)
   - Cost-based query optimizer with histogram statistics
+  - External-sort build: bounded RAM regardless of dataset size
 """
 
 [[bin]]

@@ -59,7 +59,7 @@ impl Store {
             .collect();
 
         if config.build.chunk_size > 0 {
-            Self::load_two_pass_internal(dir, &inputs, &config)
+            Self::load_two_pass_internal(dir, &inputs, &config, false)
         } else {
             Self::load_one_pass_internal(dir, input_files, &config)
         }
@@ -93,7 +93,17 @@ impl Store {
 
     // ── internal: two-pass (external-sort dict) ───────────────────────────────
 
-    fn load_two_pass_internal(dir: &Path, inputs: &[InputSpec], config: &Config) -> io::Result<Self> {
+    /// Two-pass external-sort index build.
+    ///
+    /// When `resume_phase2 = true`, Phase 1 (string collection) is skipped and
+    /// an existing `_ecordf_tmp/dict_sorted.bin` is used directly.  This lets
+    /// you continue a build that was interrupted after Phase 1 completed.
+    fn load_two_pass_internal(
+        dir: &Path,
+        inputs: &[InputSpec],
+        config: &Config,
+        resume_phase2: bool,
+    ) -> io::Result<Self> {
         let tmp_dir = dir.join("_ecordf_tmp");
         let dict_sorted_path = tmp_dir.join("dict_sorted.bin");
 
@@ -128,33 +138,61 @@ impl Store {
 
         fs::create_dir_all(&tmp_dir)?;
 
-        // ── Phase 1: collect all unique strings (parallel) ────────────────────
-        eprintln!("=== Phase 1: collecting unique terms ({} threads) ===", num_threads);
+        // ── Phase 1: collect all unique strings (or skip if resuming) ─────────
+        let term_count: u32;
 
-        let (all_string_chunks, p1_stats) = pool.install(|| {
-            collect_strings_parallel(inputs, &tmp_dir, dict_chunk_bytes, num_threads)
-        })?;
+        if resume_phase2 {
+            // ── Resume path: verify dict_sorted.bin, skip string collection ───
+            if !dict_sorted_path.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "--resume-phase2: {:?} が見つかりません。\n\
+                         Phase 1 が完了していることを確認してください。\n\
+                         最初からやり直す場合は --resume-phase2 なしで実行してください。",
+                        dict_sorted_path
+                    ),
+                ));
+            }
+            let rdict = ReadonlyDict::open(&dict_sorted_path)?;
+            term_count = rdict.len() as u32;
+            eprintln!(
+                "=== Phase 1 をスキップ (--resume-phase2): 既存の辞書を使用 ===\n\
+                 Dictionary: {} terms  ({:?})",
+                term_count, dict_sorted_path
+            );
+            // 中断した Phase 1 が残した p1_ ディレクトリを掃除する
+            for i in 0..inputs.len() {
+                let _ = fs::remove_dir_all(tmp_dir.join(format!("p1_{:06}", i)));
+            }
+        } else {
+            eprintln!("=== Phase 1: collecting unique terms ({} threads) ===", num_threads);
 
-        eprintln!(
-            "Phase 1 done: {} lines processed, {} string chunks  ({:.1}s)",
-            p1_stats.lines_processed,
-            all_string_chunks.len(),
-            t0.elapsed().as_secs_f64()
-        );
+            let (all_string_chunks, p1_stats) = pool.install(|| {
+                collect_strings_parallel(inputs, &tmp_dir, dict_chunk_bytes, num_threads)
+            })?;
 
-        // k-way merge of all per-thread/per-file string chunks
-        let t_merge = Instant::now();
-        let term_count = crate::dict_builder::merge_string_chunks(&all_string_chunks, &dict_sorted_path)?;
-        // Clean up per-file Phase 1 subdirectories
-        for i in 0..inputs.len() {
-            let _ = fs::remove_dir_all(tmp_dir.join(format!("p1_{:06}", i)));
+            eprintln!(
+                "Phase 1 done: {} lines processed, {} string chunks  ({:.1}s)",
+                p1_stats.lines_processed,
+                all_string_chunks.len(),
+                t0.elapsed().as_secs_f64()
+            );
+
+            // k-way merge of all per-thread/per-file string chunks
+            let t_merge = Instant::now();
+            term_count = crate::dict_builder::merge_string_chunks(&all_string_chunks, &dict_sorted_path)?;
+            // Clean up per-file Phase 1 subdirectories
+            for i in 0..inputs.len() {
+                let _ = fs::remove_dir_all(tmp_dir.join(format!("p1_{:06}", i)));
+            }
+            eprintln!(
+                "Dictionary: {} unique terms  (merge {:.1}s  |  total {:.1}s)",
+                term_count,
+                t_merge.elapsed().as_secs_f64(),
+                t0.elapsed().as_secs_f64()
+            );
         }
-        eprintln!(
-            "Dictionary: {} unique terms  (merge {:.1}s  |  total {:.1}s)",
-            term_count,
-            t_merge.elapsed().as_secs_f64(),
-            t0.elapsed().as_secs_f64()
-        );
 
         // ── Phase 2: load triples in parallel ─────────────────────────────────
         eprintln!("=== Phase 2: loading triples ({} threads) ===", num_threads);
@@ -213,10 +251,38 @@ impl Store {
         let config = Config::resolve(None, dir).map_err(io::Error::from)?;
 
         if config.build.chunk_size > 0 {
-            Self::load_two_pass_internal(dir, inputs, &config)
+            Self::load_two_pass_internal(dir, inputs, &config, false)
         } else {
             let t0 = Instant::now();
             eprintln!("=== EcoRDF: loading {} file(s) [one-pass] ===", inputs.len());
+            let dict = Dictionary::new();
+            let mut builders = AllBuilders::new_streaming(dir, 0)?;
+            let stats = load_files_with_graphs(inputs, &dict, &mut builders)?;
+            eprintln!("Parsed {} triples in {:.1}s. Writing indexes...",
+                stats.triples_loaded, t0.elapsed().as_secs_f64());
+            let index = builders.build(dir)?;
+            dict.save(&dir.join("dict.bin"))?;
+            let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
+            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats })
+        }
+    }
+
+    /// [`load_with_graphs`] と同じだが Phase 1 (文字列収集) をスキップする。
+    ///
+    /// `<dir>/_ecordf_tmp/dict_sorted.bin` が存在している必要があります。
+    /// Phase 1 が完了した後に Phase 2 が失敗した場合の再実行用。
+    ///
+    /// `chunk_size == 0` の場合は通常の one-pass ビルドにフォールバックします。
+    pub fn load_with_graphs_resume_phase2(dir: &Path, inputs: &[InputSpec]) -> io::Result<Self> {
+        fs::create_dir_all(dir)?;
+        let config = Config::resolve(None, dir).map_err(io::Error::from)?;
+
+        if config.build.chunk_size > 0 {
+            Self::load_two_pass_internal(dir, inputs, &config, true)
+        } else {
+            // chunk_size == 0 はもともと one-pass なので resume の概念がない
+            eprintln!("警告: chunk_size=0 のため --resume-phase2 は無視し通常ビルドを実行します");
+            let t0 = Instant::now();
             let dict = Dictionary::new();
             let mut builders = AllBuilders::new_streaming(dir, 0)?;
             let stats = load_files_with_graphs(inputs, &dict, &mut builders)?;
