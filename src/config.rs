@@ -120,12 +120,31 @@ pub struct BuildConfig {
     /// RAM before sorting (the old behaviour).  Only do this on machines with
     /// many tens of GB of free memory and datasets that fit comfortably in RAM.
     pub chunk_size: usize,
+
+    /// RAM budget (in MiB) for the string-collection buffer in the two-pass
+    /// dictionary builder (used when `chunk_size > 0`).
+    ///
+    /// During Phase 1 of the two-pass load, unique RDF terms are accumulated
+    /// in memory up to this size, then sorted, deduped, and flushed to a
+    /// temporary chunk file.  All chunks are later k-way merged on disk.
+    ///
+    /// | dict_chunk_mb | peak string-buffer RAM |
+    /// |---------------|------------------------|
+    /// |  50           |  ≈  50 MB              |
+    /// | 200           |  ≈ 200 MB  (default)   |
+    /// | 500           |  ≈ 500 MB              |
+    ///
+    /// Larger values mean fewer chunk files and a faster merge, at the cost of
+    /// more RAM.  A value of 200 MB is a safe default for machines with ≥ 1 GB
+    /// of free memory.
+    pub dict_chunk_mb: usize,
 }
 
 impl Default for BuildConfig {
     fn default() -> Self {
         Self {
             chunk_size: 5_000_000,
+            dict_chunk_mb: 200,
         }
     }
 }

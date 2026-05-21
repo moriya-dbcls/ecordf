@@ -210,6 +210,323 @@ fn parse_nt_line(line: &str) -> Option<(String, String, String)> {
     }
 }
 
+// ── Generic parse visitors (shared by one-pass and two-pass paths) ────────────
+
+/// Stream every triple from an N-Triples file through `f(subject, predicate, object)`.
+fn visit_nt_file<F>(path: &Path, mut f: F) -> io::Result<LoadStats>
+where
+    F: FnMut(&str, &str, &str) -> io::Result<()>,
+{
+    let file = File::open(path)?;
+    let reader = BufReader::with_capacity(4 * 1024 * 1024, file);
+    let mut stats = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
+    for line in reader.lines() {
+        let line = line?;
+        stats.lines_processed += 1;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        match parse_nt_line(line) {
+            Some((s, p, o)) => { f(&s, &p, &o)?; stats.triples_loaded += 1; }
+            None => {
+                stats.errors += 1;
+                if stats.errors <= 10 {
+                    eprintln!("  parse error on line {}: {:?}", stats.lines_processed, &line[..line.len().min(80)]);
+                }
+            }
+        }
+    }
+    Ok(stats)
+}
+
+/// Stream every quad from an N-Quads file through `f(s, p, o, graph_opt)`.
+fn visit_nq_file<F>(path: &Path, mut f: F) -> io::Result<LoadStats>
+where
+    F: FnMut(&str, &str, &str, Option<&str>) -> io::Result<()>,
+{
+    let file = File::open(path)?;
+    let reader = BufReader::with_capacity(4 * 1024 * 1024, file);
+    let mut stats = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
+    for line in reader.lines() {
+        let line = line?;
+        stats.lines_processed += 1;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        match parse_nq_line(line) {
+            Some((s, p, o, g)) => {
+                f(&s, &p, &o, g.as_deref())?;
+                stats.triples_loaded += 1;
+            }
+            None => { stats.errors += 1; }
+        }
+    }
+    Ok(stats)
+}
+
+#[cfg(feature = "gzip")]
+fn visit_nt_file_gz<F>(path: &Path, mut f: F) -> io::Result<LoadStats>
+where
+    F: FnMut(&str, &str, &str) -> io::Result<()>,
+{
+    use flate2::read::GzDecoder;
+    let file = File::open(path)?;
+    let gz = GzDecoder::new(file);
+    let reader = BufReader::new(gz);
+    let mut stats = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
+    for line in reader.lines() {
+        let line = line?;
+        stats.lines_processed += 1;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        match parse_nt_line(line) {
+            Some((s, p, o)) => { f(&s, &p, &o)?; stats.triples_loaded += 1; }
+            None => { stats.errors += 1; }
+        }
+    }
+    Ok(stats)
+}
+
+#[cfg(not(feature = "gzip"))]
+fn visit_nt_file_gz<F>(_path: &Path, _f: F) -> io::Result<LoadStats>
+where F: FnMut(&str, &str, &str) -> io::Result<()>
+{
+    Err(io::Error::new(io::ErrorKind::Unsupported,
+        "gzip support not compiled in — rebuild with: cargo build --features gzip"))
+}
+
+#[cfg(feature = "gzip")]
+fn visit_nq_file_gz<F>(path: &Path, mut f: F) -> io::Result<LoadStats>
+where
+    F: FnMut(&str, &str, &str, Option<&str>) -> io::Result<()>,
+{
+    use flate2::read::GzDecoder;
+    let file = File::open(path)?;
+    let gz = GzDecoder::new(file);
+    let reader = BufReader::new(gz);
+    let mut stats = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
+    for line in reader.lines() {
+        let line = line?;
+        stats.lines_processed += 1;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        match parse_nq_line(line) {
+            Some((s, p, o, g)) => {
+                f(&s, &p, &o, g.as_deref())?;
+                stats.triples_loaded += 1;
+            }
+            None => { stats.errors += 1; }
+        }
+    }
+    Ok(stats)
+}
+
+#[cfg(not(feature = "gzip"))]
+fn visit_nq_file_gz<F>(_path: &Path, _f: F) -> io::Result<LoadStats>
+where F: FnMut(&str, &str, &str, Option<&str>) -> io::Result<()>
+{
+    Err(io::Error::new(io::ErrorKind::Unsupported,
+        "gzip support not compiled in — rebuild with: cargo build --features gzip"))
+}
+
+// ── Phase 1: string collection ────────────────────────────────────────────────
+
+/// Collect every unique RDF term from `inputs` into `db` (Phase 1 of two-pass load).
+///
+/// Streams through each file without building any index or triple buffer.
+/// Memory cost = `db`'s internal chunk buffer (bounded by `dict_chunk_mb`).
+pub fn collect_strings_from_inputs(
+    inputs: &[InputSpec],
+    db: &mut crate::dict_builder::DictBuilder,
+) -> io::Result<LoadStats> {
+    let mut total = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
+    for input in inputs {
+        let path = &input.path;
+        eprintln!("  Phase 1: {:?}", path.file_name().unwrap_or_default());
+        let graph = input.graph.as_deref();
+        let stats = match (classify_extension(path), graph) {
+            (FileKind::NTriples,   Some(g)) => collect_nt_strings(path, Some(g), db)?,
+            (FileKind::NTriples,   None)    => collect_nt_strings(path, None,    db)?,
+            (FileKind::NTriplesGz, Some(g)) => collect_nt_strings_gz(path, Some(g), db)?,
+            (FileKind::NTriplesGz, None)    => collect_nt_strings_gz(path, None,    db)?,
+            (FileKind::NQuads,   _)         => collect_nq_strings(path, db)?,
+            (FileKind::NQuadsGz, _)         => collect_nq_strings_gz(path, db)?,
+            (FileKind::Unknown(_), Some(g)) => collect_nt_strings(path, Some(g), db)?,
+            (FileKind::Unknown(_), None)    => collect_nt_strings(path, None,    db)?,
+        };
+        total.triples_loaded  += stats.triples_loaded;
+        total.lines_processed += stats.lines_processed;
+        total.errors          += stats.errors;
+    }
+    Ok(total)
+}
+
+fn collect_nt_strings(path: &Path, graph: Option<&str>, db: &mut crate::dict_builder::DictBuilder) -> io::Result<LoadStats> {
+    if let Some(g) = graph { db.add(g)?; }
+    visit_nt_file(path, |s, p, o| { db.add(s)?; db.add(p)?; db.add(o) })
+}
+
+fn collect_nt_strings_gz(path: &Path, graph: Option<&str>, db: &mut crate::dict_builder::DictBuilder) -> io::Result<LoadStats> {
+    if let Some(g) = graph { db.add(g)?; }
+    visit_nt_file_gz(path, |s, p, o| { db.add(s)?; db.add(p)?; db.add(o) })
+}
+
+fn collect_nq_strings(path: &Path, db: &mut crate::dict_builder::DictBuilder) -> io::Result<LoadStats> {
+    visit_nq_file(path, |s, p, o, g| {
+        db.add(s)?; db.add(p)?; db.add(o)?;
+        if let Some(g) = g { db.add(g)?; }
+        Ok(())
+    })
+}
+
+fn collect_nq_strings_gz(path: &Path, db: &mut crate::dict_builder::DictBuilder) -> io::Result<LoadStats> {
+    visit_nq_file_gz(path, |s, p, o, g| {
+        db.add(s)?; db.add(p)?; db.add(o)?;
+        if let Some(g) = g { db.add(g)?; }
+        Ok(())
+    })
+}
+
+// ── Phase 2: triple loading with ReadonlyDict ─────────────────────────────────
+
+/// Load triples from `inputs` using IDs from `dict` (Phase 2 of two-pass load).
+///
+/// Every string is resolved via binary search on the mmap-ed `ReadonlyDict`.
+/// Returns an error if a term is missing from the dictionary (indicates a
+/// mismatch between Phase 1 and Phase 2 parsing).
+pub fn load_triples_with_readonly_dict(
+    inputs: &[InputSpec],
+    dict: &crate::dict_builder::ReadonlyDict,
+    builders: &mut AllBuilders,
+) -> io::Result<LoadStats> {
+    let mut total = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
+    for input in inputs {
+        let path = &input.path;
+        let graph_label = input.graph.as_deref()
+            .map(|g| format!(" → <{}>", g))
+            .unwrap_or_default();
+        eprintln!("  Phase 2: {:?}{}", path.file_name().unwrap_or_default(), graph_label);
+
+        let stats = match (classify_extension(path), input.graph.as_deref()) {
+            (FileKind::NTriples,   Some(g)) => load_nt_two_pass_graph(path, g, dict, builders)?,
+            (FileKind::NTriples,   None)    => load_nt_two_pass(path, None, dict, builders)?,
+            (FileKind::NTriplesGz, Some(g)) => load_nt_two_pass_gz_graph(path, g, dict, builders)?,
+            (FileKind::NTriplesGz, None)    => load_nt_two_pass_gz(path, None, dict, builders)?,
+            (FileKind::NQuads,   _)         => load_nq_two_pass(path, dict, builders)?,
+            (FileKind::NQuadsGz, _)         => load_nq_two_pass_gz(path, dict, builders)?,
+            (FileKind::Unknown(_), Some(g)) => load_nt_two_pass_graph(path, g, dict, builders)?,
+            (FileKind::Unknown(_), None)    => load_nt_two_pass(path, None, dict, builders)?,
+        };
+        total.triples_loaded  += stats.triples_loaded;
+        total.lines_processed += stats.lines_processed;
+        total.errors          += stats.errors;
+        eprintln!("    → {} triples ({} errors)", stats.triples_loaded, stats.errors);
+    }
+    Ok(total)
+}
+
+#[inline]
+fn lookup(dict: &crate::dict_builder::ReadonlyDict, s: &str) -> io::Result<u32> {
+    dict.get_id(s).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("term not found in dictionary (phase 1/2 mismatch?): {:?}", &s[..s.len().min(80)]),
+        )
+    })
+}
+
+fn load_nt_two_pass(
+    path: &Path,
+    _graph: Option<&str>,
+    dict: &crate::dict_builder::ReadonlyDict,
+    builders: &mut AllBuilders,
+) -> io::Result<LoadStats> {
+    visit_nt_file(path, |s, p, o| {
+        let si = lookup(dict, s)?;
+        let pi = lookup(dict, p)?;
+        let oi = lookup(dict, o)?;
+        builders.push(crate::triple::Triple::new(si, pi, oi))
+    })
+}
+
+fn load_nt_two_pass_graph(
+    path: &Path,
+    graph_iri: &str,
+    dict: &crate::dict_builder::ReadonlyDict,
+    builders: &mut AllBuilders,
+) -> io::Result<LoadStats> {
+    let gi = lookup(dict, graph_iri)?;
+    visit_nt_file(path, |s, p, o| {
+        let si = lookup(dict, s)?;
+        let pi = lookup(dict, p)?;
+        let oi = lookup(dict, o)?;
+        builders.push_quad(crate::triple::Quad::new(si, pi, oi, gi))
+    })
+}
+
+fn load_nt_two_pass_gz(
+    path: &Path,
+    _graph: Option<&str>,
+    dict: &crate::dict_builder::ReadonlyDict,
+    builders: &mut AllBuilders,
+) -> io::Result<LoadStats> {
+    visit_nt_file_gz(path, |s, p, o| {
+        let si = lookup(dict, s)?;
+        let pi = lookup(dict, p)?;
+        let oi = lookup(dict, o)?;
+        builders.push(crate::triple::Triple::new(si, pi, oi))
+    })
+}
+
+fn load_nt_two_pass_gz_graph(
+    path: &Path,
+    graph_iri: &str,
+    dict: &crate::dict_builder::ReadonlyDict,
+    builders: &mut AllBuilders,
+) -> io::Result<LoadStats> {
+    let gi = lookup(dict, graph_iri)?;
+    visit_nt_file_gz(path, |s, p, o| {
+        let si = lookup(dict, s)?;
+        let pi = lookup(dict, p)?;
+        let oi = lookup(dict, o)?;
+        builders.push_quad(crate::triple::Quad::new(si, pi, oi, gi))
+    })
+}
+
+fn load_nq_two_pass(
+    path: &Path,
+    dict: &crate::dict_builder::ReadonlyDict,
+    builders: &mut AllBuilders,
+) -> io::Result<LoadStats> {
+    visit_nq_file(path, |s, p, o, g| {
+        let si = lookup(dict, s)?;
+        let pi = lookup(dict, p)?;
+        let oi = lookup(dict, o)?;
+        if let Some(g) = g {
+            let gi = lookup(dict, g)?;
+            builders.push_quad(crate::triple::Quad::new(si, pi, oi, gi))
+        } else {
+            builders.push(crate::triple::Triple::new(si, pi, oi))
+        }
+    })
+}
+
+fn load_nq_two_pass_gz(
+    path: &Path,
+    dict: &crate::dict_builder::ReadonlyDict,
+    builders: &mut AllBuilders,
+) -> io::Result<LoadStats> {
+    visit_nq_file_gz(path, |s, p, o, g| {
+        let si = lookup(dict, s)?;
+        let pi = lookup(dict, p)?;
+        let oi = lookup(dict, o)?;
+        if let Some(g) = g {
+            let gi = lookup(dict, g)?;
+            builders.push_quad(crate::triple::Quad::new(si, pi, oi, gi))
+        } else {
+            builders.push(crate::triple::Triple::new(si, pi, oi))
+        }
+    })
+}
+
 fn unescape_char(c: char) -> char {
     match c {
         'n' => '\n', 't' => '\t', 'r' => '\r',

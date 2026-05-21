@@ -13,8 +13,10 @@ use std::time::Instant;
 
 use crate::config::Config;
 use crate::dict::Dictionary;
+use crate::dict_builder::{DictBuilder, ReadonlyDict};
 use crate::index::{AllBuilders, TripleIndex};
-use crate::loader::{load_files, load_files_with_graphs, InputSpec};
+use crate::loader::{collect_strings_from_inputs, load_files, load_files_with_graphs,
+                    load_triples_with_readonly_dict, InputSpec};
 use crate::sparql::{parse_query, Executor, ResultSet};
 use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
 use crate::stats::StoreStatistics;
@@ -33,53 +35,126 @@ impl Store {
     /// Build a new store from RDF input files.
     ///
     /// Creates `dir` if it doesn't exist, writes dict.bin + spo.bin/pos.bin/osp.bin.
+    ///
+    /// When `config.build.chunk_size > 0` (the default) a **two-pass** strategy
+    /// is used to keep peak RAM bounded regardless of dataset size:
+    ///
+    /// - **Phase 1** — stream every file once to collect unique strings into
+    ///   an external-sort dictionary builder.  Peak RAM = `dict_chunk_mb` MB.
+    /// - **Phase 2** — stream every file again, resolving string IDs via a
+    ///   mmap-based binary search, and build the triple indexes with external sort.
+    ///   Peak RAM = `dict_chunk_mb` + triple index buffers (`chunk_size × 12 B × 3`).
+    ///
+    /// Set `chunk_size = 0` in `ecordf.toml` to revert to the legacy one-pass
+    /// in-memory approach (requires all unique strings in RAM simultaneously).
     pub fn load(dir: &Path, input_files: &[&Path]) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
-
-        // Load config before building so chunk_size is available.
-        // At build time the config file may not exist yet — fall back to defaults.
         let config = Config::resolve(None, dir).map_err(io::Error::from)?;
 
-        let t0 = Instant::now();
-        eprintln!("=== EcoRDF: loading {} file(s) ===", input_files.len());
+        let inputs: Vec<InputSpec> = input_files.iter()
+            .map(|p| InputSpec::plain(p.to_path_buf()))
+            .collect();
+
         if config.build.chunk_size > 0 {
-            eprintln!(
-                "External sort: chunk_size={} (~{} MB/index buffer)",
-                config.build.chunk_size,
-                config.build.chunk_size * 12 / (1024 * 1024),
-            );
+            Self::load_two_pass_internal(dir, &inputs, &config)
+        } else {
+            Self::load_one_pass_internal(dir, input_files, &config)
         }
+    }
+
+    // ── internal: one-pass (legacy) ───────────────────────────────────────────
+
+    fn load_one_pass_internal(dir: &Path, input_files: &[&Path], config: &Config) -> io::Result<Self> {
+        let t0 = Instant::now();
+        eprintln!("=== EcoRDF: loading {} file(s) [one-pass / in-memory dict] ===", input_files.len());
 
         let dict = Dictionary::new();
-        let mut builders = AllBuilders::new_streaming(dir, config.build.chunk_size)?;
-
+        // chunk_size == 0 → in-memory sort (AllBuilders::new)
+        let mut builders = AllBuilders::new_streaming(dir, 0)?;
         let stats = load_files(input_files, &dict, &mut builders)?;
 
-        eprintln!(
-            "Parsed {} triples in {:.1}s. Sorting and writing indexes...",
-            stats.triples_loaded,
-            t0.elapsed().as_secs_f64()
-        );
+        eprintln!("Parsed {} triples in {:.1}s. Sorting and writing indexes...",
+            stats.triples_loaded, t0.elapsed().as_secs_f64());
 
         let t1 = Instant::now();
         let index = builders.build(dir)?;
         dict.save(&dir.join("dict.bin"))?;
 
+        eprintln!("Indexes written in {:.1}s. Total: {:.1}s",
+            t1.elapsed().as_secs_f64(), t0.elapsed().as_secs_f64());
+        eprintln!("Dictionary: {} terms | Triples: {}", dict.len(), index.triple_count());
+
+        let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats })
+    }
+
+    // ── internal: two-pass (external-sort dict) ───────────────────────────────
+
+    fn load_two_pass_internal(dir: &Path, inputs: &[InputSpec], config: &Config) -> io::Result<Self> {
+        let tmp_dir = dir.join("_ecordf_tmp");
+        let dict_sorted_path = tmp_dir.join("dict_sorted.bin");
+
+        let dict_chunk_bytes = config.build.dict_chunk_mb * 1024 * 1024;
+        let t0 = Instant::now();
+
+        eprintln!("=== EcoRDF: loading {} file(s) [two-pass / external-sort dict] ===", inputs.len());
         eprintln!(
-            "Indexes written in {:.1}s. Total load time: {:.1}s",
-            t1.elapsed().as_secs_f64(),
+            "  dict_chunk_mb={} MB  |  triple chunk_size={} (~{} MB/index)",
+            config.build.dict_chunk_mb,
+            config.build.chunk_size,
+            config.build.chunk_size * 12 / (1024 * 1024),
+        );
+
+        // ── Phase 1: collect all unique strings ───────────────────────────────
+        eprintln!("=== Phase 1: collecting unique terms ===");
+        fs::create_dir_all(&tmp_dir)?;
+        let mut db = DictBuilder::new(&tmp_dir, dict_chunk_bytes)?;
+        let p1_stats = collect_strings_from_inputs(inputs, &mut db)?;
+        eprintln!(
+            "Phase 1 done: {} lines processed in {:.1}s",
+            p1_stats.lines_processed,
             t0.elapsed().as_secs_f64()
         );
+
+        let term_count = db.finish(&dict_sorted_path)?;
+        eprintln!("Dictionary: {} unique terms  ({:.1}s total so far)",
+            term_count, t0.elapsed().as_secs_f64());
+
+        // ── Phase 2: load triples using mmap-ed dict ──────────────────────────
+        eprintln!("=== Phase 2: loading triples ===");
+        let t2 = Instant::now();
+        let readonly_dict = ReadonlyDict::open(&dict_sorted_path)?;
+        let mut builders = AllBuilders::new_streaming(dir, config.build.chunk_size)?;
+        let p2_stats = load_triples_with_readonly_dict(inputs, &readonly_dict, &mut builders)?;
+
         eprintln!(
-            "Dictionary: {} terms | Triples: {}",
-            dict.len(),
+            "Parsed {} triples in {:.1}s. Sorting and writing indexes...",
+            p2_stats.triples_loaded,
+            t2.elapsed().as_secs_f64()
+        );
+
+        let t3 = Instant::now();
+        let index = builders.build(dir)?;
+
+        eprintln!("Indexes written in {:.1}s.", t3.elapsed().as_secs_f64());
+
+        // ── Write legacy dict.bin for query-time Dictionary::load() ───────────
+        readonly_dict.write_legacy_dict(&dir.join("dict.bin"))?;
+
+        eprintln!(
+            "Total load time: {:.1}s  |  Dictionary: {} terms  |  Triples: {}",
+            t0.elapsed().as_secs_f64(),
+            term_count,
             index.triple_count()
         );
 
-        // Build predicate statistics and save to stats.bin for future runs.
-        let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
+        // Cleanup tmp dir (dict_sorted.bin + string chunks)
+        let _ = fs::remove_dir_all(&tmp_dir);
 
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats })
+        // Load query-time dictionary
+        let dict = Dictionary::load(&dir.join("dict.bin"))?;
+        let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats })
     }
 
     /// Build a new store from RDF input files with optional per-file named graph assignment.
@@ -88,51 +163,26 @@ impl Store {
     /// N-Triples files with a graph IRI are loaded into both the union graph and
     /// the named graph (GSPO index).  N-Quads files ignore the graph field.
     ///
-    /// Use this instead of [`Store::load`] when you need named graph support
-    /// without preparing N-Quads files.
+    /// Uses the same two-pass / one-pass logic as [`Store::load`].
     pub fn load_with_graphs(dir: &Path, inputs: &[InputSpec]) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
-
         let config = Config::resolve(None, dir).map_err(io::Error::from)?;
 
-        let t0 = Instant::now();
-        eprintln!("=== EcoRDF: loading {} file(s) ===", inputs.len());
         if config.build.chunk_size > 0 {
-            eprintln!(
-                "External sort: chunk_size={} (~{} MB/index buffer)",
-                config.build.chunk_size,
-                config.build.chunk_size * 12 / (1024 * 1024),
-            );
+            Self::load_two_pass_internal(dir, inputs, &config)
+        } else {
+            let t0 = Instant::now();
+            eprintln!("=== EcoRDF: loading {} file(s) [one-pass] ===", inputs.len());
+            let dict = Dictionary::new();
+            let mut builders = AllBuilders::new_streaming(dir, 0)?;
+            let stats = load_files_with_graphs(inputs, &dict, &mut builders)?;
+            eprintln!("Parsed {} triples in {:.1}s. Writing indexes...",
+                stats.triples_loaded, t0.elapsed().as_secs_f64());
+            let index = builders.build(dir)?;
+            dict.save(&dir.join("dict.bin"))?;
+            let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
+            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats })
         }
-
-        let dict = Dictionary::new();
-        let mut builders = AllBuilders::new_streaming(dir, config.build.chunk_size)?;
-
-        let stats = load_files_with_graphs(inputs, &dict, &mut builders)?;
-
-        eprintln!(
-            "Parsed {} triples in {:.1}s. Sorting and writing indexes...",
-            stats.triples_loaded,
-            t0.elapsed().as_secs_f64()
-        );
-
-        let t1 = Instant::now();
-        let index = builders.build(dir)?;
-        dict.save(&dir.join("dict.bin"))?;
-
-        eprintln!(
-            "Indexes written in {:.1}s. Total load time: {:.1}s",
-            t1.elapsed().as_secs_f64(),
-            t0.elapsed().as_secs_f64()
-        );
-        eprintln!(
-            "Dictionary: {} terms | Triples: {}",
-            dict.len(),
-            index.triple_count()
-        );
-
-        let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats })
     }
 
     /// Reopen an existing store from its directory.

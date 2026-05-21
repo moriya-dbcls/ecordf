@@ -32,6 +32,22 @@
 # before sorting — use this only on machines with tens of GB of free memory.
 chunk_size = 5_000_000
 
+# RAM budget (in MiB) for the string-collection buffer used in Phase 1 of
+# the two-pass dictionary builder (active when chunk_size > 0).
+#
+# Strings are buffered in memory up to this size, then sorted, deduped, and
+# flushed to a temporary chunk file on disk.  All chunks are later k-way
+# merged without further heap allocation beyond I/O buffers.
+#
+#   dict_chunk_mb    peak string-buffer RAM
+#   -------------    ----------------------
+#    50              ≈  50 MB
+#   200              ≈ 200 MB  ← default
+#   500              ≈ 500 MB
+#
+# Larger values reduce the number of chunk files and speed up the merge.
+dict_chunk_mb = 200
+
 # ── Query execution tunables ──────────────────────────────────────────────────
 
 [query]

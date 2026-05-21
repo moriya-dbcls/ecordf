@@ -30,6 +30,7 @@
 
 pub mod config;
 pub mod dict;
+pub mod dict_builder;
 pub mod index;
 pub mod loader;
 pub mod server;
