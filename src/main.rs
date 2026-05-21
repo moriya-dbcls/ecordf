@@ -68,10 +68,15 @@ enum Command {
         #[arg(long, value_name = "LIST_FILE", action = clap::ArgAction::Append)]
         from_file: Vec<PathBuf>,
 
-        /// Phase 1 (文字列収集) をスキップして Phase 2 (インデックス構築) から再開する。
+        /// Phase 1 (文字列収集) をスキップして中断した処理を再開する。
         ///
-        /// Phase 1 が完了した後に Phase 2 が中断した場合に使用します。
-        /// `<--dir>/_ecordf_tmp/dict_sorted.bin` が存在している必要があります。
+        /// 以下の2つの状況に自動対応します:
+        ///
+        ///   A) `<--dir>/_ecordf_tmp/dict_sorted.bin` が存在する場合:
+        ///      Phase 1 を完全スキップして Phase 2 へ
+        ///
+        ///   B) dict_sorted.bin はないが `_ecordf_tmp/p1_*/` チャンクが残っている場合:
+        ///      マージだけやり直してから Phase 2 へ (EMFILE で止まった場合など)
         ///
         /// 例:
         ///

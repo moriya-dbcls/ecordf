@@ -142,28 +142,57 @@ impl Store {
         let term_count: u32;
 
         if resume_phase2 {
-            // ── Resume path: verify dict_sorted.bin, skip string collection ───
-            if !dict_sorted_path.exists() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "--resume-phase2: {:?} が見つかりません。\n\
-                         Phase 1 が完了していることを確認してください。\n\
-                         最初からやり直す場合は --resume-phase2 なしで実行してください。",
-                        dict_sorted_path
-                    ),
-                ));
-            }
-            let rdict = ReadonlyDict::open(&dict_sorted_path)?;
-            term_count = rdict.len() as u32;
-            eprintln!(
-                "=== Phase 1 をスキップ (--resume-phase2): 既存の辞書を使用 ===\n\
-                 Dictionary: {} terms  ({:?})",
-                term_count, dict_sorted_path
-            );
-            // 中断した Phase 1 が残した p1_ ディレクトリを掃除する
-            for i in 0..inputs.len() {
-                let _ = fs::remove_dir_all(tmp_dir.join(format!("p1_{:06}", i)));
+            if dict_sorted_path.exists() {
+                // ── ケース A: dict_sorted.bin が存在 → Phase 1 を完全スキップ ──
+                let rdict = ReadonlyDict::open(&dict_sorted_path)?;
+                term_count = rdict.len() as u32;
+                eprintln!(
+                    "=== Phase 1 をスキップ (--resume-phase2): 既存の辞書を使用 ===\n\
+                     Dictionary: {} terms  ({:?})",
+                    term_count, dict_sorted_path
+                );
+                // 中断した Phase 1 が残した p1_ ディレクトリを掃除する
+                for entry in fs::read_dir(&tmp_dir).into_iter().flatten().flatten() {
+                    let name = entry.file_name();
+                    if name.to_string_lossy().starts_with("p1_") {
+                        let _ = fs::remove_dir_all(entry.path());
+                    }
+                }
+            } else {
+                // ── ケース B: dict_sorted.bin がない → 残存チャンクからマージ ──
+                // Phase 1 の文字列収集は終わっているが merge_string_chunks が
+                // EMFILE などで失敗した場合にここに来る。
+                let existing_chunks = collect_p1_chunks(&tmp_dir)?;
+                if existing_chunks.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "--resume-phase2: dict_sorted.bin も p1_* チャンクファイルも見つかりません。\n\
+                             再開できる状態ではありません。--resume-phase2 を外して最初からやり直してください。\n\
+                             (探した場所: {:?})",
+                            tmp_dir
+                        ),
+                    ));
+                }
+                eprintln!(
+                    "=== Phase 1 マージを再実行 (--resume-phase2): {} チャンクファイルを使用 ===",
+                    existing_chunks.len()
+                );
+                let t_merge = Instant::now();
+                term_count = crate::dict_builder::merge_string_chunks(&existing_chunks, &dict_sorted_path)?;
+                // p1_ ディレクトリを掃除する
+                for entry in fs::read_dir(&tmp_dir).into_iter().flatten().flatten() {
+                    let name = entry.file_name();
+                    if name.to_string_lossy().starts_with("p1_") {
+                        let _ = fs::remove_dir_all(entry.path());
+                    }
+                }
+                eprintln!(
+                    "Dictionary: {} unique terms  (merge {:.1}s  |  total {:.1}s)",
+                    term_count,
+                    t_merge.elapsed().as_secs_f64(),
+                    t0.elapsed().as_secs_f64()
+                );
             }
         } else {
             eprintln!("=== Phase 1: collecting unique terms ({} threads) ===", num_threads);
@@ -402,6 +431,37 @@ impl Store {
             dir: self.dir.clone(),
         }
     }
+}
+
+/// `_ecordf_tmp/p1_NNNNNN/` ディレクトリ内の文字列チャンクファイルを収集する。
+///
+/// Phase 1 の文字列収集が完了したが `merge_string_chunks` が失敗した場合（EMFILE など）に
+/// 残存するチャンクファイルを再マージするために使用する。
+fn collect_p1_chunks(tmp_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut chunks: Vec<PathBuf> = Vec::new();
+    if !tmp_dir.exists() {
+        return Ok(chunks);
+    }
+    let mut entries: Vec<_> = fs::read_dir(tmp_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name().to_string_lossy().starts_with("p1_")
+                && e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+        })
+        .collect();
+    // p1_ ディレクトリを名前順にソートして決定的な順序にする
+    entries.sort_by_key(|e| e.file_name());
+
+    for dir_entry in entries {
+        let mut files: Vec<PathBuf> = fs::read_dir(dir_entry.path())?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|ext| ext == "bin").unwrap_or(false))
+            .collect();
+        files.sort(); // sdc_000000.bin, sdc_000001.bin … の順
+        chunks.extend(files);
+    }
+    Ok(chunks)
 }
 
 /// Check that every plain variable in SELECT is either a GROUP BY key or an aggregate alias.
