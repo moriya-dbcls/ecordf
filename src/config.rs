@@ -138,6 +138,22 @@ pub struct BuildConfig {
     /// more RAM.  A value of 200 MB is a safe default for machines with ≥ 1 GB
     /// of free memory.
     pub dict_chunk_mb: usize,
+
+    /// Number of threads used for parallel file loading during `ecordf build`.
+    ///
+    /// EcoRDF processes multiple input files in parallel: each thread handles
+    /// one file at a time (Phase 1 string collection + Phase 2 triple loading),
+    /// then all results are merged.  The total peak RAM stays approximately
+    /// constant because per-thread budgets are scaled down by thread count.
+    ///
+    /// | parallel_threads | behaviour                            |
+    /// |------------------|--------------------------------------|
+    /// | 0                | all CPU cores (default, recommended) |
+    /// | 1                | single-threaded (for debugging)      |
+    /// | N                | exactly N threads                    |
+    ///
+    /// Set to 1 if you hit memory pressure on a machine with many cores.
+    pub parallel_threads: usize,
 }
 
 impl Default for BuildConfig {
@@ -145,6 +161,7 @@ impl Default for BuildConfig {
         Self {
             chunk_size: 5_000_000,
             dict_chunk_mb: 200,
+            parallel_threads: 0,
         }
     }
 }

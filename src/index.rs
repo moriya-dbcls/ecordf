@@ -39,6 +39,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+// rayon::join is used in build_from_parallel_chunks to merge 3 indexes in parallel.
+use rayon;
+
 use crate::triple::{IndexKind, Quad, TermId, Triple, TriplePattern, UNBOUND};
 
 const INDEX_MAGIC: &[u8; 8] = b"ECOI0001";
@@ -141,6 +144,21 @@ impl IndexBuilder {
         Ok(())
     }
 
+    // ── parallel support ──────────────────────────────────────────────────────
+
+    /// Flush remaining buffer and return all chunk file paths without merging.
+    ///
+    /// Used by the parallel loader: each worker thread calls this on its own
+    /// `IndexBuilder` and returns the paths to the main thread, which then
+    /// calls [`merge_triple_chunks`] once over all gathered paths.
+    ///
+    /// **Only valid in streaming mode** (`chunk_size > 0`).
+    pub(crate) fn flush_and_return_chunks(mut self) -> io::Result<Vec<PathBuf>> {
+        debug_assert!(self.chunk_size > 0, "flush_and_return_chunks called on in-memory builder");
+        self.flush_chunk()?;
+        Ok(self.chunks)
+    }
+
     // ── build ─────────────────────────────────────────────────────────────────
 
     /// Sort and write to disk, then return a read-only `IndexFile`.
@@ -172,7 +190,7 @@ impl IndexBuilder {
 /// Write a pre-sorted slice of raw triples to a binary chunk file.
 ///
 /// Format: `[count: u64][a0, b0, c0, a1, b1, c1, …  : u32 each]`
-fn write_triple_chunk(triples: &[[u32; 3]], path: &Path) -> io::Result<()> {
+pub(crate) fn write_triple_chunk(triples: &[[u32; 3]], path: &Path) -> io::Result<()> {
     let file = File::create(path)?;
     let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
     w.write_all(&(triples.len() as u64).to_le_bytes())?;
@@ -185,7 +203,7 @@ fn write_triple_chunk(triples: &[[u32; 3]], path: &Path) -> io::Result<()> {
 }
 
 /// Write a sorted slice of raw triples as a final index file (with header).
-fn write_index_from_sorted(triples: &[[u32; 3]], path: &Path) -> io::Result<()> {
+pub(crate) fn write_index_from_sorted(triples: &[[u32; 3]], path: &Path) -> io::Result<()> {
     let file = File::create(path)?;
     let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
     w.write_all(INDEX_MAGIC)?;
@@ -200,9 +218,12 @@ fn write_index_from_sorted(triples: &[[u32; 3]], path: &Path) -> io::Result<()> 
 
 /// k-way merge of sorted triple chunk files into a single index file.
 ///
+/// Also called by [`AllBuilders::build_from_parallel_chunks`] to merge chunks
+/// gathered from multiple parallel worker threads.
+///
 /// Consecutive duplicate triples are dropped so the output is a set.
 /// The count header is back-patched after writing all triples.
-fn merge_triple_chunks(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
+pub(crate) fn merge_triple_chunks(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
     // ── Open all chunk readers ────────────────────────────────────────────────
     let mut readers: Vec<TripleChunkReader> = chunks.iter()
         .map(|p| TripleChunkReader::open(p))
@@ -584,6 +605,12 @@ impl GspoBuilder {
         Ok(())
     }
 
+    /// Flush remaining buffer and return all chunk file paths without merging.
+    pub(crate) fn flush_and_return_chunks(mut self) -> io::Result<Vec<PathBuf>> {
+        self.flush_chunk()?;
+        Ok(self.chunks)
+    }
+
     /// Sort and write to disk, returning a read-only GspoIndexFile.
     pub fn build(mut self, path: &Path) -> io::Result<GspoIndexFile> {
         if self.chunks.is_empty() {
@@ -628,7 +655,7 @@ fn write_gspo_index_from_sorted(quads: &[[u32; 4]], path: &Path) -> io::Result<(
     w.flush()
 }
 
-fn merge_quad_chunks(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
+pub(crate) fn merge_quad_chunks(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
     let mut readers: Vec<QuadChunkReader> = chunks.iter()
         .map(|p| QuadChunkReader::open(p))
         .collect::<io::Result<Vec<_>>>()?;
@@ -874,6 +901,19 @@ impl TripleIndex {
     }
 }
 
+// ── Parallel chunk collection ─────────────────────────────────────────────────
+
+/// Sorted chunk files produced by one worker thread during parallel Phase 2.
+///
+/// Each field is a list of chunk files for the corresponding index type.
+/// All `Vec`s may be empty if no triples (or no quads) were encountered.
+pub struct ParallelChunks {
+    pub spo:  Vec<PathBuf>,
+    pub pos:  Vec<PathBuf>,
+    pub osp:  Vec<PathBuf>,
+    pub gspo: Vec<PathBuf>,
+}
+
 // ── Builder convenience ───────────────────────────────────────────────────────
 
 pub struct AllBuilders {
@@ -910,13 +950,26 @@ impl AllBuilders {
             return Ok(Self::new());
         }
         let tmp_dir = dir.join("_ecordf_tmp");
-        std::fs::create_dir_all(&tmp_dir)?;
+        Self::new_streaming_in(&tmp_dir, chunk_size)
+    }
+
+    /// Like [`new_streaming`] but writes chunks directly to the given
+    /// `chunk_dir` rather than `<dir>/_ecordf_tmp`.
+    ///
+    /// Used by the parallel loader so that each worker thread can write to its
+    /// own private subdirectory, avoiding file-name collisions.
+    pub fn new_streaming_in(chunk_dir: &Path, chunk_size: usize) -> io::Result<Self> {
+        if chunk_size == 0 {
+            return Ok(Self::new());
+        }
+        std::fs::create_dir_all(chunk_dir)?;
+        let cd = chunk_dir.to_path_buf();
         Ok(Self {
-            spo:  IndexBuilder::new_streaming(IndexKind::Spo, tmp_dir.clone(), chunk_size),
-            pos:  IndexBuilder::new_streaming(IndexKind::Pos, tmp_dir.clone(), chunk_size),
-            osp:  IndexBuilder::new_streaming(IndexKind::Osp, tmp_dir.clone(), chunk_size),
-            gspo: GspoBuilder::new_streaming(tmp_dir.clone(), chunk_size),
-            tmp_dir: Some(tmp_dir),
+            spo:  IndexBuilder::new_streaming(IndexKind::Spo, cd.clone(), chunk_size),
+            pos:  IndexBuilder::new_streaming(IndexKind::Pos, cd.clone(), chunk_size),
+            osp:  IndexBuilder::new_streaming(IndexKind::Osp, cd.clone(), chunk_size),
+            gspo: GspoBuilder::new_streaming(cd.clone(), chunk_size),
+            tmp_dir: Some(cd),
         })
     }
 
@@ -937,6 +990,104 @@ impl AllBuilders {
         self.gspo.push(q)?;
         Ok(())
     }
+
+    // ── parallel support ──────────────────────────────────────────────────────
+
+    /// Flush all remaining buffers and return the chunk paths for all four
+    /// indexes without doing the final merge.
+    ///
+    /// Used by the parallel loader: each worker thread calls this, then the
+    /// main thread gathers all [`ParallelChunks`] and passes them to
+    /// [`AllBuilders::build_from_parallel_chunks`].
+    ///
+    /// **Only valid in streaming mode** (`chunk_size > 0`).
+    pub(crate) fn flush_and_return_chunks(self) -> io::Result<ParallelChunks> {
+        Ok(ParallelChunks {
+            spo:  self.spo.flush_and_return_chunks()?,
+            pos:  self.pos.flush_and_return_chunks()?,
+            osp:  self.osp.flush_and_return_chunks()?,
+            gspo: self.gspo.flush_and_return_chunks()?,
+        })
+    }
+
+    /// Merge all chunk files gathered from parallel worker threads and open
+    /// the resulting triple indexes.
+    ///
+    /// SPO, POS, and OSP merges run in parallel via `rayon::join` since they
+    /// each write a different file.  The GSPO merge (if any named-graph data
+    /// was loaded) runs sequentially after the triple merges complete.
+    ///
+    /// After a successful merge the individual chunk files are deleted.
+    /// The caller is responsible for cleaning up the per-thread temp
+    /// directories (the top-level `_ecordf_tmp` is removed by `store.rs`).
+    pub fn build_from_parallel_chunks(
+        all: Vec<ParallelChunks>,
+        dir: &Path,
+    ) -> io::Result<TripleIndex> {
+        // Collect chunks by index type
+        let spo_chunks: Vec<PathBuf> = all.iter().flat_map(|c| c.spo.iter().cloned()).collect();
+        let pos_chunks: Vec<PathBuf> = all.iter().flat_map(|c| c.pos.iter().cloned()).collect();
+        let osp_chunks: Vec<PathBuf> = all.iter().flat_map(|c| c.osp.iter().cloned()).collect();
+        let gspo_chunks: Vec<PathBuf> = all.iter().flat_map(|c| c.gspo.iter().cloned()).collect();
+
+        let spo_path  = dir.join("spo.bin");
+        let pos_path  = dir.join("pos.bin");
+        let osp_path  = dir.join("osp.bin");
+        let gspo_path = dir.join("gspo.bin");
+
+        eprintln!(
+            "  Merging indexes in parallel: {} SPO + {} POS + {} OSP chunks",
+            spo_chunks.len(), pos_chunks.len(), osp_chunks.len()
+        );
+
+        // Run the three triple-index merges in parallel (each writes a different file).
+        let merge_spo = || Self::merge_or_empty(&spo_chunks, &spo_path);
+        let merge_pos = || Self::merge_or_empty(&pos_chunks, &pos_path);
+        let merge_osp = || Self::merge_or_empty(&osp_chunks, &osp_path);
+
+        let (r_spo, (r_pos, r_osp)) = rayon::join(
+            merge_spo,
+            || rayon::join(merge_pos, merge_osp),
+        );
+        r_spo?;
+        r_pos?;
+        r_osp?;
+
+        // Remove chunk files (dirs cleaned up by store.rs)
+        for c in spo_chunks.iter().chain(pos_chunks.iter()).chain(osp_chunks.iter()) {
+            let _ = std::fs::remove_file(c);
+        }
+
+        // GSPO quad index (sequential; only present when named-graph data was loaded)
+        let gspo = if gspo_chunks.is_empty() {
+            None
+        } else {
+            eprintln!("  Merging {} GSPO chunks…", gspo_chunks.len());
+            merge_quad_chunks(&gspo_chunks, &gspo_path)?;
+            for c in &gspo_chunks {
+                let _ = std::fs::remove_file(c);
+            }
+            Some(GspoIndexFile::open(&gspo_path)?)
+        };
+
+        Ok(TripleIndex {
+            spo: IndexFile::open(&spo_path, IndexKind::Spo)?,
+            pos: IndexFile::open(&pos_path, IndexKind::Pos)?,
+            osp: IndexFile::open(&osp_path, IndexKind::Osp)?,
+            gspo,
+        })
+    }
+
+    /// Helper: merge chunks into `path`, or write an empty index if no chunks.
+    fn merge_or_empty(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
+        if chunks.is_empty() {
+            write_index_from_sorted(&[], path)
+        } else {
+            merge_triple_chunks(chunks, path)
+        }
+    }
+
+    // ── standard build ────────────────────────────────────────────────────────
 
     pub fn build(self, dir: &Path) -> io::Result<TripleIndex> {
         let tmp_dir = self.tmp_dir.clone();

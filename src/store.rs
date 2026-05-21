@@ -11,12 +11,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use rayon;
+
 use crate::config::Config;
 use crate::dict::Dictionary;
-use crate::dict_builder::{DictBuilder, ReadonlyDict};
+use crate::dict_builder::ReadonlyDict;
 use crate::index::{AllBuilders, TripleIndex};
-use crate::loader::{collect_strings_from_inputs, load_files, load_files_with_graphs,
-                    load_triples_with_readonly_dict, InputSpec};
+use crate::loader::{collect_strings_from_inputs, collect_strings_parallel,
+                    load_files, load_files_with_graphs,
+                    load_triples_with_readonly_dict, load_triples_parallel, InputSpec};
 use crate::sparql::{parse_query, Executor, ResultSet};
 use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
 use crate::stats::StoreStatistics;
@@ -97,48 +100,89 @@ impl Store {
         let dict_chunk_bytes = config.build.dict_chunk_mb * 1024 * 1024;
         let t0 = Instant::now();
 
-        eprintln!("=== EcoRDF: loading {} file(s) [two-pass / external-sort dict] ===", inputs.len());
+        // Determine actual thread count.
+        let num_threads = if config.build.parallel_threads > 0 {
+            config.build.parallel_threads.min(inputs.len()).max(1)
+        } else {
+            rayon::current_num_threads().min(inputs.len()).max(1)
+        };
+
         eprintln!(
-            "  dict_chunk_mb={} MB  |  triple chunk_size={} (~{} MB/index)",
+            "=== EcoRDF: loading {} file(s) [two-pass / external-sort dict / {} thread(s)] ===",
+            inputs.len(), num_threads
+        );
+        eprintln!(
+            "  dict_chunk_mb={} MB  |  triple chunk_size={} (~{} MB/index)  |  threads={}",
             config.build.dict_chunk_mb,
             config.build.chunk_size,
             config.build.chunk_size * 12 / (1024 * 1024),
+            num_threads,
         );
 
-        // ── Phase 1: collect all unique strings ───────────────────────────────
-        eprintln!("=== Phase 1: collecting unique terms ===");
+        // Build a local rayon thread pool so the thread count is honoured even
+        // when the caller has already configured the global pool differently.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
         fs::create_dir_all(&tmp_dir)?;
-        let mut db = DictBuilder::new(&tmp_dir, dict_chunk_bytes)?;
-        let p1_stats = collect_strings_from_inputs(inputs, &mut db)?;
+
+        // ── Phase 1: collect all unique strings (parallel) ────────────────────
+        eprintln!("=== Phase 1: collecting unique terms ({} threads) ===", num_threads);
+
+        let (all_string_chunks, p1_stats) = pool.install(|| {
+            collect_strings_parallel(inputs, &tmp_dir, dict_chunk_bytes, num_threads)
+        })?;
+
         eprintln!(
-            "Phase 1 done: {} lines processed in {:.1}s",
+            "Phase 1 done: {} lines processed, {} string chunks  ({:.1}s)",
             p1_stats.lines_processed,
+            all_string_chunks.len(),
             t0.elapsed().as_secs_f64()
         );
 
-        let term_count = db.finish(&dict_sorted_path)?;
-        eprintln!("Dictionary: {} unique terms  ({:.1}s total so far)",
-            term_count, t0.elapsed().as_secs_f64());
+        // k-way merge of all per-thread/per-file string chunks
+        let t_merge = Instant::now();
+        let term_count = crate::dict_builder::merge_string_chunks(&all_string_chunks, &dict_sorted_path)?;
+        // Clean up per-file Phase 1 subdirectories
+        for i in 0..inputs.len() {
+            let _ = fs::remove_dir_all(tmp_dir.join(format!("p1_{:06}", i)));
+        }
+        eprintln!(
+            "Dictionary: {} unique terms  (merge {:.1}s  |  total {:.1}s)",
+            term_count,
+            t_merge.elapsed().as_secs_f64(),
+            t0.elapsed().as_secs_f64()
+        );
 
-        // ── Phase 2: load triples using mmap-ed dict ──────────────────────────
-        eprintln!("=== Phase 2: loading triples ===");
+        // ── Phase 2: load triples in parallel ─────────────────────────────────
+        eprintln!("=== Phase 2: loading triples ({} threads) ===", num_threads);
         let t2 = Instant::now();
-        let readonly_dict = ReadonlyDict::open(&dict_sorted_path)?;
-        let mut builders = AllBuilders::new_streaming(dir, config.build.chunk_size)?;
-        let p2_stats = load_triples_with_readonly_dict(inputs, &readonly_dict, &mut builders)?;
+
+        let (all_index_chunks, p2_stats) = pool.install(|| {
+            load_triples_parallel(
+                inputs,
+                &dict_sorted_path,
+                &tmp_dir,
+                config.build.chunk_size,
+                num_threads,
+            )
+        })?;
 
         eprintln!(
-            "Parsed {} triples in {:.1}s. Sorting and writing indexes...",
+            "Parsed {} triples in {:.1}s. Merging indexes...",
             p2_stats.triples_loaded,
             t2.elapsed().as_secs_f64()
         );
 
         let t3 = Instant::now();
-        let index = builders.build(dir)?;
+        let index = AllBuilders::build_from_parallel_chunks(all_index_chunks, dir)?;
 
         eprintln!("Indexes written in {:.1}s.", t3.elapsed().as_secs_f64());
 
         // ── Write legacy dict.bin for query-time Dictionary::load() ───────────
+        let readonly_dict = ReadonlyDict::open(&dict_sorted_path)?;
         readonly_dict.write_legacy_dict(&dir.join("dict.bin"))?;
 
         eprintln!(
@@ -148,7 +192,7 @@ impl Store {
             index.triple_count()
         );
 
-        // Cleanup tmp dir (dict_sorted.bin + string chunks)
+        // Cleanup entire tmp dir (dict_sorted.bin + any remaining chunk dirs)
         let _ = fs::remove_dir_all(&tmp_dir);
 
         // Load query-time dictionary

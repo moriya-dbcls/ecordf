@@ -122,6 +122,16 @@ impl DictBuilder {
         Ok(())
     }
 
+    /// Flush any remaining buffer and return all chunk file paths **without merging**.
+    ///
+    /// Used by the parallel loader: each thread calls this, then the main thread
+    /// collects all chunk paths from all threads and passes them to
+    /// [`merge_string_chunks`] for a single k-way merge.
+    pub fn flush_and_return_chunks(mut self) -> io::Result<Vec<PathBuf>> {
+        self.flush_chunk()?;
+        Ok(self.chunks)
+    }
+
     /// Finish: flush remainder, merge all chunks, write `dict_sorted.bin`.
     ///
     /// Returns the number of unique terms written.
@@ -188,13 +198,16 @@ impl StringChunkReader {
 
 /// K-way merge of sorted string chunks → write `dict_sorted.bin`.
 ///
+/// Called by [`DictBuilder::finish`] for single-threaded loads, and directly
+/// from the parallel loader after collecting chunks from all per-file threads.
+///
 /// Uses two temporary files to avoid holding all offsets in RAM:
 /// - `*.strings.tmp`: string bytes in sorted order
 /// - `*.offsets.tmp`: u64 file-offset of each string (written incrementally)
 ///
 /// After the merge both temporaries are concatenated into the final file and
 /// removed.
-fn merge_string_chunks(chunks: &[PathBuf], out_path: &Path) -> io::Result<u32> {
+pub(crate) fn merge_string_chunks(chunks: &[PathBuf], out_path: &Path) -> io::Result<u32> {
     let mut readers: Vec<StringChunkReader> = chunks
         .iter()
         .map(|p| StringChunkReader::open(p))

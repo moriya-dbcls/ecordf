@@ -48,6 +48,20 @@ chunk_size = 5_000_000
 # Larger values reduce the number of chunk files and speed up the merge.
 dict_chunk_mb = 200
 
+# Number of threads used during `ecordf build` for parallel file loading.
+#
+# Each thread handles one file at a time in Phase 1 (string collection) and
+# Phase 2 (triple loading).  Per-thread RAM budgets are divided by this count,
+# so total peak memory stays roughly constant regardless of parallelism.
+#
+#   parallel_threads    behaviour
+#   ----------------    ---------
+#   0                   all CPU cores (default, recommended)
+#   1                   single-threaded  (debugging / memory profiling)
+#   N                   exactly N threads
+#
+parallel_threads = 0
+
 # ── Query execution tunables ──────────────────────────────────────────────────
 
 [query]

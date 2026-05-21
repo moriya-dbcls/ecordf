@@ -329,7 +329,28 @@ where F: FnMut(&str, &str, &str, Option<&str>) -> io::Result<()>
 
 // ── Phase 1: string collection ────────────────────────────────────────────────
 
-/// Collect every unique RDF term from `inputs` into `db` (Phase 1 of two-pass load).
+/// Collect every unique RDF term from a **single** input into `db`.
+///
+/// Low-level helper shared by the sequential and parallel callers.
+fn collect_strings_from_one_input(
+    input: &InputSpec,
+    db: &mut crate::dict_builder::DictBuilder,
+) -> io::Result<LoadStats> {
+    let path = &input.path;
+    let graph = input.graph.as_deref();
+    match (classify_extension(path), graph) {
+        (FileKind::NTriples,   Some(g)) => collect_nt_strings(path, Some(g), db),
+        (FileKind::NTriples,   None)    => collect_nt_strings(path, None,    db),
+        (FileKind::NTriplesGz, Some(g)) => collect_nt_strings_gz(path, Some(g), db),
+        (FileKind::NTriplesGz, None)    => collect_nt_strings_gz(path, None,    db),
+        (FileKind::NQuads,   _)         => collect_nq_strings(path, db),
+        (FileKind::NQuadsGz, _)         => collect_nq_strings_gz(path, db),
+        (FileKind::Unknown(_), Some(g)) => collect_nt_strings(path, Some(g), db),
+        (FileKind::Unknown(_), None)    => collect_nt_strings(path, None,    db),
+    }
+}
+
+/// Collect every unique RDF term from `inputs` into `db` (Phase 1, sequential).
 ///
 /// Streams through each file without building any index or triple buffer.
 /// Memory cost = `db`'s internal chunk buffer (bounded by `dict_chunk_mb`).
@@ -339,24 +360,63 @@ pub fn collect_strings_from_inputs(
 ) -> io::Result<LoadStats> {
     let mut total = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
     for input in inputs {
-        let path = &input.path;
-        eprintln!("  Phase 1: {:?}", path.file_name().unwrap_or_default());
-        let graph = input.graph.as_deref();
-        let stats = match (classify_extension(path), graph) {
-            (FileKind::NTriples,   Some(g)) => collect_nt_strings(path, Some(g), db)?,
-            (FileKind::NTriples,   None)    => collect_nt_strings(path, None,    db)?,
-            (FileKind::NTriplesGz, Some(g)) => collect_nt_strings_gz(path, Some(g), db)?,
-            (FileKind::NTriplesGz, None)    => collect_nt_strings_gz(path, None,    db)?,
-            (FileKind::NQuads,   _)         => collect_nq_strings(path, db)?,
-            (FileKind::NQuadsGz, _)         => collect_nq_strings_gz(path, db)?,
-            (FileKind::Unknown(_), Some(g)) => collect_nt_strings(path, Some(g), db)?,
-            (FileKind::Unknown(_), None)    => collect_nt_strings(path, None,    db)?,
-        };
+        eprintln!("  Phase 1: {:?}", input.path.file_name().unwrap_or_default());
+        let stats = collect_strings_from_one_input(input, db)?;
         total.triples_loaded  += stats.triples_loaded;
         total.lines_processed += stats.lines_processed;
         total.errors          += stats.errors;
     }
     Ok(total)
+}
+
+/// Phase 1, **parallel** variant.
+///
+/// Each file is processed by its own rayon worker thread.  Per-thread
+/// [`DictBuilder`] instances write sorted string chunks to private
+/// subdirectories under `tmp_dir`; their chunk files are returned for a
+/// single k-way merge by the caller.
+///
+/// `total_dict_chunk_bytes` is divided by the actual thread count so that
+/// total peak RAM stays approximately constant regardless of parallelism.
+///
+/// Returns `(all_chunk_paths, accumulated_stats)`.
+pub fn collect_strings_parallel(
+    inputs: &[InputSpec],
+    tmp_dir: &Path,
+    total_dict_chunk_bytes: usize,
+    num_threads: usize,
+) -> io::Result<(Vec<PathBuf>, LoadStats)> {
+    use rayon::prelude::*;
+
+    let n = num_threads.max(1);
+    // Divide budget by actual thread count; never drop below 8 MB.
+    let per_thread_bytes = (total_dict_chunk_bytes / n).max(8 * 1024 * 1024);
+
+    // Process all inputs in parallel; each returns (chunks, stats) or an error.
+    let results: Vec<io::Result<(Vec<PathBuf>, LoadStats)>> = inputs
+        .par_iter()
+        .enumerate()
+        .map(|(i, input)| {
+            let thread_tmp = tmp_dir.join(format!("p1_{:06}", i));
+            eprintln!("  Phase 1 [t{i}]: {:?}", input.path.file_name().unwrap_or_default());
+            let mut db = crate::dict_builder::DictBuilder::new(&thread_tmp, per_thread_bytes)?;
+            let stats = collect_strings_from_one_input(input, &mut db)?;
+            let chunks = db.flush_and_return_chunks()?;
+            Ok((chunks, stats))
+        })
+        .collect();
+
+    // Fold results; propagate first error (rayon does not short-circuit).
+    let mut all_chunks = Vec::new();
+    let mut total = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
+    for r in results {
+        let (chunks, stats) = r?;
+        all_chunks.extend(chunks);
+        total.triples_loaded  += stats.triples_loaded;
+        total.lines_processed += stats.lines_processed;
+        total.errors          += stats.errors;
+    }
+    Ok((all_chunks, total))
 }
 
 fn collect_nt_strings(path: &Path, graph: Option<&str>, db: &mut crate::dict_builder::DictBuilder) -> io::Result<LoadStats> {
@@ -387,7 +447,28 @@ fn collect_nq_strings_gz(path: &Path, db: &mut crate::dict_builder::DictBuilder)
 
 // ── Phase 2: triple loading with ReadonlyDict ─────────────────────────────────
 
-/// Load triples from `inputs` using IDs from `dict` (Phase 2 of two-pass load).
+/// Load triples from a **single** input using IDs from `dict`.
+///
+/// Low-level helper shared by the sequential and parallel callers.
+fn load_triple_from_one_input(
+    input: &InputSpec,
+    dict: &crate::dict_builder::ReadonlyDict,
+    builders: &mut AllBuilders,
+) -> io::Result<LoadStats> {
+    let path = &input.path;
+    match (classify_extension(path), input.graph.as_deref()) {
+        (FileKind::NTriples,   Some(g)) => load_nt_two_pass_graph(path, g, dict, builders),
+        (FileKind::NTriples,   None)    => load_nt_two_pass(path, None, dict, builders),
+        (FileKind::NTriplesGz, Some(g)) => load_nt_two_pass_gz_graph(path, g, dict, builders),
+        (FileKind::NTriplesGz, None)    => load_nt_two_pass_gz(path, None, dict, builders),
+        (FileKind::NQuads,   _)         => load_nq_two_pass(path, dict, builders),
+        (FileKind::NQuadsGz, _)         => load_nq_two_pass_gz(path, dict, builders),
+        (FileKind::Unknown(_), Some(g)) => load_nt_two_pass_graph(path, g, dict, builders),
+        (FileKind::Unknown(_), None)    => load_nt_two_pass(path, None, dict, builders),
+    }
+}
+
+/// Load triples from `inputs` using IDs from `dict` (Phase 2, sequential).
 ///
 /// Every string is resolved via binary search on the mmap-ed `ReadonlyDict`.
 /// Returns an error if a term is missing from the dictionary (indicates a
@@ -399,28 +480,72 @@ pub fn load_triples_with_readonly_dict(
 ) -> io::Result<LoadStats> {
     let mut total = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
     for input in inputs {
-        let path = &input.path;
         let graph_label = input.graph.as_deref()
             .map(|g| format!(" → <{}>", g))
             .unwrap_or_default();
-        eprintln!("  Phase 2: {:?}{}", path.file_name().unwrap_or_default(), graph_label);
-
-        let stats = match (classify_extension(path), input.graph.as_deref()) {
-            (FileKind::NTriples,   Some(g)) => load_nt_two_pass_graph(path, g, dict, builders)?,
-            (FileKind::NTriples,   None)    => load_nt_two_pass(path, None, dict, builders)?,
-            (FileKind::NTriplesGz, Some(g)) => load_nt_two_pass_gz_graph(path, g, dict, builders)?,
-            (FileKind::NTriplesGz, None)    => load_nt_two_pass_gz(path, None, dict, builders)?,
-            (FileKind::NQuads,   _)         => load_nq_two_pass(path, dict, builders)?,
-            (FileKind::NQuadsGz, _)         => load_nq_two_pass_gz(path, dict, builders)?,
-            (FileKind::Unknown(_), Some(g)) => load_nt_two_pass_graph(path, g, dict, builders)?,
-            (FileKind::Unknown(_), None)    => load_nt_two_pass(path, None, dict, builders)?,
-        };
+        eprintln!("  Phase 2: {:?}{}", input.path.file_name().unwrap_or_default(), graph_label);
+        let stats = load_triple_from_one_input(input, dict, builders)?;
         total.triples_loaded  += stats.triples_loaded;
         total.lines_processed += stats.lines_processed;
         total.errors          += stats.errors;
         eprintln!("    → {} triples ({} errors)", stats.triples_loaded, stats.errors);
     }
     Ok(total)
+}
+
+/// Phase 2, **parallel** variant.
+///
+/// Each file is processed by its own rayon worker thread.  Each thread opens
+/// its own [`ReadonlyDict`] instance (the OS shares physical pages across
+/// mmap-s of the same file), writes triple chunks to a private subdirectory
+/// under `tmp_dir`, and returns a [`ParallelChunks`] struct.
+///
+/// `chunk_size` is divided by thread count so total peak triple-buffer RAM
+/// stays approximately constant.
+///
+/// Returns `(per_file_chunks, accumulated_stats)`.
+pub fn load_triples_parallel(
+    inputs: &[InputSpec],
+    dict_sorted_path: &Path,
+    tmp_dir: &Path,
+    chunk_size: usize,
+    num_threads: usize,
+) -> io::Result<(Vec<crate::index::ParallelChunks>, LoadStats)> {
+    use rayon::prelude::*;
+
+    let n = num_threads.max(1);
+    // Divide chunk_size by thread count; never drop below 100_000 triples.
+    let per_thread_chunk_size = (chunk_size / n).max(100_000);
+
+    let results: Vec<io::Result<(crate::index::ParallelChunks, LoadStats)>> = inputs
+        .par_iter()
+        .enumerate()
+        .map(|(i, input)| {
+            // Each thread opens its own ReadonlyDict — OS shares physical pages.
+            let dict = crate::dict_builder::ReadonlyDict::open(dict_sorted_path)?;
+            let thread_tmp = tmp_dir.join(format!("p2_{:06}", i));
+            let graph_label = input.graph.as_deref()
+                .map(|g| format!(" → <{}>", g))
+                .unwrap_or_default();
+            eprintln!("  Phase 2 [t{i}]: {:?}{}", input.path.file_name().unwrap_or_default(), graph_label);
+            let mut builders = AllBuilders::new_streaming_in(&thread_tmp, per_thread_chunk_size)?;
+            let stats = load_triple_from_one_input(input, &dict, &mut builders)?;
+            eprintln!("    → {} triples ({} errors)", stats.triples_loaded, stats.errors);
+            let chunks = builders.flush_and_return_chunks()?;
+            Ok((chunks, stats))
+        })
+        .collect();
+
+    let mut all_chunks = Vec::new();
+    let mut total = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
+    for r in results {
+        let (chunks, stats) = r?;
+        all_chunks.push(chunks);
+        total.triples_loaded  += stats.triples_loaded;
+        total.lines_processed += stats.lines_processed;
+        total.errors          += stats.errors;
+    }
+    Ok((all_chunks, total))
 }
 
 #[inline]

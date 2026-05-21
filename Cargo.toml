@@ -44,6 +44,9 @@ clap = { version = "4", features = ["derive"] }
 # Fast hash map (for dictionary encoding)
 rustc-hash = "1"
 
+# Data-parallel processing for multi-file index build
+rayon = "1"
+
 # Regex support for SPARQL FILTER regex()
 regex = "1"
 
