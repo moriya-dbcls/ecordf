@@ -2,10 +2,11 @@
 
 ## 設計の動機
 
-EcoRDF が重視した2点：
+EcoRDF が重視した3点：
 
 - **複雑な JOIN の性能**: Virtuoso のようなハッシュ結合の逐次処理に対して、Leapfrog Triejoin（最悪ケース最適）を採用。
-- **ビルド時のメモリ効率**: 辞書・インデックスを外部ソートで構築し、ピーク RAM をデータセットサイズに依存しない定数に抑える。
+- **ビルド時のメモリ効率**: 辞書・インデックスを2パス外部ソートで構築し、ピーク RAM をデータセットサイズに依存しない定数に抑える。UniProt 規模（100M+ 固有 IRI/リテラル）でも RAM 上限を超えない。
+- **並列ロード**: rayon によるファイル並列処理で、複数ファイルの Phase 1/2 を CPU コア数に応じてスケールアップ。
 
 ---
 
@@ -29,9 +30,73 @@ let mmap = unsafe { Mmap::map(&file)? };
 
 ---
 
-## 核心技術 2 — Leapfrog Triejoin
+## 核心技術 2 — 2パス外部ソート辞書ビルダー
 
-Virtuoso のハッシュ結合は 2パターンずつ逐次処理し、中間結果を物理化します。
+`dict_builder.rs` が実装するメモリ効率的な辞書構築。インメモリ `Dictionary` は全ユニーク文字列を同時保持するため、UniProt 規模で 10 GB 超のメモリを消費する問題があった。
+
+### Phase 1 — DictBuilder（文字列収集）
+
+入力ファイルをストリームしながら文字列だけを収集。メモリが `dict_chunk_mb` MB を超えたらソート・dedup してディスクへチャンクを書き出す。全ファイル走査後に k-way マージで `dict_sorted.bin` を生成。
+
+```
+ピーク RAM = チャンクバッファ 1 つ分（≤ dict_chunk_mb MB）
+```
+
+**EMFILE 対策 — 階層マージ (`MAX_FAN_IN = 64`):**  
+チャンク数が 64 を超える場合は、64 個ずつバッチマージして中間チャンクを作り、最終マージを行う。macOS のデフォルト fd 上限 (256) でも安全。
+
+### Phase 2 — ReadonlyDict（mmap バイナリサーチ）
+
+`dict_sorted.bin` を `memmap2::Mmap` でマップし、オフセットテーブルを使った O(log N) バイナリサーチで ID を解決。頻出タームはホットキャッシュ (≤ 4M エントリ / 約 400 MB) に保持して再探索を回避。
+
+```
+ピーク RAM = ホットキャッシュ（≤ ~400 MB）+ OS ページキャッシュ（mmap）
+```
+
+### QueryDict — 実行時の辞書インターフェイス
+
+`store.rs` の `dict` フィールドは `QueryDict` enum になっており、`ReadonlyDict`（2パス）か `Dictionary`（レガシー1パス）かを透過的に切り替える。
+
+### dict_sorted.bin フォーマット
+
+```text
+[magic: b"ESRT0001"  (8 bytes)]
+[count: u64           (8 bytes)]   ← ユニーク項数
+[offsets_start: u64   (8 bytes)]   ← オフセットセクションの開始バイト位置
+── 文字列セクション (byte 24 から) ──────────────────────────
+for each term (辞書順):
+  [len: u32][bytes: len × u8]
+── オフセットセクション (offsets_start から) ─────────────────
+for each term i in 0..count:
+  [u64]  term i の (len, bytes) の絶対バイト位置
+```
+
+ID は辞書順インデックスで割り当て。Phase 2 で構築されるトリプルインデックスが同じ ID を使うため、全文字列を HashMap に展開せず一貫性が保たれる。
+
+### レジューム機能 — `--resume-phase2`
+
+長大データセットのビルドが中断した場合：
+
+- **ケース A**: `_ecordf_tmp/dict_sorted.bin` が存在 → Phase 1 を完全スキップして Phase 2 へ
+- **ケース B**: チャンクファイル (`_ecordf_tmp/p1_*`) が残存 → マージだけやり直してから Phase 2 へ
+
+```bash
+ecordf build --dir ./store --resume-phase2 --from-file inputs.txt
+```
+
+### ビルドメモリ概算（2パス時）
+
+| フェーズ | ピーク RAM |
+|---------|-----------|
+| Phase 1（文字列収集）| ≤ `dict_chunk_mb` MB（デフォルト 200 MB）|
+| Phase 2（トリプルインデックス構築）| ≤ `dict_chunk_mb` + `chunk_size × 40B × スレッド数` |
+| クエリ実行時の辞書（ReadonlyDict）| ホットキャッシュ ≤ ~400 MB + mmap |
+
+---
+
+## 核心技術 3 — Leapfrog Triejoin
+
+Virtuoso のハッシュ結合は 2パターンずつ逐次処理し、中間結果を物理化します。EcoRDF の Leapfrog Triejoin は全パターンのイテレータを同時に動かします。
 
 ```
 ?protein up:organism <taxon:9606>    → 20,000件をハッシュテーブルに積む
@@ -272,26 +337,44 @@ WHERE {
 ```
 ecordf/
 ├── src/
-│   ├── config.rs      設定: Config / QueryConfig / ServerConfig
+│   ├── lib.rs         クレートエントリポイント
+│   │                    モジュール宣言 / 公開 API (Config, InputSpec, Store, StoreStatistics)
+│   ├── config.rs      設定: Config / BuildConfig / QueryConfig / ServerConfig
 │   │                    ecordf.toml を serde+toml でデシリアライズ
 │   │                    ファイル探索順: --config > <store-dir>/ecordf.toml > デフォルト値
-│   ├── dict.rs        辞書: 文字列 ↔ u32 ID
+│   │                    BuildConfig: chunk_size / dict_chunk_mb / parallel_threads
+│   ├── dict.rs        辞書 (レガシー・1パス用): 文字列 ↔ u32 ID
 │   │                    RwLock による interior mutability
 │   │                    19プレフィックスの名前空間圧縮
+│   │                    クエリ実行時の ephemeral エントリ追加 (STR, CONCAT 等)
+│   ├── dict_builder.rs 辞書ビルダー (2パス外部ソート用)
+│   │                    DictBuilder    — Phase 1: チャンクバッファ→ディスク→k-wayマージ
+│   │                    ReadonlyDict   — Phase 2: mmap+バイナリサーチ+ホットキャッシュ
+│   │                    QueryDict      — 実行時 enum (ReadonlyDict | Dictionary)
+│   │                    merge_string_chunks — 階層マージ (MAX_FAN_IN=64, EMFILE対策)
+│   │                    dict_sorted.bin フォーマット: ESRT0001 magic
 │   ├── triple.rs      TripleId / Triple / Quad 型、UNBOUND定数
 │   ├── index.rs       memmap2ベースのソート済み整数配列
 │   │                    IndexBuilder / IndexFile (SPO・POS・OSP)
 │   │                    GspoBuilder / GspoIndexFile (Named Graphs)
-│   │                    AllBuilders (ビルドフェーズの統合API)
+│   │                    AllBuilders (ビルドフェーズの統合API; 並列対応)
 │   │                    spo_scan_all / pos_scan_all (統計構築用全スキャン)
 │   ├── stats.rs       述語統計: StoreStatistics / PredicateStats
 │   │                    build_from_index (2パスO(N)スキャン)
 │   │                    save / load / load_or_build
 │   │                    estimate (SP/PO/P/SPO ファンアウト推定)
 │   ├── store.rs       ストアファサード: load / open / open_with_config / query
+│   │                    dict フィールドが QueryDict (ReadonlyDict or Dictionary)
+│   │                    load_with_graphs — Named Graph 対応の2パスロード
+│   │                    load_with_graphs_resume_phase2 — 中断再開
 │   │                    Config / StoreStatistics を保持
 │   │                    Executor に QueryConfig + StoreStatistics を渡す
 │   ├── loader.rs      N-Triples / N-Quads ストリーミングパーサー
+│   │                    InputSpec — ファイルパス + オプショナル Named Graph IRI
+│   │                    collect_strings_from_inputs — Phase 1 (シングルスレッド)
+│   │                    collect_strings_parallel     — Phase 1 (rayon 並列)
+│   │                    load_triples_with_readonly_dict — Phase 2 (シングル)
+│   │                    load_triples_parallel           — Phase 2 (rayon 並列)
 │   ├── sparql/
 │   │   ├── ast.rs     SPARQL 1.1 AST型定義
 │   │   │                PropertyPath / GraphPattern を含む完全定義
@@ -312,8 +395,9 @@ ecordf/
 │   │                    JSON / XML / TSV / CSV レスポンス
 │   │                    CORS オプション対応
 │   └── main.rs        CLI: build / serve / query / stats
+│                        build: --resume-phase2 (中断再開)
 │                        serve: --host / --port / --cors / --config
-│                        query: --config
+│                        query: --config / "-" (stdin読み込み)
 ├── ecordf.toml        設定ファイルのサンプル（全パラメータ・説明付き）
 ├── DESIGN.md          本ドキュメント
 └── Cargo.toml
@@ -378,6 +462,9 @@ find /data -name '*.nt.gz' | \
 
 # 読み込み完了後:
 # Built store: 142357891 triples, 28456123 terms, 5 named graphs
+
+# ビルドが中断した場合は --resume-phase2 で再開（dict_sorted.bin が存在すれば Phase 1 スキップ）
+./target/release/ecordf build --dir ./store --resume-phase2 --from-file inputs.txt
 ```
 
 ロードされたグラフは `GRAPH` 句でアクセスできます：
@@ -436,6 +523,9 @@ $EDITOR ./uniprot-store/ecordf.toml
 
 | キー | デフォルト | 説明 |
 |------|-----------|------|
+| `build.chunk_size` | 5,000,000 | 外部ソートのトリプルチャンクサイズ（0=レガシー1パス） |
+| `build.dict_chunk_mb` | 200 | Phase 1 文字列バッファの RAM 上限（MiB） |
+| `build.parallel_threads` | 0 | 並列ロードスレッド数（0=全 CPU コア） |
 | `query.max_intermediate_rows` | 50,000,000 | 中間結果の行数上限（OOM防止） |
 | `query.bind_join_threshold` | 10,000 | bind_join / hash_join の切り替え閾値 |
 | `server.host` | `127.0.0.1` | バインドアドレス |
@@ -485,7 +575,7 @@ POST http://localhost:7878/sparql
 |------|-------------|
 | 起動時間 | mmap のため即時（インデックスファイルを開くだけ） |
 | クエリ時 RAM | ワーキングセット依存（OS ページキャッシュで管理） |
-| ビルド時ピーク RAM | 外部ソートにより定数（`dict_chunk_mb` + `chunk_size × 36B`）|
+| ビルド時ピーク RAM | 2パス外部ソートにより定数（Phase 1: `dict_chunk_mb` MB、Phase 2: `dict_chunk_mb` + `chunk_size × 40B × スレッド数`）|
 | 並列クエリ処理 | 対応（tokio blocking pool） |
 | Property Path (* 転移閉包) | BFS（対応済） |
 | Named Graphs (GRAPH句) | GSPO索引（対応済） |
@@ -506,18 +596,19 @@ Semaphore (max_concurrent_queries): アプリ層の同時数キャップ
 
 - **1クエリの内部処理**: シングルスレッド。広域スキャンが絡む単一クエリでは内部並列実行を持つシステムに劣る場合があります。
 - **Leapfrog**: 共有変数が2つ以上のパターンはハッシュジョインにフォールバックします（完全な多変数 Leapfrog は今後の課題）。
-- **クエリ時辞書**: 起動時に `dict.bin` 全体をメモリに読み込みます。ビルド時はmmap＋外部ソートで定数メモリですが、クエリ時の辞書はデータセット規模に比例します。
+- **クエリ時辞書**: `ReadonlyDict`（2パス構築後）はホットキャッシュ (≤ 4M エントリ / ~400 MB) + mmap で動作します。レガシー1パス時は `dict.bin` を全件 HashMap に展開するためデータセット規模に比例します。
 
 ---
 
 ## 今後の拡張候補
 
 1. **SPARQL UPDATE** — INSERT DATA / DELETE DATA / MODIFY
-2. **クエリ内部の並列化** — rayon による JOIN内部のスレッド並列化（クエリ間並列は実装済み）
+2. **クエリ内部の並列化** — rayon による JOIN内部のスレッド並列化（クエリ間並列は実装済み、ファイルロードの並列化は実装済み）
 3. **Leapfrog 多変数完全実装** — 共有変数が2つ以上の場合もLeapfrogで処理
 4. **SPARQL Federation** — SERVICE句による外部エンドポイント連携
 5. **Block圧縮** — zstdでディスク使用量をさらに削減
 6. **CONSTRUCT** — RDFグラフを返すクエリ形式
 7. **クエリタイムアウト** — 長時間クエリを自動キャンセルする機能
-8. **HyperLogLog** — subject_count / object_count の厳密カウント（現在は全スキャン）
+8. **HyperLogLog** — subject_count / object_count の近似カウント（現在は2パス全スキャン）
 9. **BOUND_VAR_FACTOR の自動調整** — 述語の distinctiveness から動的に推定倍率を計算
+10. **ReadonlyDict のキャッシュ戦略改善** — ホットキャッシュを LRU 化して偏りのあるアクセスパターンに対応
