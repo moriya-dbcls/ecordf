@@ -553,23 +553,50 @@ impl IndexFile {
 
     /// Seek to the first position where raw[0] >= target.
     /// Returns the actual raw[0] at that position, or u32::MAX if exhausted.
+    ///
+    /// Uses **galloping search** (exponential probe + binary search in the
+    /// narrowed range): O(log k) where k = distance from `from` to the result.
+    /// This is significantly faster than O(log n) binary search over the entire
+    /// index when the target is close — the common case in Leapfrog Triejoin
+    /// because successive `seek` calls advance by small amounts.
     pub fn seek_0(&self, from: usize, target: u32) -> (usize, u32) {
-        let pos = {
-            let (mut lo, mut hi) = (from, self.count);
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                if self.get_raw(mid)[0] < target {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
+        if from >= self.count {
+            return (self.count, u32::MAX);
+        }
+        // If already at or past target, return immediately.
+        let cur = self.get_raw(from)[0];
+        if cur >= target {
+            return (from, cur);
+        }
+
+        // ── Galloping phase ───────────────────────────────────────────────────
+        // `lo` always satisfies get_raw(lo)[0] < target.
+        // We probe at lo+step, doubling step each time until we overshoot or
+        // run off the end of the index.
+        let mut lo = from;
+        let mut step = 1usize;
+        loop {
+            let probe = lo + step;
+            if probe >= self.count || self.get_raw(probe)[0] >= target {
+                // Binary search in the range (lo, min(probe, count))
+                let hi = probe.min(self.count);
+                let (mut a, mut b) = (lo + 1, hi); // a > lo so a-1 is guaranteed < target
+                while a < b {
+                    let mid = a + (b - a) / 2;
+                    if self.get_raw(mid)[0] < target {
+                        a = mid + 1;
+                    } else {
+                        b = mid;
+                    }
                 }
+                return if a < self.count {
+                    (a, self.get_raw(a)[0])
+                } else {
+                    (self.count, u32::MAX)
+                };
             }
-            lo
-        };
-        if pos < self.count {
-            (pos, self.get_raw(pos)[0])
-        } else {
-            (self.count, u32::MAX)
+            lo = probe;
+            step = step.saturating_mul(2);
         }
     }
 }

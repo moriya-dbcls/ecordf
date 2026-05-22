@@ -30,7 +30,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::config::QueryConfig;
-use crate::dict::Dictionary;
+use crate::dict_builder::QueryDict;
 use crate::index::{GspoIndexFile, TripleIndex};
 use crate::stats::StoreStatistics;
 use crate::triple::{TermId, TriplePattern, UNBOUND};
@@ -165,7 +165,7 @@ fn leapfrog_join(mut iters: Vec<SortedIter>) -> Vec<TermId> {
 
 pub struct Executor<'a> {
     pub index: &'a TripleIndex,
-    pub dict: &'a Dictionary,
+    pub dict: &'a QueryDict,
     pub config: QueryConfig,
     /// Optional predicate statistics for join ordering.
     /// When `None`, the optimizer falls back to index-probe estimates only.
@@ -173,17 +173,17 @@ pub struct Executor<'a> {
 }
 
 impl<'a> Executor<'a> {
-    pub fn new(index: &'a TripleIndex, dict: &'a Dictionary) -> Self {
+    pub fn new(index: &'a TripleIndex, dict: &'a QueryDict) -> Self {
         Self { index, dict, config: QueryConfig::default(), stats: None }
     }
 
-    pub fn with_config(index: &'a TripleIndex, dict: &'a Dictionary, config: QueryConfig) -> Self {
+    pub fn with_config(index: &'a TripleIndex, dict: &'a QueryDict, config: QueryConfig) -> Self {
         Self { index, dict, config, stats: None }
     }
 
     pub fn with_config_and_stats(
         index: &'a TripleIndex,
-        dict: &'a Dictionary,
+        dict: &'a QueryDict,
         config: QueryConfig,
         stats: Option<&'a StoreStatistics>,
     ) -> Self {
@@ -1908,7 +1908,7 @@ fn collect_pattern_vars(pattern: &GraphPattern, out: &mut HashSet<String>) {
 pub fn optimize_bgp(
     pattern: &GraphPattern,
     index: &TripleIndex,
-    dict: &Dictionary,
+    dict: &QueryDict,
     stats: Option<&StoreStatistics>,
 ) -> ExecutionPlan {
     optimize_bgp_with_bound(pattern, index, dict, stats, &HashSet::new())
@@ -1917,7 +1917,7 @@ pub fn optimize_bgp(
 fn optimize_bgp_with_bound(
     pattern: &GraphPattern,
     index: &TripleIndex,
-    dict: &Dictionary,
+    dict: &QueryDict,
     stats: Option<&StoreStatistics>,
     bound: &HashSet<String>,
 ) -> ExecutionPlan {
@@ -2040,7 +2040,7 @@ fn estimate_pattern_cardinality(
     t: &TriplePatternAst,
     bound: &HashSet<String>,
     index: &TripleIndex,
-    dict: &Dictionary,
+    dict: &QueryDict,
     stats: Option<&StoreStatistics>,
 ) -> u64 {
     // Encode constant (non-variable) terms to TermIds for index probing.
@@ -2113,7 +2113,7 @@ fn estimate_pattern_cardinality(
 fn optimize_triple_patterns(
     triples: &[TriplePatternAst],
     index: &TripleIndex,
-    dict: &Dictionary,
+    dict: &QueryDict,
     stats: Option<&StoreStatistics>,
     initially_bound: &HashSet<String>,
 ) -> ExecutionPlan {
@@ -2276,7 +2276,7 @@ fn parse_numeric(s: &str) -> Option<f64> {
     val.parse::<f64>().ok()
 }
 
-fn eval_expr_to_string(expr: &Expression, binding: &Binding, dict: &Dictionary) -> String {
+fn eval_expr_to_string(expr: &Expression, binding: &Binding, dict: &QueryDict) -> String {
     match expr {
         Expression::Variable(v) => binding.get(v.as_str())
             .map(|&id| dict.decode(id))

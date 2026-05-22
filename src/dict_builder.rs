@@ -41,6 +41,7 @@ use std::collections::BinaryHeap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use memmap2::Mmap;
 use rustc_hash::FxHashMap;
@@ -427,7 +428,9 @@ pub struct ReadonlyDict {
     /// Byte offset of the offsets section inside the mmap.
     offsets_start: usize,
     /// Bounded string→ID cache for hot terms.
-    cache: std::cell::RefCell<FxHashMap<Box<str>, u32>>,
+    /// `RwLock` (not `RefCell`) makes `ReadonlyDict` `Sync` so it can be
+    /// shared across query threads via `Arc<Store>`.
+    cache: RwLock<FxHashMap<Box<str>, u32>>,
 }
 
 impl ReadonlyDict {
@@ -455,7 +458,7 @@ impl ReadonlyDict {
             mmap,
             count,
             offsets_start,
-            cache: std::cell::RefCell::new(FxHashMap::default()),
+            cache: RwLock::new(FxHashMap::default()),
         })
     }
 
@@ -467,9 +470,9 @@ impl ReadonlyDict {
 
     /// Look up a string and return its ID, or `None` if not present.
     pub fn get_id(&self, s: &str) -> Option<u32> {
-        // Fast path: hot cache.
+        // Fast path: hot cache (read lock, no exclusive contention with readers).
         {
-            let cache = self.cache.borrow();
+            let cache = self.cache.read().unwrap();
             if let Some(&id) = cache.get(s) {
                 return Some(id);
             }
@@ -477,7 +480,7 @@ impl ReadonlyDict {
         // Slow path: binary search in mmap.
         let id = self.binary_search(s)?;
         // Cache result if the cache is not yet full.
-        let mut cache = self.cache.borrow_mut();
+        let mut cache = self.cache.write().unwrap();
         if cache.len() < MAX_CACHE_ENTRIES {
             cache.insert(s.into(), id);
         }
@@ -572,5 +575,153 @@ impl ReadonlyDict {
         }
 
         w.flush()
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// QueryDict — query-time dictionary (mmap-backed or legacy in-memory)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Unified query-time dictionary.
+///
+/// ## Mmap mode (new stores)
+///
+/// The immutable base terms are served directly from the mmap-ed
+/// `dict_sorted.bin` via binary search + bounded hot cache.  Peak RAM =
+/// cache (~400 MB) + OS page cache pages actually touched.
+///
+/// Expression-generated terms (e.g. from `CONCAT`, `UCASE`, `STR`) that do
+/// not appear in the base dictionary receive IDs starting at `base_count`.
+/// They live in the in-memory `computed` table and are ephemeral (discarded
+/// when the `Store` is dropped).
+///
+/// ## Legacy mode (old stores without `dict_sorted.bin`)
+///
+/// All terms are held in a fully in-memory hash table, matching the old
+/// `Dictionary` behaviour.  This path is taken automatically when `open()`
+/// cannot find `dict_sorted.bin` in the store directory.
+pub enum QueryDict {
+    Mmap {
+        base: ReadonlyDict,
+        base_count: u32,
+        /// Computed (expression-generated) terms: (vec of strings, string→id map).
+        /// Single lock to avoid lock-ordering issues.
+        computed: RwLock<(Vec<Box<str>>, FxHashMap<String, u32>)>,
+    },
+    Legacy {
+        /// All terms: (id_to_str, str_to_id).
+        data: RwLock<(Vec<Box<str>>, FxHashMap<String, u32>)>,
+    },
+}
+
+impl QueryDict {
+    /// Build a query dict backed by a memory-mapped `dict_sorted.bin`.
+    pub fn from_mmap(base: ReadonlyDict) -> Self {
+        let base_count = base.len() as u32;
+        Self::Mmap {
+            base,
+            base_count,
+            computed: RwLock::new((Vec::new(), FxHashMap::default())),
+        }
+    }
+
+    /// Build a query dict from in-memory vectors (legacy / old-store path).
+    pub fn from_legacy(id_to_str: Vec<Box<str>>, str_to_id: FxHashMap<String, u32>) -> Self {
+        Self::Legacy {
+            data: RwLock::new((id_to_str, str_to_id)),
+        }
+    }
+
+    /// Number of base terms (not counting ephemeral computed terms).
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Mmap { base, .. } => base.len() as usize,
+            Self::Legacy { data } => data.read().unwrap().0.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Look up a string without inserting. Returns `None` if absent.
+    pub fn lookup(&self, s: &str) -> Option<u32> {
+        match self {
+            Self::Mmap { base, computed, .. } => {
+                base.get_id(s)
+                    .or_else(|| computed.read().unwrap().1.get(s).copied())
+            }
+            Self::Legacy { data } => {
+                data.read().unwrap().1.get(s).copied()
+            }
+        }
+    }
+
+    /// Decode a term ID to its string representation.
+    pub fn decode(&self, id: u32) -> String {
+        match self {
+            Self::Mmap { base, base_count, computed } => {
+                if id < *base_count {
+                    base.get_str(id).to_string()
+                } else {
+                    let idx = (id - base_count) as usize;
+                    computed.read().unwrap().0
+                        .get(idx)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("<unknown-term:{}>", id))
+                }
+            }
+            Self::Legacy { data } => {
+                data.read().unwrap().0[id as usize].to_string()
+            }
+        }
+    }
+
+    /// Get or assign an integer ID for the given string.
+    ///
+    /// Base-dictionary terms get the same ID they were assigned during build.
+    /// New expression-generated terms (absent from the base dict) get IDs
+    /// starting at `base_count`; these IDs are ephemeral and session-local.
+    pub fn encode(&self, s: &str) -> u32 {
+        // Fast path: already known.
+        if let Some(id) = self.lookup(s) {
+            return id;
+        }
+        // Slow path: insert into the computed / data table.
+        match self {
+            Self::Mmap { base_count, computed, .. } => {
+                let mut g = computed.write().unwrap();
+                // Re-check after acquiring write lock.
+                if let Some(&id) = g.1.get(s) {
+                    return id;
+                }
+                let id = base_count + g.0.len() as u32;
+                g.0.push(s.into());
+                g.1.insert(s.to_string(), id);
+                id
+            }
+            Self::Legacy { data } => {
+                let mut g = data.write().unwrap();
+                if let Some(&id) = g.1.get(s) {
+                    return id;
+                }
+                let id = g.0.len() as u32;
+                g.0.push(s.into());
+                g.1.insert(s.to_string(), id);
+                id
+            }
+        }
+    }
+
+    /// Pretty-print a term for human display (wraps IRIs in `<…>`).
+    pub fn display(&self, id: u32) -> String {
+        let s = self.decode(id);
+        if s.starts_with("http://") || s.starts_with("https://") {
+            format!("<{}>", s)
+        } else if s.starts_with('"') {
+            s
+        } else {
+            s
+        }
     }
 }

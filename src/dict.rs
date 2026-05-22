@@ -234,6 +234,17 @@ impl Dictionary {
         })
     }
 
+    /// Consume this `Dictionary` and return its internal storage.
+    ///
+    /// Used to convert an in-memory dictionary built during a one-pass load
+    /// into a [`QueryDict::Legacy`] without copying all strings.
+    pub fn into_parts(self) -> (Vec<Box<str>>, FxHashMap<String, u32>) {
+        (
+            self.id_to_str.into_inner().unwrap(),
+            self.str_to_id.into_inner().unwrap(),
+        )
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn find_prefix<'a>(&self, term: &'a str) -> (Option<usize>, &'a str) {

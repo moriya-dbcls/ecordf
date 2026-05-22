@@ -15,7 +15,7 @@ use rayon;
 
 use crate::config::Config;
 use crate::dict::Dictionary;
-use crate::dict_builder::ReadonlyDict;
+use crate::dict_builder::{QueryDict, ReadonlyDict};
 use crate::index::{AllBuilders, TripleIndex};
 use crate::loader::{collect_strings_from_inputs, collect_strings_parallel,
                     load_files, load_files_with_graphs,
@@ -25,7 +25,7 @@ use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
 use crate::stats::StoreStatistics;
 
 pub struct Store {
-    pub dict: Dictionary,
+    pub dict: QueryDict,
     pub index: TripleIndex,
     pub dir: PathBuf,
     pub config: Config,
@@ -71,22 +71,24 @@ impl Store {
         let t0 = Instant::now();
         eprintln!("=== EcoRDF: loading {} file(s) [one-pass / in-memory dict] ===", input_files.len());
 
-        let dict = Dictionary::new();
+        let raw_dict = Dictionary::new();
         // chunk_size == 0 → in-memory sort (AllBuilders::new)
         let mut builders = AllBuilders::new_streaming(dir, 0)?;
-        let stats = load_files(input_files, &dict, &mut builders)?;
+        let stats = load_files(input_files, &raw_dict, &mut builders)?;
 
         eprintln!("Parsed {} triples in {:.1}s. Sorting and writing indexes...",
             stats.triples_loaded, t0.elapsed().as_secs_f64());
 
         let t1 = Instant::now();
         let index = builders.build(dir)?;
-        dict.save(&dir.join("dict.bin"))?;
+        raw_dict.save(&dir.join("dict.bin"))?;
 
         eprintln!("Indexes written in {:.1}s. Total: {:.1}s",
             t1.elapsed().as_secs_f64(), t0.elapsed().as_secs_f64());
-        eprintln!("Dictionary: {} terms | Triples: {}", dict.len(), index.triple_count());
+        eprintln!("Dictionary: {} terms | Triples: {}", raw_dict.len(), index.triple_count());
 
+        let (id_to_str, str_to_id) = raw_dict.into_parts();
+        let dict = QueryDict::from_legacy(id_to_str, str_to_id);
         let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
         Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats })
     }
@@ -248,7 +250,11 @@ impl Store {
 
         eprintln!("Indexes written in {:.1}s.", t3.elapsed().as_secs_f64());
 
-        // ── Write legacy dict.bin for query-time Dictionary::load() ───────────
+        // ── Persist dict_sorted.bin in the store root for query-time mmap ─────
+        let store_dict_sorted = dir.join("dict_sorted.bin");
+        fs::copy(&dict_sorted_path, &store_dict_sorted)?;
+
+        // ── Write legacy dict.bin for backward compatibility ──────────────────
         let readonly_dict = ReadonlyDict::open(&dict_sorted_path)?;
         readonly_dict.write_legacy_dict(&dir.join("dict.bin"))?;
 
@@ -262,8 +268,8 @@ impl Store {
         // Cleanup entire tmp dir (dict_sorted.bin + any remaining chunk dirs)
         let _ = fs::remove_dir_all(&tmp_dir);
 
-        // Load query-time dictionary
-        let dict = Dictionary::load(&dir.join("dict.bin"))?;
+        // Open query-time dictionary from the persisted mmap file.
+        let dict = QueryDict::from_mmap(ReadonlyDict::open(&store_dict_sorted)?);
         let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
         Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats })
     }
@@ -284,13 +290,15 @@ impl Store {
         } else {
             let t0 = Instant::now();
             eprintln!("=== EcoRDF: loading {} file(s) [one-pass] ===", inputs.len());
-            let dict = Dictionary::new();
+            let raw_dict = Dictionary::new();
             let mut builders = AllBuilders::new_streaming(dir, 0)?;
-            let stats = load_files_with_graphs(inputs, &dict, &mut builders)?;
+            let stats = load_files_with_graphs(inputs, &raw_dict, &mut builders)?;
             eprintln!("Parsed {} triples in {:.1}s. Writing indexes...",
                 stats.triples_loaded, t0.elapsed().as_secs_f64());
             let index = builders.build(dir)?;
-            dict.save(&dir.join("dict.bin"))?;
+            raw_dict.save(&dir.join("dict.bin"))?;
+            let (id_to_str, str_to_id) = raw_dict.into_parts();
+            let dict = QueryDict::from_legacy(id_to_str, str_to_id);
             let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
             Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats })
         }
@@ -312,13 +320,15 @@ impl Store {
             // chunk_size == 0 はもともと one-pass なので resume の概念がない
             eprintln!("警告: chunk_size=0 のため --resume-phase2 は無視し通常ビルドを実行します");
             let t0 = Instant::now();
-            let dict = Dictionary::new();
+            let raw_dict = Dictionary::new();
             let mut builders = AllBuilders::new_streaming(dir, 0)?;
-            let stats = load_files_with_graphs(inputs, &dict, &mut builders)?;
+            let stats = load_files_with_graphs(inputs, &raw_dict, &mut builders)?;
             eprintln!("Parsed {} triples in {:.1}s. Writing indexes...",
                 stats.triples_loaded, t0.elapsed().as_secs_f64());
             let index = builders.build(dir)?;
-            dict.save(&dir.join("dict.bin"))?;
+            raw_dict.save(&dir.join("dict.bin"))?;
+            let (id_to_str, str_to_id) = raw_dict.into_parts();
+            let dict = QueryDict::from_legacy(id_to_str, str_to_id);
             let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
             Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats })
         }
@@ -326,7 +336,7 @@ impl Store {
 
     /// Reopen an existing store from its directory.
     pub fn open(dir: &Path) -> io::Result<Self> {
-        let dict = Dictionary::load(&dir.join("dict.bin"))?;
+        let dict = open_query_dict(dir)?;
         let index = TripleIndex::open(dir)?;
         let config = Config::resolve(None, dir).map_err(io::Error::from)?;
         let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
@@ -336,7 +346,7 @@ impl Store {
     /// Reopen an existing store and apply an explicit config file (overrides
     /// the auto-detected `<store-dir>/ecordf.toml`).
     pub fn open_with_config(dir: &Path, config_path: Option<&std::path::Path>) -> io::Result<Self> {
-        let dict = Dictionary::load(&dir.join("dict.bin"))?;
+        let dict = open_query_dict(dir)?;
         let index = TripleIndex::open(dir)?;
         let config = Config::resolve(config_path, dir).map_err(io::Error::from)?;
         let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
@@ -431,6 +441,23 @@ impl Store {
             dir: self.dir.clone(),
         }
     }
+}
+
+/// Open the query-time dictionary for an existing store.
+///
+/// Prefers `dict_sorted.bin` (mmap-backed, low RAM) when present.
+/// Falls back to the legacy `dict.bin` (full in-memory) for stores built
+/// before this feature was added.
+fn open_query_dict(dir: &Path) -> io::Result<QueryDict> {
+    let mmap_path = dir.join("dict_sorted.bin");
+    if mmap_path.exists() {
+        let base = ReadonlyDict::open(&mmap_path)?;
+        return Ok(QueryDict::from_mmap(base));
+    }
+    // Legacy fallback: load dict.bin into memory.
+    let legacy = Dictionary::load(&dir.join("dict.bin"))?;
+    let (id_to_str, str_to_id) = legacy.into_parts();
+    Ok(QueryDict::from_legacy(id_to_str, str_to_id))
 }
 
 /// `_ecordf_tmp/p1_NNNNNN/` ディレクトリ内の文字列チャンクファイルを収集する。
