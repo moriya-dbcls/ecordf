@@ -1,14 +1,16 @@
 //! Core triple types.
 //!
-//! All strings are stored as u32 IDs from the Dictionary.
+//! All strings are stored as u64 IDs from the Dictionary.
 //! This keeps the hot path (index operations) to pure integer arithmetic.
+//! u64 IDs are required for datasets (such as full UniProt) whose unique term
+//! count exceeds the u32 limit of ~4.3 billion.
 
 /// An RDF term as a dictionary ID.
-/// u32::MAX is reserved as "unbound" (variable marker in pattern matching).
-pub type TermId = u32;
+/// u64::MAX is reserved as "unbound" (variable marker in pattern matching).
+pub type TermId = u64;
 
 /// Sentinel value for an unbound variable in a triple pattern.
-pub const UNBOUND: TermId = u32::MAX;
+pub const UNBOUND: TermId = u64::MAX;
 
 /// Special IRI used as the default graph identifier in GSPO index.
 pub const DEFAULT_GRAPH_IRI: &str = "urn:ecordf:default";
@@ -46,23 +48,23 @@ impl Triple {
         Self { s, p, o }
     }
 
-    /// Encode as a 12-byte array for binary storage.
+    /// Encode as a 24-byte array for binary storage (3 × u64 LE).
     #[inline]
-    pub fn to_bytes(self) -> [u8; 12] {
-        let mut b = [0u8; 12];
-        b[0..4].copy_from_slice(&self.s.to_le_bytes());
-        b[4..8].copy_from_slice(&self.p.to_le_bytes());
-        b[8..12].copy_from_slice(&self.o.to_le_bytes());
+    pub fn to_bytes(self) -> [u8; 24] {
+        let mut b = [0u8; 24];
+        b[0..8].copy_from_slice(&self.s.to_le_bytes());
+        b[8..16].copy_from_slice(&self.p.to_le_bytes());
+        b[16..24].copy_from_slice(&self.o.to_le_bytes());
         b
     }
 
-    /// Decode from a 12-byte array.
+    /// Decode from a 24-byte array (3 × u64 LE).
     #[inline]
-    pub fn from_bytes(b: &[u8; 12]) -> Self {
+    pub fn from_bytes(b: &[u8; 24]) -> Self {
         Self {
-            s: u32::from_le_bytes(b[0..4].try_into().unwrap()),
-            p: u32::from_le_bytes(b[4..8].try_into().unwrap()),
-            o: u32::from_le_bytes(b[8..12].try_into().unwrap()),
+            s: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+            p: u64::from_le_bytes(b[8..16].try_into().unwrap()),
+            o: u64::from_le_bytes(b[16..24].try_into().unwrap()),
         }
     }
 }

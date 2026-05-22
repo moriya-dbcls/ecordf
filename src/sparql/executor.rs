@@ -2079,8 +2079,8 @@ fn estimate_pattern_cardinality(
         //   SPO → 1  (direct triple check)
         //   P   → total triples for predicate
         // This is already conditioned on the bound positions, so no extra discount.
-        let s_opt = if s_id.is_some() || is_bound_var(&t.s) { Some(0u32) } else { None };
-        let o_opt = if o_id.is_some() || is_bound_var(&t.o) { Some(0u32) } else { None };
+        let s_opt = if s_id.is_some() || is_bound_var(&t.s) { Some(0u64) } else { None };
+        let o_opt = if o_id.is_some() || is_bound_var(&t.o) { Some(0u64) } else { None };
         stats.estimate(s_opt, Some(p), o_opt)
     } else {
         // ── Tier 1: index binary-search range count ───────────────────────────

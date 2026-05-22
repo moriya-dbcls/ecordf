@@ -141,13 +141,13 @@ impl Store {
         fs::create_dir_all(&tmp_dir)?;
 
         // ── Phase 1: collect all unique strings (or skip if resuming) ─────────
-        let term_count: u32;
+        let term_count: u64;
 
         if resume_phase2 {
             if dict_sorted_path.exists() {
                 // ── ケース A: dict_sorted.bin が存在 → Phase 1 を完全スキップ ──
                 let rdict = ReadonlyDict::open(&dict_sorted_path)?;
-                term_count = rdict.len() as u32;
+                term_count = rdict.len();
                 eprintln!(
                     "=== Phase 1 をスキップ (--resume-phase2): 既存の辞書を使用 ===\n\
                      Dictionary: {} terms  ({:?})",
@@ -267,8 +267,13 @@ impl Store {
         fs::copy(&dict_sorted_path, &store_dict_sorted)?;
 
         // ── Write legacy dict.bin for backward compatibility ──────────────────
+        // Skipped when the dictionary exceeds 4.3 billion unique terms (u32 limit),
+        // since the legacy format uses u32 term counts.  Query-time lookups use
+        // dict_sorted.bin which supports unlimited term counts.
         let readonly_dict = ReadonlyDict::open(&dict_sorted_path)?;
-        readonly_dict.write_legacy_dict(&dir.join("dict.bin"))?;
+        if let Err(e) = readonly_dict.write_legacy_dict(&dir.join("dict.bin")) {
+            eprintln!("Note: skipping legacy dict.bin — {}", e);
+        }
 
         eprintln!(
             "Total load time: {:.1}s  |  Dictionary: {} terms  |  Triples: {}",

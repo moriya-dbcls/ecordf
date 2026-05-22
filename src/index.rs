@@ -43,13 +43,15 @@ use rayon;
 
 use crate::triple::{IndexKind, Quad, TermId, Triple, TriplePattern, UNBOUND};
 
-const INDEX_MAGIC: &[u8; 8] = b"ECOI0001";
+/// Index file format version 2: term IDs are u64 (8 bytes each).
+/// Version 1 used u32 (4 bytes each) and is no longer written.
+const INDEX_MAGIC: &[u8; 8] = b"ECOI0002";
 const HEADER_SIZE: usize = 16; // magic(8) + count(8)
-const TRIPLE_BYTES: usize = 12; // 3 × u32
+const TRIPLE_BYTES: usize = 24; // 3 × u64
 
 // ── GSPO quad index constants ─────────────────────────────────────────────────
-const GSPO_MAGIC: &[u8; 8] = b"ECOG0001";
-const QUAD_BYTES: usize = 16; // 4 × u32 : (g, s, p, o)
+const GSPO_MAGIC: &[u8; 8] = b"ECOG0002";
+const QUAD_BYTES: usize = 32; // 4 × u64 : (g, s, p, o)
 
 /// Maximum number of chunk files opened simultaneously in a single k-way merge pass.
 ///
@@ -82,7 +84,7 @@ const MAX_FAN_IN: usize = 64;
 /// and are sorted in a single pass.
 pub struct IndexBuilder {
     pub kind: IndexKind,
-    triples: Vec<[u32; 3]>,
+    triples: Vec<[u64; 3]>,
     /// 0 = unbounded (in-memory); > 0 = external-sort chunk threshold.
     chunk_size: usize,
     /// Directory for temporary chunk files (set when chunk_size > 0).
@@ -195,8 +197,8 @@ impl IndexBuilder {
 
 /// Write a pre-sorted slice of raw triples to a binary chunk file.
 ///
-/// Format: `[count: u64][a0, b0, c0, a1, b1, c1, …  : u32 each]`
-pub(crate) fn write_triple_chunk(triples: &[[u32; 3]], path: &Path) -> io::Result<()> {
+/// Format: `[count: u64][a0, b0, c0, a1, b1, c1, …  : u64 each]`
+pub(crate) fn write_triple_chunk(triples: &[[u64; 3]], path: &Path) -> io::Result<()> {
     let file = File::create(path)?;
     let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
     w.write_all(&(triples.len() as u64).to_le_bytes())?;
@@ -209,7 +211,7 @@ pub(crate) fn write_triple_chunk(triples: &[[u32; 3]], path: &Path) -> io::Resul
 }
 
 /// Write a sorted slice of raw triples as a final index file (with header).
-pub(crate) fn write_index_from_sorted(triples: &[[u32; 3]], path: &Path) -> io::Result<()> {
+pub(crate) fn write_index_from_sorted(triples: &[[u64; 3]], path: &Path) -> io::Result<()> {
     let file = File::create(path)?;
     let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
     w.write_all(INDEX_MAGIC)?;
@@ -272,7 +274,7 @@ fn merge_triple_chunks_direct(chunks: &[PathBuf], path: &Path) -> io::Result<()>
     w.write_all(&0u64.to_le_bytes())?; // placeholder
 
     // ── Seed heap ─────────────────────────────────────────────────────────────
-    let mut heap: BinaryHeap<Reverse<([u32; 3], usize)>> = BinaryHeap::new();
+    let mut heap: BinaryHeap<Reverse<([u64; 3], usize)>> = BinaryHeap::new();
     for (i, reader) in readers.iter_mut().enumerate() {
         if let Some(t) = reader.next()? {
             heap.push(Reverse((t, i)));
@@ -281,7 +283,7 @@ fn merge_triple_chunks_direct(chunks: &[PathBuf], path: &Path) -> io::Result<()>
 
     // ── Merge with deduplication ──────────────────────────────────────────────
     let mut count = 0u64;
-    let mut prev: Option<[u32; 3]> = None;
+    let mut prev: Option<[u64; 3]> = None;
     while let Some(Reverse((t, i))) = heap.pop() {
         if Some(t) != prev {
             w.write_all(&t[0].to_le_bytes())?;
@@ -319,7 +321,7 @@ fn merge_triple_chunks_to_chunk(chunks: &[PathBuf], path: &Path) -> io::Result<(
     let mut w = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
     w.write_all(&0u64.to_le_bytes())?; // count placeholder
 
-    let mut heap: BinaryHeap<Reverse<([u32; 3], usize)>> = BinaryHeap::new();
+    let mut heap: BinaryHeap<Reverse<([u64; 3], usize)>> = BinaryHeap::new();
     for (i, reader) in readers.iter_mut().enumerate() {
         if let Some(t) = reader.next()? {
             heap.push(Reverse((t, i)));
@@ -327,7 +329,7 @@ fn merge_triple_chunks_to_chunk(chunks: &[PathBuf], path: &Path) -> io::Result<(
     }
 
     let mut count = 0u64;
-    let mut prev: Option<[u32; 3]> = None;
+    let mut prev: Option<[u64; 3]> = None;
     while let Some(Reverse((t, i))) = heap.pop() {
         if Some(t) != prev {
             w.write_all(&t[0].to_le_bytes())?;
@@ -374,17 +376,17 @@ impl TripleChunkReader {
         Ok(Self { reader, remaining })
     }
 
-    fn next(&mut self) -> io::Result<Option<[u32; 3]>> {
+    fn next(&mut self) -> io::Result<Option<[u64; 3]>> {
         if self.remaining == 0 {
             return Ok(None);
         }
-        let mut buf = [0u8; 12];
+        let mut buf = [0u8; 24];
         self.reader.read_exact(&mut buf)?;
         self.remaining -= 1;
         Ok(Some([
-            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
-            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            u64::from_le_bytes(buf[16..24].try_into().unwrap()),
         ]))
     }
 }
@@ -445,25 +447,25 @@ impl IndexFile {
 
     /// Read a triple by index position (in the index's sort order, not SPO).
     #[inline]
-    fn get_raw(&self, pos: usize) -> [u32; 3] {
+    fn get_raw(&self, pos: usize) -> [u64; 3] {
         debug_assert!(pos < self.count);
         let off = HEADER_SIZE + pos * TRIPLE_BYTES;
-        let s = u32::from_le_bytes(self.mmap[off..off + 4].try_into().unwrap());
-        let p = u32::from_le_bytes(self.mmap[off + 4..off + 8].try_into().unwrap());
-        let o = u32::from_le_bytes(self.mmap[off + 8..off + 12].try_into().unwrap());
+        let s = u64::from_le_bytes(self.mmap[off..off + 8].try_into().unwrap());
+        let p = u64::from_le_bytes(self.mmap[off + 8..off + 16].try_into().unwrap());
+        let o = u64::from_le_bytes(self.mmap[off + 16..off + 24].try_into().unwrap());
         [s, p, o]
     }
 
     /// Convert a raw (reordered) triple back to SPO order.
     #[inline]
-    fn to_triple(&self, raw: [u32; 3]) -> Triple {
+    fn to_triple(&self, raw: [u64; 3]) -> Triple {
         reorder_back(raw, self.kind)
     }
 
     // ── Scan API ──────────────────────────────────────────────────────────────
 
     /// Binary search: find the first position where raw[0] >= key.
-    fn lower_bound_0(&self, key: u32) -> usize {
+    fn lower_bound_0(&self, key: u64) -> usize {
         let (mut lo, mut hi) = (0, self.count);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
@@ -477,7 +479,7 @@ impl IndexFile {
     }
 
     /// Binary search: find first pos where (raw[0], raw[1]) >= (k0, k1).
-    fn lower_bound_01(&self, k0: u32, k1: u32) -> usize {
+    fn lower_bound_01(&self, k0: u64, k1: u64) -> usize {
         let (mut lo, mut hi) = (0, self.count);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
@@ -504,7 +506,7 @@ impl IndexFile {
         }
     }
 
-    fn range_for_pattern(&self, raw: &[Option<u32>; 3]) -> (usize, usize) {
+    fn range_for_pattern(&self, raw: &[Option<u64>; 3]) -> (usize, usize) {
         match (raw[0], raw[1]) {
             (Some(k0), Some(k1)) => {
                 // Seek to exact (k0, k1) range
@@ -552,16 +554,16 @@ impl IndexFile {
     // ── Leapfrog Triejoin support ─────────────────────────────────────────────
 
     /// Seek to the first position where raw[0] >= target.
-    /// Returns the actual raw[0] at that position, or u32::MAX if exhausted.
+    /// Returns the actual raw[0] at that position, or `u64::MAX` if exhausted.
     ///
     /// Uses **galloping search** (exponential probe + binary search in the
     /// narrowed range): O(log k) where k = distance from `from` to the result.
     /// This is significantly faster than O(log n) binary search over the entire
     /// index when the target is close — the common case in Leapfrog Triejoin
     /// because successive `seek` calls advance by small amounts.
-    pub fn seek_0(&self, from: usize, target: u32) -> (usize, u32) {
+    pub fn seek_0(&self, from: usize, target: u64) -> (usize, u64) {
         if from >= self.count {
-            return (self.count, u32::MAX);
+            return (self.count, u64::MAX);
         }
         // If already at or past target, return immediately.
         let cur = self.get_raw(from)[0];
@@ -592,7 +594,7 @@ impl IndexFile {
                 return if a < self.count {
                     (a, self.get_raw(a)[0])
                 } else {
-                    (self.count, u32::MAX)
+                    (self.count, u64::MAX)
                 };
             }
             lo = probe;
@@ -605,7 +607,7 @@ impl IndexFile {
 
 pub struct TripleScan<'a> {
     index: &'a IndexFile,
-    raw_pat: [Option<u32>; 3],
+    raw_pat: [Option<u64>; 3],
     pos: usize,
     end: usize,
 }
@@ -633,7 +635,7 @@ impl<'a> Iterator for TripleScan<'a> {
 
 /// Reorder SPO triple into the index's natural sort key.
 #[inline]
-fn reorder(t: Triple, kind: IndexKind) -> [u32; 3] {
+fn reorder(t: Triple, kind: IndexKind) -> [u64; 3] {
     match kind {
         IndexKind::Spo => [t.s, t.p, t.o],
         IndexKind::Pos => [t.p, t.o, t.s],
@@ -643,7 +645,7 @@ fn reorder(t: Triple, kind: IndexKind) -> [u32; 3] {
 
 /// Convert index-ordered raw triple back to SPO.
 #[inline]
-fn reorder_back(raw: [u32; 3], kind: IndexKind) -> Triple {
+fn reorder_back(raw: [u64; 3], kind: IndexKind) -> Triple {
     match kind {
         IndexKind::Spo => Triple::new(raw[0], raw[1], raw[2]),
         IndexKind::Pos => Triple::new(raw[2], raw[0], raw[1]),
@@ -677,7 +679,7 @@ fn pattern_to_raw(pat: TriplePattern, kind: IndexKind) -> [Option<TermId>; 3] {
 /// `chunk_size > 0` quads are flushed to sorted temp files and k-way
 /// merged on `build()`.
 pub struct GspoBuilder {
-    quads: Vec<[u32; 4]>, // (g, s, p, o)
+    quads: Vec<[u64; 4]>, // (g, s, p, o)
     chunk_size: usize,
     chunk_dir: Option<PathBuf>,
     chunks: Vec<PathBuf>,
@@ -750,7 +752,7 @@ impl Default for GspoBuilder {
 
 // ── Quad chunk helpers ────────────────────────────────────────────────────────
 
-fn write_quad_chunk(quads: &[[u32; 4]], path: &Path) -> io::Result<()> {
+fn write_quad_chunk(quads: &[[u64; 4]], path: &Path) -> io::Result<()> {
     let file = File::create(path)?;
     let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
     w.write_all(&(quads.len() as u64).to_le_bytes())?;
@@ -760,7 +762,7 @@ fn write_quad_chunk(quads: &[[u32; 4]], path: &Path) -> io::Result<()> {
     w.flush()
 }
 
-fn write_gspo_index_from_sorted(quads: &[[u32; 4]], path: &Path) -> io::Result<()> {
+fn write_gspo_index_from_sorted(quads: &[[u64; 4]], path: &Path) -> io::Result<()> {
     let file = File::create(path)?;
     let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
     w.write_all(GSPO_MAGIC)?;
@@ -809,7 +811,7 @@ fn merge_quad_chunks_direct(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
     w.write_all(GSPO_MAGIC)?;
     w.write_all(&0u64.to_le_bytes())?; // placeholder
 
-    let mut heap: BinaryHeap<Reverse<([u32; 4], usize)>> = BinaryHeap::new();
+    let mut heap: BinaryHeap<Reverse<([u64; 4], usize)>> = BinaryHeap::new();
     for (i, reader) in readers.iter_mut().enumerate() {
         if let Some(q) = reader.next()? {
             heap.push(Reverse((q, i)));
@@ -817,7 +819,7 @@ fn merge_quad_chunks_direct(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
     }
 
     let mut count = 0u64;
-    let mut prev: Option<[u32; 4]> = None;
+    let mut prev: Option<[u64; 4]> = None;
     while let Some(Reverse((q, i))) = heap.pop() {
         if Some(q) != prev {
             for v in &q { w.write_all(&v.to_le_bytes())?; }
@@ -850,7 +852,7 @@ fn merge_quad_chunks_to_chunk(chunks: &[PathBuf], path: &Path) -> io::Result<()>
     let mut w = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
     w.write_all(&0u64.to_le_bytes())?; // count placeholder
 
-    let mut heap: BinaryHeap<Reverse<([u32; 4], usize)>> = BinaryHeap::new();
+    let mut heap: BinaryHeap<Reverse<([u64; 4], usize)>> = BinaryHeap::new();
     for (i, reader) in readers.iter_mut().enumerate() {
         if let Some(q) = reader.next()? {
             heap.push(Reverse((q, i)));
@@ -858,7 +860,7 @@ fn merge_quad_chunks_to_chunk(chunks: &[PathBuf], path: &Path) -> io::Result<()>
     }
 
     let mut count = 0u64;
-    let mut prev: Option<[u32; 4]> = None;
+    let mut prev: Option<[u64; 4]> = None;
     while let Some(Reverse((q, i))) = heap.pop() {
         if Some(q) != prev {
             for v in &q { w.write_all(&v.to_le_bytes())?; }
@@ -893,16 +895,16 @@ impl QuadChunkReader {
         Ok(Self { reader, remaining: u64::from_le_bytes(count_buf) })
     }
 
-    fn next(&mut self) -> io::Result<Option<[u32; 4]>> {
+    fn next(&mut self) -> io::Result<Option<[u64; 4]>> {
         if self.remaining == 0 { return Ok(None); }
-        let mut buf = [0u8; 16];
+        let mut buf = [0u8; 32];
         self.reader.read_exact(&mut buf)?;
         self.remaining -= 1;
         Ok(Some([
-            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
-            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+            u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+            u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            u64::from_le_bytes(buf[24..32].try_into().unwrap()),
         ]))
     }
 }
@@ -937,19 +939,19 @@ impl GspoIndexFile {
     pub fn quad_count(&self) -> usize { self.count }
 
     #[inline]
-    fn get_raw(&self, pos: usize) -> [u32; 4] {
+    fn get_raw(&self, pos: usize) -> [u64; 4] {
         debug_assert!(pos < self.count);
         let off = HEADER_SIZE + pos * QUAD_BYTES;
         [
-            u32::from_le_bytes(self.mmap[off..off+4].try_into().unwrap()),
-            u32::from_le_bytes(self.mmap[off+4..off+8].try_into().unwrap()),
-            u32::from_le_bytes(self.mmap[off+8..off+12].try_into().unwrap()),
-            u32::from_le_bytes(self.mmap[off+12..off+16].try_into().unwrap()),
+            u64::from_le_bytes(self.mmap[off..off+8].try_into().unwrap()),
+            u64::from_le_bytes(self.mmap[off+8..off+16].try_into().unwrap()),
+            u64::from_le_bytes(self.mmap[off+16..off+24].try_into().unwrap()),
+            u64::from_le_bytes(self.mmap[off+24..off+32].try_into().unwrap()),
         ]
     }
 
     /// Binary search: first position where raw[0] >= key.
-    fn lower_bound_g(&self, g: u32) -> usize {
+    fn lower_bound_g(&self, g: u64) -> usize {
         let (mut lo, mut hi) = (0, self.count);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
@@ -959,7 +961,7 @@ impl GspoIndexFile {
     }
 
     /// Binary search: first position after all entries with raw[0] == g.
-    fn upper_bound_g(&self, g: u32) -> usize {
+    fn upper_bound_g(&self, g: u64) -> usize {
         let (mut lo, mut hi) = (0, self.count);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;

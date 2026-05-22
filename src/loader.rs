@@ -549,7 +549,7 @@ pub fn load_triples_parallel(
 }
 
 #[inline]
-fn lookup(dict: &crate::dict_builder::ReadonlyDict, s: &str) -> io::Result<u32> {
+fn lookup(dict: &crate::dict_builder::ReadonlyDict, s: &str) -> io::Result<u64> {
     dict.get_id(s).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,

@@ -62,7 +62,7 @@ pub const KNOWN_PREFIXES: &[&str] = &[
 const MAGIC: &[u8; 8] = b"ECOD0001";
 const NO_PREFIX: u16 = 0xFFFF;
 
-/// String ↔ u32 ID dictionary with interior mutability.
+/// String ↔ u64 ID dictionary with interior mutability.
 ///
 /// `RwLock` lets `encode` be called via `&self` from multiple threads, which
 /// is required at query time: the executor only holds an immutable reference
@@ -71,11 +71,12 @@ const NO_PREFIX: u16 = 0xFFFF;
 ///
 /// The dictionary is never persisted after the load phase, so query-time
 /// additions are ephemeral (they disappear when the store is closed).
+/// Term IDs are u64 to support datasets with more than ~4.3 billion unique terms.
 pub struct Dictionary {
     // Forward: ID → string
     id_to_str: RwLock<Vec<Box<str>>>,
-    // Reverse: string → ID
-    str_to_id: RwLock<FxHashMap<String, u32>>,
+    // Reverse: string → ID (u64 to match TermId)
+    str_to_id: RwLock<FxHashMap<String, u64>>,
     // Prefix table for namespace compression
     prefixes: Vec<String>,
 }
@@ -93,7 +94,7 @@ impl Dictionary {
     ///
     /// Uses a write lock, so concurrent calls serialise correctly.
     /// Fast path: read lock only when entry already exists.
-    pub fn encode(&self, s: &str) -> u32 {
+    pub fn encode(&self, s: &str) -> u64 {
         // Fast path: read lock (no contention with other readers)
         if let Some(&id) = self.str_to_id.read().unwrap().get(s) {
             return id;
@@ -105,7 +106,7 @@ impl Dictionary {
         if let Some(&id) = str_to_id.get(s) {
             return id;
         }
-        let id = id_to_str.len() as u32;
+        let id = id_to_str.len() as u64;
         id_to_str.push(s.into());
         str_to_id.insert(s.to_string(), id);
         id
@@ -113,13 +114,13 @@ impl Dictionary {
 
     /// Decode an integer ID to its string. Panics on out-of-range (bug, not user error).
     #[inline]
-    pub fn decode(&self, id: u32) -> String {
+    pub fn decode(&self, id: u64) -> String {
         self.id_to_str.read().unwrap()[id as usize].to_string()
     }
 
     /// Lookup an ID without inserting. Returns None if not found.
     #[inline]
-    pub fn lookup(&self, s: &str) -> Option<u32> {
+    pub fn lookup(&self, s: &str) -> Option<u64> {
         self.str_to_id.read().unwrap().get(s).copied()
     }
 
@@ -205,7 +206,7 @@ impl Dictionary {
         let tc = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
         let mut id_to_str: Vec<Box<str>> = Vec::with_capacity(tc);
-        let mut str_to_id: FxHashMap<String, u32> = FxHashMap::default();
+        let mut str_to_id: FxHashMap<String, u64> = FxHashMap::default();
         str_to_id.reserve(tc);
 
         for id in 0..tc {
@@ -223,7 +224,7 @@ impl Dictionary {
                 format!("{}{}", prefixes[pid as usize], local)
             };
 
-            str_to_id.insert(full.clone(), id as u32);
+            str_to_id.insert(full.clone(), id as u64);
             id_to_str.push(full.into_boxed_str());
         }
 
@@ -238,7 +239,7 @@ impl Dictionary {
     ///
     /// Used to convert an in-memory dictionary built during a one-pass load
     /// into a [`QueryDict::Legacy`] without copying all strings.
-    pub fn into_parts(self) -> (Vec<Box<str>>, FxHashMap<String, u32>) {
+    pub fn into_parts(self) -> (Vec<Box<str>>, FxHashMap<String, u64>) {
         (
             self.id_to_str.into_inner().unwrap(),
             self.str_to_id.into_inner().unwrap(),
@@ -257,7 +258,7 @@ impl Dictionary {
     }
 
     /// Pretty-print a term for human display.
-    pub fn display(&self, id: u32) -> String {
+    pub fn display(&self, id: u64) -> String {
         let s = self.decode(id);
         // If it looks like a URI, wrap in angle brackets
         if s.starts_with("http://") || s.starts_with("https://") {

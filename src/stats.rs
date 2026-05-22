@@ -36,8 +36,9 @@ use std::path::Path;
 use crate::index::TripleIndex;
 use crate::triple::{TermId, UNBOUND};
 
-const STATS_MAGIC: &[u8; 8] = b"ECOSTAT1";
-const RECORD_BYTES: usize = 4 + 8 + 8 + 8; // pred_id + triple + subject + object
+/// Format version 2: pred_id is u64 (was u32 in v1) to match TermId = u64.
+const STATS_MAGIC: &[u8; 8] = b"ECOSTAT2";
+const RECORD_BYTES: usize = 8 + 8 + 8 + 8; // pred_id(u64) + triple + subject + object
 
 // ── Per-predicate statistics ──────────────────────────────────────────────────
 
@@ -203,10 +204,10 @@ impl StoreStatistics {
         let mut predicate_stats = HashMap::with_capacity(n);
         let mut off = 24usize;
         for _ in 0..n {
-            let pred_id  = u32::from_le_bytes(data[off..off+ 4].try_into().unwrap());
-            let tc       = u64::from_le_bytes(data[off+ 4..off+12].try_into().unwrap());
-            let sc       = u64::from_le_bytes(data[off+12..off+20].try_into().unwrap());
-            let oc       = u64::from_le_bytes(data[off+20..off+28].try_into().unwrap());
+            let pred_id  = u64::from_le_bytes(data[off..off+ 8].try_into().unwrap());
+            let tc       = u64::from_le_bytes(data[off+ 8..off+16].try_into().unwrap());
+            let sc       = u64::from_le_bytes(data[off+16..off+24].try_into().unwrap());
+            let oc       = u64::from_le_bytes(data[off+24..off+32].try_into().unwrap());
             predicate_stats.insert(pred_id, PredicateStats {
                 triple_count:  tc,
                 subject_count: sc,
