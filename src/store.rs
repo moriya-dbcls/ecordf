@@ -164,6 +164,18 @@ impl Store {
                 // ── ケース B: dict_sorted.bin がない → 残存チャンクからマージ ──
                 // Phase 1 の文字列収集は終わっているが merge_string_chunks が
                 // EMFILE などで失敗した場合にここに来る。
+
+                // 前回の失敗したマージが残した .__merge_*.tmp 中間ファイルを削除する。
+                // これらは今回の新しいマージで別の名前（L0/L1… レベル付き）が使われるので
+                // 衝突しないが、念のため清掃しておく。
+                for entry in fs::read_dir(&tmp_dir).into_iter().flatten().flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.contains(".__merge_") && name_str.ends_with(".tmp") {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+
                 let existing_chunks = collect_p1_chunks(&tmp_dir)?;
                 if existing_chunks.is_empty() {
                     return Err(io::Error::new(

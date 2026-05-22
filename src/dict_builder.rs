@@ -183,7 +183,18 @@ impl StringChunkReader {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
         let mut buf = [0u8; 8];
-        reader.read_exact(&mut buf)?;
+        // A chunk file that was being written when a previous run was interrupted
+        // may be truncated.  Treat it as an empty chunk rather than propagating
+        // the error — the valid strings in its prefix have already been written,
+        // and the strings in the missing tail will be recovered from sibling
+        // chunk files produced by other threads / prior runs.
+        match reader.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Ok(Self { reader, remaining: 0 });
+            }
+            Err(e) => return Err(e),
+        }
         let remaining = u64::from_le_bytes(buf);
         Ok(Self { reader, remaining })
     }
@@ -193,10 +204,25 @@ impl StringChunkReader {
             return Ok(None);
         }
         let mut len_buf = [0u8; 4];
-        self.reader.read_exact(&mut len_buf)?;
+        // Truncated write: stop reading this chunk gracefully.
+        match self.reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                self.remaining = 0;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut bytes = vec![0u8; len];
-        self.reader.read_exact(&mut bytes)?;
+        match self.reader.read_exact(&mut bytes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                self.remaining = 0;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
         self.remaining -= 1;
         String::from_utf8(bytes)
             .map(Some)
@@ -217,24 +243,37 @@ impl StringChunkReader {
 /// Called by [`DictBuilder::finish`] for single-threaded loads, and directly
 /// from the parallel loader after collecting chunks from all per-file threads.
 pub(crate) fn merge_string_chunks(chunks: &[PathBuf], out_path: &Path) -> io::Result<u32> {
+    merge_string_chunks_impl(chunks, out_path, 0)
+}
+
+fn merge_string_chunks_impl(
+    chunks: &[PathBuf],
+    out_path: &Path,
+    level: usize,
+) -> io::Result<u32> {
     if chunks.len() <= MAX_FAN_IN {
         return merge_string_chunks_direct(chunks, out_path);
     }
 
     // ── Hierarchical pass: merge groups of MAX_FAN_IN into intermediate chunks ──
+    //
+    // IMPORTANT: intermediate file names must include the `level` counter so
+    // that Level-0 files (`.__merge_L0_B…`) and Level-1 files (`.__merge_L1_B…`)
+    // do not share names.  Without this, Level-1 batch 0 would truncate the
+    // same `.__merge_0000.tmp` that Level-0 produced, corrupting a file that
+    // is still being read by Level-0's reader.
     let mut intermediates: Vec<PathBuf> = Vec::new();
     for (i, batch) in chunks.chunks(MAX_FAN_IN).enumerate() {
-        let tmp = append_suffix(out_path, &format!(".__merge_{:04}.tmp", i));
+        let tmp = append_suffix(out_path, &format!(".__merge_L{}_B{:06}.tmp", level, i));
         merge_string_chunks_to_chunk(batch, &tmp)?;
         intermediates.push(tmp);
     }
 
-    // ── Final pass: merge intermediate chunks → dict_sorted.bin ───────────────
+    // ── Next pass: merge intermediates (recurse if still too many) ────────────
     let result = if intermediates.len() <= MAX_FAN_IN {
         merge_string_chunks_direct(&intermediates, out_path)
     } else {
-        // More than MAX_FAN_IN² input chunks (rare); recurse.
-        merge_string_chunks(&intermediates, out_path)
+        merge_string_chunks_impl(&intermediates, out_path, level + 1)
     };
 
     for p in &intermediates {
