@@ -19,14 +19,27 @@
 # the chunk files are merged via a k-way merge (binary heap) into the final
 # index.  This bounds peak memory to roughly:
 #
-#   chunk_size × 12 bytes × 3 indexes  (SPO + POS + OSP buffers)
+#   chunk_size × 24 bytes × 3 indexes  (SPO + POS + OSP buffers, each term is u64)
 #
 # Approximate peak memory guide:
-#   chunk_size    peak index-buffer RAM
-#   ----------    ---------------------
-#    1_000_000    ≈  36 MB
-#    5_000_000    ≈ 180 MB  ← default
-#   20_000_000    ≈ 720 MB
+#   chunk_size       peak index-buffer RAM
+#   ----------       ---------------------
+#    1_000_000       ≈   72 MB
+#    5_000_000       ≈  360 MB  ← default (conservative)
+#   20_000_000       ≈ 1440 MB
+#   50_000_000       ≈ 3600 MB
+#  100_000_000       ≈ 7200 MB
+#
+# Larger values produce fewer chunk files and speed up the final index merge.
+# Phase 2 (triple loading) runs after Phase 1 is complete, so dict_chunk_mb
+# memory is already freed when chunk_size memory peaks.
+#
+# Hardware profiles:
+#   8 GB  RAM / any threads  →   5_000_000   (360 MB, very safe)
+#  16 GB  RAM / any threads  →  10_000_000   (720 MB)
+#  32 GB  RAM / any threads  →  20_000_000  (1440 MB)
+#  64 GB  RAM / 32 threads   →  50_000_000  (3600 MB)  ← recommended
+# 128 GB  RAM / any threads  → 100_000_000  (7200 MB)
 #
 # Set to 0 to disable external sort entirely and load all triples into RAM
 # before sorting — use this only on machines with tens of GB of free memory.
@@ -35,17 +48,30 @@ chunk_size = 5_000_000
 # RAM budget (in MiB) for the string-collection buffer used in Phase 1 of
 # the two-pass dictionary builder (active when chunk_size > 0).
 #
-# Strings are buffered in memory up to this size, then sorted, deduped, and
-# flushed to a temporary chunk file on disk.  All chunks are later k-way
-# merged without further heap allocation beyond I/O buffers.
+# Strings are buffered in memory up to this size per thread, then sorted,
+# deduped, and flushed to a temporary chunk file on disk.  All chunks are
+# later k-way merged (in parallel across levels) without further heap
+# allocation beyond I/O buffers.
 #
-#   dict_chunk_mb    peak string-buffer RAM
-#   -------------    ----------------------
-#    50              ≈  50 MB
-#   200              ≈ 200 MB  ← default
-#   500              ≈ 500 MB
+# Peak Phase 1 RAM = dict_chunk_mb × parallel_threads
 #
-# Larger values reduce the number of chunk files and speed up the merge.
+#   dict_chunk_mb    32 threads    16 threads    8 threads
+#   -------------    ----------    ----------    ---------
+#    50              ≈  1.6 GB     ≈  0.8 GB    ≈  0.4 GB
+#   200              ≈  6.4 GB     ≈  3.2 GB    ≈  1.6 GB  ← default
+#   500              ≈ 16.0 GB     ≈  8.0 GB    ≈  4.0 GB
+#  1200              ≈ 38.4 GB     ≈ 19.2 GB    ≈  9.6 GB
+#  1500              ≈ 48.0 GB     ≈ 24.0 GB    ≈ 12.0 GB
+#
+# Larger values reduce the number of chunk files (fewer merge batches) and
+# speed up the merge phase significantly for large datasets like UniProt.
+#
+# Hardware profiles (leave ~6 GB for OS, mmap, and misc):
+#   8 GB  RAM /  8 threads  →   200  (1.6 GB, safe)
+#  16 GB  RAM / 16 threads  →   500  (8.0 GB)
+#  32 GB  RAM / 32 threads  →   750  (24.0 GB)
+#  64 GB  RAM / 32 threads  →  1200  (38.4 GB)  ← recommended
+# 128 GB  RAM / 32 threads  →  1500  (48.0 GB, leaves 74 GB headroom)
 dict_chunk_mb = 200
 
 # Number of threads used during `ecordf build` for parallel file loading.
