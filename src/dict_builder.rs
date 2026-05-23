@@ -231,33 +231,72 @@ impl StringChunkReader {
     }
 }
 
+// ── fd limit helpers ──────────────────────────────────────────────────────────
+
+/// Read the process's soft limit on open file descriptors.
+///
+/// On Linux reads `/proc/self/limits` (no extra dependencies).
+/// Falls back to 1024 on other platforms or if parsing fails.
+fn fd_soft_limit() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(text) = std::fs::read_to_string("/proc/self/limits") {
+            // Line format: "Max open files          1024                 4096                 files"
+            for line in text.lines() {
+                if line.starts_with("Max open files") {
+                    if let Some(n) = line.split_whitespace().nth(3).and_then(|s| s.parse().ok()) {
+                        return n;
+                    }
+                }
+            }
+        }
+    }
+    1024 // conservative fallback for macOS and other platforms
+}
+
+/// Maximum number of merge batches to run concurrently, derived from the
+/// process fd soft limit.
+///
+/// Each batch opens `MAX_FAN_IN` chunk readers plus a few output files.
+/// We reserve 128 fds for mmap handles, logger, stdin/stdout/stderr, and
+/// other internal use, then divide the remainder by the per-batch cost.
+fn max_merge_concurrency() -> usize {
+    const FDS_RESERVED: usize = 128;
+    const FDS_PER_BATCH: usize = MAX_FAN_IN + 8; // readers + writer + BufWriter overhead
+    let available = fd_soft_limit().saturating_sub(FDS_RESERVED);
+    (available / FDS_PER_BATCH).max(1)
+}
+
 // ── k-way merge ───────────────────────────────────────────────────────────────
 
 /// K-way merge of sorted string chunks → write `dict_sorted.bin`.
 ///
 /// When `chunks.len() > MAX_FAN_IN` a **hierarchical merge** is performed
 /// automatically: chunks are merged in batches into intermediate chunk files,
-/// which are then merged in a final pass.  This bounds the number of
-/// simultaneously open file descriptors to `MAX_FAN_IN + a few`, preventing
-/// EMFILE (`Too many open files`) on large datasets such as UniProt.
+/// which are then merged in a final pass.
 ///
-/// Each level's batches are processed **in parallel** using Rayon, so on a
-/// 32-core machine the Level-0 pass over ~15,000 batches runs ~32× faster
-/// than the previous single-threaded version.  The final merge (which sees
-/// only a handful of intermediate files) is still handled by
-/// `merge_string_chunks_direct`.
+/// Each level's batches are processed **in parallel** using a dedicated Rayon
+/// thread pool whose size is derived from the process fd soft limit, so the
+/// total number of simultaneously open file descriptors stays within the OS
+/// limit (EMFILE / `Too many open files` is avoided automatically).
 ///
 /// Called by [`DictBuilder::finish`] for single-threaded loads, and directly
 /// from the parallel loader after collecting chunks from all per-file threads.
 /// Returns the number of unique terms written (u64; no upper-bound check).
 pub(crate) fn merge_string_chunks(chunks: &[PathBuf], out_path: &Path) -> io::Result<u64> {
-    merge_string_chunks_impl(chunks, out_path, 0)
+    let concurrency = max_merge_concurrency();
+    eprintln!(
+        "Merge: fd limit={}, batch concurrency={} (each batch opens {} files)",
+        fd_soft_limit(), concurrency, MAX_FAN_IN,
+    );
+    merge_string_chunks_impl(chunks, out_path, 0, concurrency)
 }
 
 fn merge_string_chunks_impl(
     chunks: &[PathBuf],
     out_path: &Path,
     level: usize,
+    concurrency: usize,
 ) -> io::Result<u64> {
     if chunks.len() <= MAX_FAN_IN {
         return merge_string_chunks_direct(chunks, out_path);
@@ -266,7 +305,7 @@ fn merge_string_chunks_impl(
     // ── Hierarchical pass: merge groups of MAX_FAN_IN into intermediate chunks ──
     //
     // Batches within a single level are independent (each writes to its own
-    // unique temp file), so we process them in parallel with Rayon.
+    // unique temp file), so we process them in parallel.
     //
     // IMPORTANT: intermediate file names include the `level` counter so that
     // Level-0 files (`.__merge_L0_B…`) and Level-1 files (`.__merge_L1_B…`)
@@ -280,14 +319,22 @@ fn merge_string_chunks_impl(
         .map(|i| append_suffix(out_path, &format!(".__merge_L{}_B{:06}.tmp", level, i)))
         .collect();
 
-    // Run all batches in parallel; collect the first error if any.
-    let errors: Vec<io::Error> = batches
-        .into_par_iter()
-        .zip(intermediates.par_iter())
-        .filter_map(|((_, batch), tmp)| {
-            merge_string_chunks_to_chunk(batch, tmp).err()
-        })
-        .collect();
+    // Build a dedicated pool limited to `concurrency` threads so we never
+    // open more than concurrency × MAX_FAN_IN file descriptors at once.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(concurrency)
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    let errors: Vec<io::Error> = pool.install(|| {
+        batches
+            .into_par_iter()
+            .zip(intermediates.par_iter())
+            .filter_map(|((_, batch), tmp)| {
+                merge_string_chunks_to_chunk(batch, tmp).err()
+            })
+            .collect()
+    });
 
     if let Some(e) = errors.into_iter().next() {
         // Clean up whatever was written before propagating.
@@ -301,7 +348,7 @@ fn merge_string_chunks_impl(
     let result: io::Result<u64> = if intermediates.len() <= MAX_FAN_IN {
         merge_string_chunks_direct(&intermediates, out_path)
     } else {
-        merge_string_chunks_impl(&intermediates, out_path, level + 1)
+        merge_string_chunks_impl(&intermediates, out_path, level + 1, concurrency)
     };
 
     for p in &intermediates {
