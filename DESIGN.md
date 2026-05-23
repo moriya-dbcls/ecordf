@@ -5,7 +5,7 @@
 EcoRDF が重視した3点：
 
 - **複雑な JOIN の性能**: Virtuoso のようなハッシュ結合の逐次処理に対して、Leapfrog Triejoin（最悪ケース最適）を採用。
-- **ビルド時のメモリ効率**: 辞書・インデックスを2パス外部ソートで構築し、ピーク RAM をデータセットサイズに依存しない定数に抑える。UniProt 規模（100M+ 固有 IRI/リテラル）でも RAM 上限を超えない。
+- **ビルド時のメモリ効率**: 辞書・インデックスを2パス外部ソートで構築し、ピーク RAM をデータセットサイズに依存しない定数に抑える。UniProt 全体（~13.4B 固有 IRI/リテラル）のように u32 上限（4.3B）を超えるデータセットにも対応するため、`TermId` は u64 を採用。
 - **並列ロード**: rayon によるファイル並列処理で、複数ファイルの Phase 1/2 を CPU コア数に応じてスケールアップ。
 
 ---
@@ -42,8 +42,16 @@ let mmap = unsafe { Mmap::map(&file)? };
 ピーク RAM = チャンクバッファ 1 つ分（≤ dict_chunk_mb MB）
 ```
 
-**EMFILE 対策 — 階層マージ (`MAX_FAN_IN = 64`):**  
-チャンク数が 64 を超える場合は、64 個ずつバッチマージして中間チャンクを作り、最終マージを行う。macOS のデフォルト fd 上限 (256) でも安全。
+**EMFILE 対策 + 並列化 — 階層マージ (`MAX_FAN_IN = 64`):**  
+チャンク数が 64 を超える場合は、64 個ずつバッチに分けて中間チャンクを生成し、最終マージを行う。macOS のデフォルト fd 上限 (256) でも安全。
+
+同一レベル内のバッチは互いに独立しているため、**Rayon で並列処理**する（`into_par_iter().zip()`）。32 コア環境では Level 0 の数千バッチが ~32× 速くなる。最終マージ（中間ファイル数十本）は逐次で行う。
+
+```
+Level 0 batches:  [B0] [B1] [B2] … [B4700]   ← 32スレッドで並列
+Level 1 batches:  [B0] [B1] … [B73]           ← 並列
+Level 2 final:    直接 dict_sorted.bin へ      ← 逐次
+```
 
 ### Phase 2 — ReadonlyDict（mmap バイナリサーチ）
 
@@ -88,9 +96,20 @@ ecordf build --dir ./store --resume-phase2 --from-file inputs.txt
 
 | フェーズ | ピーク RAM |
 |---------|-----------|
-| Phase 1（文字列収集）| ≤ `dict_chunk_mb` MB（デフォルト 200 MB）|
-| Phase 2（トリプルインデックス構築）| ≤ `dict_chunk_mb` + `chunk_size × 40B × スレッド数` |
+| Phase 1（文字列収集）| `dict_chunk_mb × parallel_threads`（デフォルト 200 MB × スレッド数）|
+| マージ | I/O バッファのみ（数十 MB 以下）|
+| Phase 2（トリプルインデックス構築）| `chunk_size × 24B × 3`（SPO+POS+OSP バッファ; Phase 1 解放後）|
 | クエリ実行時の辞書（ReadonlyDict）| ホットキャッシュ ≤ ~400 MB + mmap |
+
+**ハードウェアプロファイル（推奨値）:**
+
+|  RAM  | スレッド数 | `dict_chunk_mb` | `chunk_size`    |
+|-------|-----------|-----------------|-----------------|
+|  8 GB | 任意       | 200             | 5_000_000       |
+| 16 GB | 任意       | 500             | 10_000_000      |
+| 32 GB | 32         | 750             | 20_000_000      |
+| 64 GB | 32         | **1200**        | **50_000_000**  |
+|128 GB | 32         | 1500            | 100_000_000     |
 
 ---
 
@@ -134,42 +153,47 @@ OSP索引 (osp.bin):  目的語でソート → 値や概念からの逆引き
 GSPO索引 (gspo.bin): グラフ+SPO → Named Graphs / N-Quads 対応（存在する場合のみ）
 ```
 
-各エントリは `[s: u32, p: u32, o: u32]` の 12 バイト（GSPO は先頭に `g: u32` を加えた 16 バイト）。  
+各エントリは `[s: u64, p: u64, o: u64]` の 24 バイト（GSPO は先頭に `g: u64` を加えた 32 バイト）。  
 全インデックスは `TripleIndex::open` がメモリマップで開き、クエリ時は `scan()` / `scan_graph()` で範囲走査します。
+
+インデックスファイルのマジックバイト: `ECOI0002`（SPO/POS/OSP）、`ECOG0002`（GSPO）。  
+旧フォーマット（`ECOI0001`、u32 × 3 = 12 バイト）は非互換 — 再ビルドが必要です。
 
 **ディスク使用量の概算:**
 
 | トリプル数 | SPO+POS+OSP | GSPO付き | 辞書込み目安 |
 |-----------|-------------|---------|------------|
-| 1,000万   | 360 MB      | 520 MB  | ～450 MB   |
-| 1億       | 3.6 GB      | 5.2 GB  | ～4.5 GB   |
-| 10億      | 36 GB       | 52 GB   | ～45 GB    |
+| 1,000万   | 720 MB      | 1.0 GB  | ～800 MB   |
+| 1億       | 7.2 GB      | 10.4 GB | ～9 GB     |
+| 10億      | 72 GB       | 104 GB  | ～90 GB    |
 
 ---
 
 ## 辞書 (Dictionary)
 
-全URI・リテラルを `u32` IDに変換。  
+全URI・リテラルを `u64` IDに変換。u64 採用により UniProt 全体（~13.4B 固有タームで u32 上限 4.3B を超過）にも対応。  
 生命科学の主要名前空間（UniProt, PDB, OBO, XSD, RDF/S, OWL … 19プレフィックス）をプレフィックステーブルで圧縮し、辞書サイズを約40%削減します。
 
 ```
-dict.bin フォーマット:
+dict.bin フォーマット（レガシー互換、u32 上限あり）:
   [magic: "ECOD0001"][prefix_count: u32]
   (各プレフィックス: [len: u16][bytes])
-  [term_count: u32]
+  [term_count: u32]                    ← u32::MAX を超える辞書では書き出しをスキップ
   (各タームID: [prefix_id: u16][local_len: u32][local_bytes])
 ```
 
+タームが 4.3B を超える場合、`dict.bin` の書き出しは非致命的スキップ（`Note: skipping legacy dict.bin` を出力）。クエリ時は `dict_sorted.bin` を使用するため動作に影響しません。
+
 **スレッド安全な interior mutability:**  
-クエリ実行時に `STR(IRI)`・`CONCAT`・`UCASE` などで生成されるリテラルを辞書に追加できるよう、`encode` は `&self` で呼び出せます。内部は `RwLock<Vec<Box<str>>>` と `RwLock<FxHashMap<String, u32>>` で実装し、`axum` のマルチスレッド環境でも安全に動作します。
+クエリ実行時に `STR(IRI)`・`CONCAT`・`UCASE` などで生成されるリテラルを辞書に追加できるよう、`encode` は `&self` で呼び出せます。内部は `RwLock<Vec<Box<str>>>` と `RwLock<FxHashMap<String, u64>>` で実装し、`axum` のマルチスレッド環境でも安全に動作します。
 
 ```rust
 // 読み取り: read lock のみ（複数スレッドが並行して実行可）
-pub fn decode(&self, id: u32) -> String { ... }
-pub fn lookup(&self, s: &str) -> Option<u32> { ... }
+pub fn decode(&self, id: u64) -> String { ... }
+pub fn lookup(&self, s: &str) -> Option<u64> { ... }
 
 // 挿入: write lock（既存IDなら read lock だけで返す）
-pub fn encode(&self, s: &str) -> u32 { ... }
+pub fn encode(&self, s: &str) -> u64 { ... }
 ```
 
 クエリ時の追加エントリはメモリ上にのみ存在し、`dict.bin` には保存されません。
@@ -285,20 +309,22 @@ Pass 2 — SPO索引を順走査 (S, P, O 順):
   (S, P) のペアが変わったとき → subject_count++ (述語Pの)。
 ```
 
-両パスとも追加メモリは `HashMap<TermId, PredicateStats>`（述語数 × 28 バイト）のみ。
+両パスとも追加メモリは `HashMap<TermId, PredicateStats>`（述語数 × 32 バイト）のみ。
 
 **ファイルフォーマット (`stats.bin`):**
 
 ```
-offset  0: magic          [u8; 8]  = "ECOSTAT1"
+offset  0: magic          [u8; 8]  = "ECOSTAT2"
 offset  8: total_triples  u64
 offset 16: n_predicates   u64
-offset 24: (28バイト × n_predicates):
-             pred_id       u32
+offset 24: (32バイト × n_predicates):
+             pred_id       u64      ← v1 の u32 から変更
              triple_count  u64
              subject_count u64
              object_count  u64
 ```
+
+旧フォーマット（`ECOSTAT1`、`pred_id` が u32）は読み込み失敗時に自動再ビルドされます。
 
 ### 既バインド変数の割引（Tier 1 のみ）
 
@@ -343,7 +369,7 @@ ecordf/
 │   │                    ecordf.toml を serde+toml でデシリアライズ
 │   │                    ファイル探索順: --config > <store-dir>/ecordf.toml > デフォルト値
 │   │                    BuildConfig: chunk_size / dict_chunk_mb / parallel_threads
-│   ├── dict.rs        辞書 (レガシー・1パス用): 文字列 ↔ u32 ID
+│   ├── dict.rs        辞書 (レガシー・1パス用): 文字列 ↔ u64 ID
 │   │                    RwLock による interior mutability
 │   │                    19プレフィックスの名前空間圧縮
 │   │                    クエリ実行時の ephemeral エントリ追加 (STR, CONCAT 等)
@@ -352,8 +378,9 @@ ecordf/
 │   │                    ReadonlyDict   — Phase 2: mmap+バイナリサーチ+ホットキャッシュ
 │   │                    QueryDict      — 実行時 enum (ReadonlyDict | Dictionary)
 │   │                    merge_string_chunks — 階層マージ (MAX_FAN_IN=64, EMFILE対策)
+│   │                                         各レベルのバッチを Rayon で並列実行
 │   │                    dict_sorted.bin フォーマット: ESRT0001 magic
-│   ├── triple.rs      TripleId / Triple / Quad 型、UNBOUND定数
+│   ├── triple.rs      TermId = u64 / Triple (24B) / Quad (32B)、UNBOUND = u64::MAX
 │   ├── index.rs       memmap2ベースのソート済み整数配列
 │   │                    IndexBuilder / IndexFile (SPO・POS・OSP)
 │   │                    GspoBuilder / GspoIndexFile (Named Graphs)
@@ -575,7 +602,7 @@ POST http://localhost:7878/sparql
 |------|-------------|
 | 起動時間 | mmap のため即時（インデックスファイルを開くだけ） |
 | クエリ時 RAM | ワーキングセット依存（OS ページキャッシュで管理） |
-| ビルド時ピーク RAM | 2パス外部ソートにより定数（Phase 1: `dict_chunk_mb` MB、Phase 2: `dict_chunk_mb` + `chunk_size × 40B × スレッド数`）|
+| ビルド時ピーク RAM | 2パス外部ソートにより定数（Phase 1: `dict_chunk_mb × スレッド数` MB、Phase 2: `chunk_size × 72B`）|
 | 並列クエリ処理 | 対応（tokio blocking pool） |
 | Property Path (* 転移閉包) | BFS（対応済） |
 | Named Graphs (GRAPH句) | GSPO索引（対応済） |
