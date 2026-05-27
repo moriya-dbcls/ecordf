@@ -61,6 +61,7 @@ anyhow = "1"
 toml = "0.8"
 
 [features]
+default = ["gzip"]
 gzip = ["dep:flate2"]
 
 [dev-dependencies]

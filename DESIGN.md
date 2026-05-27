@@ -53,12 +53,49 @@ Level 1 batches:  [B0] [B1] … [B73]           ← 並列
 Level 2 final:    直接 dict_sorted.bin へ      ← 逐次
 ```
 
-### Phase 2 — ReadonlyDict（mmap バイナリサーチ）
+### Phase 2 — トリプルロード（2戦略）
+
+`term_count` によって自動的に戦略を切り替えます。
+
+#### 戦略 A: mmap バイナリサーチ（`term_count ≤ 1B`）
 
 `dict_sorted.bin` を `memmap2::Mmap` でマップし、オフセットテーブルを使った O(log N) バイナリサーチで ID を解決。頻出タームはホットキャッシュ (≤ 4M エントリ / 約 400 MB) に保持して再探索を回避。
 
 ```
 ピーク RAM = ホットキャッシュ（≤ ~400 MB）+ OS ページキャッシュ（mmap）
+```
+
+辞書が RAM に収まる小〜中規模データセットに適した高速なパス。
+
+#### 戦略 B: Streaming Phase 2（`term_count > 1B`、UniProt 規模）
+
+**問題**: UniProt では `dict_sorted.bin` が約 640 GB（13.4B 固有タームで RAM 64 GB を大幅超過）。バイナリサーチが毎回ランダムページフォルトを起こし、CPU 使用率 5% のまま3日以上稼働する。
+
+**解決策**: ランダム I/O をゼロにする3ステップのバッチ処理。ファイルを `batch_size` 本ずつまとめて処理する：
+
+```
+for each batch:
+  ┌─ Phase 2a (並列): ファイルごとに unique 文字列を収集・ソート
+  │   → per_file_sorted: Vec<Vec<String>>（各ファイルの辞書順文字列リスト）
+  │
+  ├─ Join   (逐次): dict_sorted.bin を1回 sequential スキャン
+  │   → k-way merge of per_file_sorted vs. dict stream
+  │   → LocalMap（string→u64）を各ファイル用に構築
+  │   複数ファイルへの同一文字列の割当ても1パスで完結
+  │
+  └─ Phase 2b (並列): LocalMap を使って O(1) ハッシュルックアップでトリプルロード
+```
+
+**メモリ**: `batch_size × strings_per_file × 80 bytes × 2 ≤ ram_budget`  
+`ram_budget = dict_chunk_mb × parallel_threads`（Phase 1 と同じ予算を流用）
+
+**I/O**: 1バッチあたり dict_sorted.bin を1回フルスキャン（sequential I/O）。  
+UniProt (1200 MB/thread × 32 threads = 40 GB budget, batch ≈ 132ファイル, スキャン回数 ≈ 54回):  
+`54 × 640 GB / 2 GB/s ≈ 5時間`（Join のみ）→ 合計 **12〜20時間**（現状3日以上から大幅改善）。
+
+```
+DictScanner: dict_sorted.bin の文字列セクションを先頭から順次読む
+ →「辞書は大きいが I/O は sequential」を活かして page fault ゼロ
 ```
 
 ### QueryDict — 実行時の辞書インターフェイス
@@ -98,7 +135,8 @@ ecordf build --dir ./store --resume-phase2 --from-file inputs.txt
 |---------|-----------|
 | Phase 1（文字列収集）| `dict_chunk_mb × parallel_threads`（デフォルト 200 MB × スレッド数）|
 | マージ | I/O バッファのみ（数十 MB 以下）|
-| Phase 2（トリプルインデックス構築）| `chunk_size × 24B × 3`（SPO+POS+OSP バッファ; Phase 1 解放後）|
+| Phase 2 — 戦略 A（mmap バイナリサーチ）| `chunk_size × 24B × 3`（SPO+POS+OSP バッファ; Phase 1 解放後）|
+| Phase 2 — 戦略 B（Streaming / term_count > 1B）| `batch_size × strings_per_file × 80B × 2` ≤ `dict_chunk_mb × threads`（Phase 1 と同予算）|
 | クエリ実行時の辞書（ReadonlyDict）| ホットキャッシュ ≤ ~400 MB + mmap |
 
 **ハードウェアプロファイル（推奨値）:**
@@ -242,8 +280,8 @@ pub fn encode(&self, s: &str) -> u64 { ... }
 |-------|------------|------|
 | `.nt` / `.ntriples` | N-Triples | SPO/POS/OSPインデックスに格納 |
 | `.nq` / `.nquads` | N-Quads | SPO/POS/OSP（ユニオングラフ）+ GSPO（名前付きグラフ） |
-| `.nt.gz` / `.ntriples.gz` | gzip済みN-Triples | `--features gzip` でビルド時のみ対応 |
-| `.nq.gz` / `.nquads.gz` | gzip済みN-Quads | `--features gzip` でビルド時のみ対応 |
+| `.nt.gz` / `.ntriples.gz` | gzip済みN-Triples | デフォルトで対応（`default = ["gzip"]`） |
+| `.nq.gz` / `.nquads.gz` | gzip済みN-Quads | デフォルトで対応（`default = ["gzip"]`） |
 | `.gz`（単体） | gzip済みN-Triples | 後方互換。ダブル拡張子推奨 |
 
 ---
@@ -375,7 +413,9 @@ ecordf/
 │   │                    クエリ実行時の ephemeral エントリ追加 (STR, CONCAT 等)
 │   ├── dict_builder.rs 辞書ビルダー (2パス外部ソート用)
 │   │                    DictBuilder    — Phase 1: チャンクバッファ→ディスク→k-wayマージ
-│   │                    ReadonlyDict   — Phase 2: mmap+バイナリサーチ+ホットキャッシュ
+│   │                    ReadonlyDict   — Phase 2A: mmap+バイナリサーチ+ホットキャッシュ
+│   │                    DictScanner    — Phase 2B Join: dict_sorted.bin を逐次スキャン
+│   │                                    8 MiB read buffer / sequential I/O / page fault ゼロ
 │   │                    QueryDict      — 実行時 enum (ReadonlyDict | Dictionary)
 │   │                    merge_string_chunks — 階層マージ (MAX_FAN_IN=64, EMFILE対策)
 │   │                                         各レベルのバッチを Rayon で並列実行
@@ -396,12 +436,16 @@ ecordf/
 │   │                    load_with_graphs_resume_phase2 — 中断再開
 │   │                    Config / StoreStatistics を保持
 │   │                    Executor に QueryConfig + StoreStatistics を渡す
-│   ├── loader.rs      N-Triples / N-Quads ストリーミングパーサー
+│   ├── loader.rs      N-Triples / N-Quads ストリーミングパーサー (.nt/.nq/.gz デフォルト対応)
 │   │                    InputSpec — ファイルパス + オプショナル Named Graph IRI
 │   │                    collect_strings_from_inputs — Phase 1 (シングルスレッド)
 │   │                    collect_strings_parallel     — Phase 1 (rayon 並列)
-│   │                    load_triples_with_readonly_dict — Phase 2 (シングル)
-│   │                    load_triples_parallel           — Phase 2 (rayon 並列)
+│   │                    load_triples_with_readonly_dict — Phase 2A (シングル)
+│   │                    load_triples_parallel           — Phase 2A (rayon 並列, mmap)
+│   │                    load_triples_streaming          — Phase 2B (Streaming, term_count>1B)
+│   │                      collect_strings_for_file_sorted — Phase 2a: ファイル別sorted文字列収集
+│   │                      join_batch_with_dict            — Join: dict逐次スキャン→LocalMap構築
+│   │                      load_triple_from_one_input_local — Phase 2b: LocalMap O(1)ルックアップ
 │   ├── sparql/
 │   │   ├── ast.rs     SPARQL 1.1 AST型定義
 │   │   │                PropertyPath / GraphPattern を含む完全定義
@@ -438,10 +482,10 @@ ecordf/
 
 ```bash
 cd ecordf
-cargo build --release
+cargo build --release          # gzip対応込み（デフォルト）
 
-# gzip対応を含める場合
-cargo build --release --features gzip
+# gzip対応を除外する場合
+cargo build --release --no-default-features
 ```
 
 ### データ読み込み
@@ -602,7 +646,7 @@ POST http://localhost:7878/sparql
 |------|-------------|
 | 起動時間 | mmap のため即時（インデックスファイルを開くだけ） |
 | クエリ時 RAM | ワーキングセット依存（OS ページキャッシュで管理） |
-| ビルド時ピーク RAM | 2パス外部ソートにより定数（Phase 1: `dict_chunk_mb × スレッド数` MB、Phase 2: `chunk_size × 72B`）|
+| ビルド時ピーク RAM | 2パス外部ソートにより定数。Phase 1: `dict_chunk_mb × スレッド数` MB。Phase 2A: `chunk_size × 72B`。Phase 2B (Streaming): Phase 1 と同予算（`dict_chunk_mb × スレッド数`）|
 | 並列クエリ処理 | 対応（tokio blocking pool） |
 | Property Path (* 転移閉包) | BFS（対応済） |
 | Named Graphs (GRAPH句) | GSPO索引（対応済） |
