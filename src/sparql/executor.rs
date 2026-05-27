@@ -2108,9 +2108,11 @@ fn estimate_pattern_cardinality(
     // Returns None for variables and for constants not (yet) in the dictionary.
     let resolve_const = |term: &Term| -> Option<TermId> {
         match term {
-            Term::Variable(_) | Term::BlankNode(_) => None,
-            Term::Iri(iri)     => dict.lookup(iri.as_str()),
-            Term::Literal(lit) => dict.lookup(&lit.to_ntriples()),
+            Term::Variable(_)   => None,
+            // BlankNode stores the full "_:label" form; look it up as a constant.
+            Term::BlankNode(b)  => dict.lookup(b.as_str()),
+            Term::Iri(iri)      => dict.lookup(iri.as_str()),
+            Term::Literal(lit)  => dict.lookup(&lit.to_ntriples()),
         }
     };
 

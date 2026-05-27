@@ -959,7 +959,9 @@ impl<'a> Parser<'a> {
                     .clone();
                 Ok(Term::Iri(format!("{}{}", base, local)))
             }
-            Token::BlankNodeLabel(l) => Ok(Term::BlankNode(l.to_string())),
+            // Keep the full "_:label" form so the executor can look it up in the
+            // dictionary, which stores blank nodes with the "_:" prefix.
+            Token::BlankNodeLabel(l) => Ok(Term::BlankNode(format!("_:{}", l))),
             Token::Anon => Ok(Term::BlankNode(self.fresh_blank())),
             Token::StringLit(s) => {
                 // Check for datatype or lang tag
