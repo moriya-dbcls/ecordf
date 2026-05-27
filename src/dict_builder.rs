@@ -693,6 +693,80 @@ impl ReadonlyDict {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// DictScanner — streaming sequential reader for dict_sorted.bin
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Sequential reader for the **strings section** of `dict_sorted.bin`.
+///
+/// Yields `(term_id, string)` pairs in ascending lexicographic order without
+/// touching the random-access offsets section.  Used by the streaming Phase 2
+/// join to build per-file `LocalMap`s in a single O(N) sequential pass over
+/// the dictionary file, avoiding the random page-fault storm that binary-search
+/// causes on a dictionary larger than available RAM.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut scanner = DictScanner::open(&dict_sorted_path)?;
+/// while let Some((id, s)) = scanner.next_entry()? {
+///     // id is the lexicographic rank of s (0-based)
+/// }
+/// ```
+pub struct DictScanner {
+    reader: BufReader<File>,
+    count: u64,
+    next_id: u64,
+}
+
+impl DictScanner {
+    /// Open `dict_sorted.bin` and position the reader at the first string.
+    ///
+    /// Uses an 8 MiB read buffer to amortise the cost of sequential I/O on
+    /// a large dictionary file.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+        let mut header = [0u8; 24];
+        reader.read_exact(&mut header)?;
+        if &header[..8] != SORTED_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "dict_sorted.bin: invalid magic bytes (expected ESRT0001)",
+            ));
+        }
+        let count = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        // header[16..24] = offsets_start — unused here; strings begin at byte 24
+        Ok(Self { reader, count, next_id: 0 })
+    }
+
+    /// Total number of unique terms in the dictionary.
+    #[inline]
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Read and return the next `(term_id, string)` pair, or `Ok(None)` at EOF.
+    ///
+    /// Reads exactly one `[len: u32][bytes: len × u8]` record from the strings
+    /// section.  IDs are assigned in ascending lexicographic order, starting at 0.
+    pub fn next_entry(&mut self) -> io::Result<Option<(u64, String)>> {
+        if self.next_id >= self.count {
+            return Ok(None);
+        }
+        let mut len_buf = [0u8; 4];
+        self.reader.read_exact(&mut len_buf)?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut bytes = vec![0u8; len];
+        self.reader.read_exact(&mut bytes)?;
+        let s = String::from_utf8(bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let id = self.next_id;
+        self.next_id += 1;
+        Ok(Some((id, s)))
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // QueryDict — query-time dictionary (mmap-backed or legacy in-memory)
 // ══════════════════════════════════════════════════════════════════════════════
 

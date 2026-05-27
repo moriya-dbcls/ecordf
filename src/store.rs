@@ -19,7 +19,8 @@ use crate::dict_builder::{QueryDict, ReadonlyDict};
 use crate::index::{AllBuilders, TripleIndex};
 use crate::loader::{collect_strings_from_inputs, collect_strings_parallel,
                     load_files, load_files_with_graphs,
-                    load_triples_with_readonly_dict, load_triples_parallel, InputSpec};
+                    load_triples_with_readonly_dict, load_triples_parallel,
+                    load_triples_streaming, InputSpec};
 use crate::sparql::{parse_query, Executor, ResultSet};
 use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
 use crate::stats::StoreStatistics;
@@ -237,19 +238,67 @@ impl Store {
             );
         }
 
-        // ── Phase 2: load triples in parallel ─────────────────────────────────
+        // ── Phase 2: load triples ─────────────────────────────────────────────
+        //
+        // Two strategies, chosen by dictionary size:
+        //
+        //  • Streaming  (term_count > STREAMING_PHASE2_THRESHOLD):
+        //    dict_sorted.bin is larger than RAM.  Random binary search causes
+        //    severe page-fault thrash.  Use the three-step join:
+        //    Phase2a (collect strings per file) → Join (sequential dict scan)
+        //    → Phase2b (load triples via LocalMap O(1) hash lookup).
+        //
+        //  • Parallel mmap (term_count ≤ threshold):
+        //    dict_sorted.bin fits in RAM (OS page cache warms quickly).
+        //    Binary-search mmap lookups are fast.  Simpler, lower latency.
+        //
+        // Threshold: 1 B unique terms → ~47 GB dict_sorted.bin on average.
+        // Below that the OS can cache most pages; above it thrash dominates.
+        const STREAMING_PHASE2_THRESHOLD: u64 = 1_000_000_000;
+
         eprintln!("=== Phase 2: loading triples ({} threads) ===", num_threads);
         let t2 = Instant::now();
 
-        let (all_index_chunks, p2_stats) = pool.install(|| {
-            load_triples_parallel(
-                inputs,
-                &dict_sorted_path,
-                &tmp_dir,
-                config.build.chunk_size,
+        let (all_index_chunks, p2_stats) = if term_count > STREAMING_PHASE2_THRESHOLD {
+            // RAM budget for the join: same as Phase 1 peak (dict_chunk_mb × threads).
+            // This is already reserved in the user's hardware profile.
+            let ram_budget_bytes = config.build.dict_chunk_mb * 1024 * 1024 * num_threads;
+            eprintln!(
+                "  dict has {} unique terms (> {} threshold): using streaming Phase 2",
+                term_count, STREAMING_PHASE2_THRESHOLD
+            );
+            eprintln!(
+                "  join ram_budget = {} MB  ({} MB/thread × {} threads)",
+                ram_budget_bytes / (1024 * 1024),
+                config.build.dict_chunk_mb,
                 num_threads,
-            )
-        })?;
+            );
+            pool.install(|| {
+                load_triples_streaming(
+                    inputs,
+                    &dict_sorted_path,
+                    term_count,
+                    &tmp_dir,
+                    config.build.chunk_size,
+                    num_threads,
+                    ram_budget_bytes,
+                )
+            })?
+        } else {
+            eprintln!(
+                "  dict has {} unique terms (≤ {} threshold): using mmap Phase 2",
+                term_count, STREAMING_PHASE2_THRESHOLD
+            );
+            pool.install(|| {
+                load_triples_parallel(
+                    inputs,
+                    &dict_sorted_path,
+                    &tmp_dir,
+                    config.build.chunk_size,
+                    num_threads,
+                )
+            })?
+        };
 
         eprintln!(
             "Parsed {} triples in {:.1}s. Merging indexes...",

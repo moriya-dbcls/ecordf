@@ -12,9 +12,13 @@
 //! Extension resolution: the full filename stem is checked for a double extension
 //! (e.g. `foo.nt.gz`) before falling back to the last extension alone (`foo.gz`).
 
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
+
+use rustc_hash::FxHashMap;
 
 use crate::dict::Dictionary;
 use crate::index::AllBuilders;
@@ -547,6 +551,482 @@ pub fn load_triples_parallel(
     }
     Ok((all_chunks, total))
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Streaming Phase 2 — sequential dict scan instead of random binary search
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Problem: dict_sorted.bin for UniProt is ~640 GB (13.4 B unique terms).
+// That exceeds the 64 GB RAM, so binary search causes ~34 page faults per
+// lookup.  With 32 threads each calling get_id() millions of times, Phase 2
+// thrashes page cache and runs for days at ~5% CPU utilization.
+//
+// Solution: three-step algorithm that avoids random I/O entirely.
+//
+// Phase 2a — Collect sorted unique strings per file (parallel, fast):
+//   Same parsing as Phase 1; result is a sorted Vec<String> per file.
+//
+// Join — Sequential dict scan (single-threaded, but sequential I/O):
+//   Scan dict_sorted.bin once.  K-way merge of per-file sorted string
+//   lists against the dict stream.  Each match writes string→id into the
+//   file's LocalMap.  O(N_dict + M_queries × log k).
+//
+// Phase 2b — Load triples using LocalMap (parallel, O(1) hash lookups):
+//   Same as the existing load_triples_parallel, but lookups hit RAM instead
+//   of mmap random I/O.
+//
+// Batch processing keeps total LocalMap memory bounded:
+//   batch_size × strings_per_file × ~80 bytes ≤ ram_budget
+// This causes multiple dict scans (one per batch), but each scan is fully
+// sequential, so total I/O is batch_count × 640 GB at disk bandwidth.
+//
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Per-file string→ID map built during the streaming Phase 2 join.
+///
+/// Built by [`join_batch_with_dict`] from a single sequential scan of
+/// `dict_sorted.bin`.  Looked up (O(1) hash) during Phase 2b triple loading.
+type LocalMap = FxHashMap<Box<str>, u64>;
+
+/// Look up a string in a per-file [`LocalMap`]; error if absent.
+#[inline]
+fn lookup_local(map: &LocalMap, s: &str) -> io::Result<u64> {
+    map.get(s).copied().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "term missing from LocalMap (Phase 1/2 mismatch?): {:?}",
+                &s[..s.len().min(80)]
+            ),
+        )
+    })
+}
+
+/// Collect every unique RDF term from `input`, sorted lexicographically.
+///
+/// Equivalent to Phase 1 string collection for a single file, but returns a
+/// sorted `Vec<String>` instead of writing to a `DictBuilder`.  Used by the
+/// streaming Phase 2a step to prepare per-file query lists for the join.
+fn collect_strings_for_file_sorted(input: &InputSpec) -> io::Result<Vec<String>> {
+    let mut set: HashSet<String> = HashSet::new();
+    if let Some(g) = input.graph.as_deref() {
+        set.insert(g.to_string());
+    }
+    let path = &input.path;
+    match classify_extension(path) {
+        FileKind::NTriples | FileKind::Unknown(_) => {
+            visit_nt_file(path, |s, p, o| {
+                set.insert(s.to_string());
+                set.insert(p.to_string());
+                set.insert(o.to_string());
+                Ok(())
+            })?;
+        }
+        FileKind::NTriplesGz => {
+            visit_nt_file_gz(path, |s, p, o| {
+                set.insert(s.to_string());
+                set.insert(p.to_string());
+                set.insert(o.to_string());
+                Ok(())
+            })?;
+        }
+        FileKind::NQuads => {
+            visit_nq_file(path, |s, p, o, g| {
+                set.insert(s.to_string());
+                set.insert(p.to_string());
+                set.insert(o.to_string());
+                if let Some(g) = g { set.insert(g.to_string()); }
+                Ok(())
+            })?;
+        }
+        FileKind::NQuadsGz => {
+            visit_nq_file_gz(path, |s, p, o, g| {
+                set.insert(s.to_string());
+                set.insert(p.to_string());
+                set.insert(o.to_string());
+                if let Some(g) = g { set.insert(g.to_string()); }
+                Ok(())
+            })?;
+        }
+    }
+    let mut v: Vec<String> = set.into_iter().collect();
+    v.sort_unstable();
+    Ok(v)
+}
+
+/// Scan `dict_sorted.bin` once sequentially to resolve all query strings in
+/// `per_file_sorted` to their dictionary IDs.
+///
+/// Performs a k-way merge of `per_file_sorted[i]` (one sorted string list per
+/// file) against the sequential dict output.  Both sides are in lexicographic
+/// order, so a single linear pass suffices.  Produces one `LocalMap` per file.
+///
+/// Time: O(N_dict + M_total × log k) where k = `per_file_sorted.len()`.
+/// Sequential I/O: one full pass over `dict_sorted.bin` (per batch).
+fn join_batch_with_dict(
+    dict_path: &Path,
+    per_file_sorted: &[Vec<String>],
+) -> io::Result<Vec<LocalMap>> {
+    let k = per_file_sorted.len();
+    let mut local_maps: Vec<LocalMap> = per_file_sorted
+        .iter()
+        .map(|v| FxHashMap::with_capacity_and_hasher(v.len(), Default::default()))
+        .collect();
+
+    if k == 0 {
+        return Ok(local_maps);
+    }
+
+    // Cursor positions into each per-file sorted list.
+    let mut positions: Vec<usize> = vec![0usize; k];
+
+    // Min-heap: (current_string_for_file, file_index).
+    // We clone Strings into the heap (one per file at a time → at most k entries).
+    let mut heap: BinaryHeap<Reverse<(String, usize)>> = BinaryHeap::new();
+    for (i, strings) in per_file_sorted.iter().enumerate() {
+        if !strings.is_empty() {
+            heap.push(Reverse((strings[0].clone(), i)));
+            positions[i] = 1;
+        }
+    }
+
+    if heap.is_empty() {
+        return Ok(local_maps);
+    }
+
+    let mut scanner = crate::dict_builder::DictScanner::open(dict_path)?;
+    let mut unresolved: u64 = 0;
+
+    // Buffered dict entry: used when dict has advanced past a query string
+    // (shouldn't happen under Phase 1/2 consistency, but handled gracefully).
+    let mut buffered: Option<(u64, String)> = None;
+
+    loop {
+        if heap.is_empty() {
+            break;
+        }
+
+        // Fetch next dict entry (reuse buffered if available).
+        let (dict_id, dict_str) = match buffered.take() {
+            Some(e) => e,
+            None => match scanner.next_entry()? {
+                Some(e) => e,
+                None => {
+                    // Dict exhausted: remaining query strings are unresolved.
+                    unresolved += heap.len() as u64;
+                    break;
+                }
+            },
+        };
+
+        // Current minimum query string across all files.
+        // Clone to avoid holding a borrow on `heap` while we mutate it below.
+        let min_query: String = heap.peek().unwrap().0 .0.clone();
+
+        match dict_str.as_str().cmp(min_query.as_str()) {
+            std::cmp::Ordering::Less => {
+                // Dict is behind the minimum query string: skip this dict entry.
+            }
+            std::cmp::Ordering::Equal => {
+                // Resolve ALL files that have this string as their current minimum.
+                // Use a borrow-safe peek-then-pop pattern: peek only to compare,
+                // then pop unconditionally, so the peek borrow is released before pop.
+                loop {
+                    let top_matches = match heap.peek() {
+                        Some(Reverse((s, _))) => s.as_str() == dict_str.as_str(),
+                        None => false,
+                    };
+                    if !top_matches { break; }
+                    let Reverse((s, fi)) = heap.pop().unwrap();
+                    local_maps[fi].insert(s.into_boxed_str(), dict_id);
+                    // Advance this file's cursor.
+                    let pos = positions[fi];
+                    if pos < per_file_sorted[fi].len() {
+                        heap.push(Reverse((per_file_sorted[fi][pos].clone(), fi)));
+                        positions[fi] += 1;
+                    }
+                }
+            }
+            std::cmp::Ordering::Greater => {
+                // Dict has jumped past the minimum query string.
+                // This indicates a Phase 1/2 mismatch (shouldn't occur in practice).
+                // `min_query` is already an owned clone, so use it directly.
+                // Borrow-safe peek-then-pop pattern.
+                loop {
+                    let top_matches = match heap.peek() {
+                        Some(Reverse((s, _))) => s.as_str() == min_query.as_str(),
+                        None => false,
+                    };
+                    if !top_matches { break; }
+                    let Reverse((_s, fi)) = heap.pop().unwrap();
+                    unresolved += 1;
+                    let pos = positions[fi];
+                    if pos < per_file_sorted[fi].len() {
+                        heap.push(Reverse((per_file_sorted[fi][pos].clone(), fi)));
+                        positions[fi] += 1;
+                    }
+                }
+                // Re-use the current dict entry for the next iteration.
+                buffered = Some((dict_id, dict_str));
+            }
+        }
+    }
+
+    if unresolved > 0 {
+        eprintln!(
+            "  WARNING: {} query strings not resolved during dict scan \
+             (Phase 1/2 parse mismatch?)",
+            unresolved
+        );
+    }
+
+    Ok(local_maps)
+}
+
+/// Load triples from one file using a pre-built [`LocalMap`] instead of the
+/// mmap-backed `ReadonlyDict`.
+///
+/// Called by [`load_triples_streaming`] in Phase 2b.  Identical logic to
+/// `load_triple_from_one_input` but lookups are O(1) hash-table hits in RAM.
+fn load_triple_from_one_input_local(
+    input: &InputSpec,
+    local_map: &LocalMap,
+    builders: &mut AllBuilders,
+) -> io::Result<LoadStats> {
+    let path = &input.path;
+    match (classify_extension(path), input.graph.as_deref()) {
+        // ── N-Triples, no named graph ─────────────────────────────────────────
+        (FileKind::NTriples | FileKind::Unknown(_), None) => {
+            visit_nt_file(path, |s, p, o| {
+                let si = lookup_local(local_map, s)?;
+                let pi = lookup_local(local_map, p)?;
+                let oi = lookup_local(local_map, o)?;
+                builders.push(Triple::new(si, pi, oi))
+            })
+        }
+        // ── N-Triples, named graph ────────────────────────────────────────────
+        (FileKind::NTriples | FileKind::Unknown(_), Some(graph_iri)) => {
+            let gi = lookup_local(local_map, graph_iri)?;
+            visit_nt_file(path, |s, p, o| {
+                let si = lookup_local(local_map, s)?;
+                let pi = lookup_local(local_map, p)?;
+                let oi = lookup_local(local_map, o)?;
+                builders.push_quad(Quad::new(si, pi, oi, gi))
+            })
+        }
+        // ── gzip N-Triples, no named graph ────────────────────────────────────
+        (FileKind::NTriplesGz, None) => {
+            visit_nt_file_gz(path, |s, p, o| {
+                let si = lookup_local(local_map, s)?;
+                let pi = lookup_local(local_map, p)?;
+                let oi = lookup_local(local_map, o)?;
+                builders.push(Triple::new(si, pi, oi))
+            })
+        }
+        // ── gzip N-Triples, named graph ───────────────────────────────────────
+        (FileKind::NTriplesGz, Some(graph_iri)) => {
+            let gi = lookup_local(local_map, graph_iri)?;
+            visit_nt_file_gz(path, |s, p, o| {
+                let si = lookup_local(local_map, s)?;
+                let pi = lookup_local(local_map, p)?;
+                let oi = lookup_local(local_map, o)?;
+                builders.push_quad(Quad::new(si, pi, oi, gi))
+            })
+        }
+        // ── N-Quads ───────────────────────────────────────────────────────────
+        (FileKind::NQuads, _) => {
+            visit_nq_file(path, |s, p, o, g| {
+                let si = lookup_local(local_map, s)?;
+                let pi = lookup_local(local_map, p)?;
+                let oi = lookup_local(local_map, o)?;
+                if let Some(g) = g {
+                    let gi = lookup_local(local_map, g)?;
+                    builders.push_quad(Quad::new(si, pi, oi, gi))
+                } else {
+                    builders.push(Triple::new(si, pi, oi))
+                }
+            })
+        }
+        // ── gzip N-Quads ──────────────────────────────────────────────────────
+        (FileKind::NQuadsGz, _) => {
+            visit_nq_file_gz(path, |s, p, o, g| {
+                let si = lookup_local(local_map, s)?;
+                let pi = lookup_local(local_map, p)?;
+                let oi = lookup_local(local_map, o)?;
+                if let Some(g) = g {
+                    let gi = lookup_local(local_map, g)?;
+                    builders.push_quad(Quad::new(si, pi, oi, gi))
+                } else {
+                    builders.push(Triple::new(si, pi, oi))
+                }
+            })
+        }
+    }
+}
+
+/// Phase 2, **streaming** variant for dictionaries larger than RAM.
+///
+/// Used when `term_count` is so large that `dict_sorted.bin` does not fit in
+/// memory and the mmap binary-search approach causes severe page-fault thrash.
+///
+/// ## Algorithm
+///
+/// Files are processed in *batches* to bound peak RAM:
+///
+/// ```text
+/// for each batch of `batch_size` files:
+///   Phase 2a (parallel):  parse each file → sorted unique string list
+///   Join    (sequential): scan dict_sorted.bin once → build LocalMaps
+///   Phase 2b (parallel):  parse each file again → triple chunks (O(1) hash lookup)
+/// ```
+///
+/// ## Memory
+///
+/// Peak RAM per batch ≈ `batch_size × strings_per_file_est × 80 bytes × 2`
+/// (factor of 2: per_file_sorted + local_maps coexist during the join).
+/// `batch_size` is chosen so this stays within `ram_budget_bytes`.
+///
+/// ## I/O
+///
+/// Each batch requires one sequential read of `dict_sorted.bin` (~640 GB for
+/// UniProt).  At 1–3 GB/s: `batch_count × 640 GB / 2 GB/s` ≈ hours, not days.
+pub fn load_triples_streaming(
+    inputs: &[InputSpec],
+    dict_path: &Path,
+    term_count: u64,
+    tmp_dir: &Path,
+    chunk_size: usize,
+    num_threads: usize,
+    ram_budget_bytes: usize,
+) -> io::Result<(Vec<crate::index::ParallelChunks>, LoadStats)> {
+    use rayon::prelude::*;
+
+    let n = num_threads.max(1);
+    let per_thread_chunk_size = (chunk_size / n).max(100_000);
+
+    // Estimate per-file string count (upper bound; cross-file sharing reduces it).
+    let strings_per_file_est = (term_count / inputs.len().max(1) as u64).max(1);
+    // ~80 bytes per LocalMap entry (Box<str> len + u64 + FxHashMap overhead).
+    // × 2 because per_file_sorted and local_maps coexist during the join.
+    const BYTES_PER_ENTRY: u64 = 80;
+    let batch_size = ((ram_budget_bytes as u64)
+        / (strings_per_file_est * BYTES_PER_ENTRY * 2))
+        .max(1)
+        .min(inputs.len() as u64) as usize;
+
+    let num_batches = (inputs.len() + batch_size - 1) / batch_size;
+    eprintln!(
+        "=== Streaming Phase 2: {} files / batch_size={} / {} dict scan(s) ===",
+        inputs.len(),
+        batch_size,
+        num_batches,
+    );
+    eprintln!(
+        "  est. {:.0} MB/batch  |  {} MB ram_budget",
+        strings_per_file_est as f64 * BYTES_PER_ENTRY as f64 * batch_size as f64 * 2.0
+            / (1024.0 * 1024.0),
+        ram_budget_bytes / (1024 * 1024),
+    );
+
+    let mut all_chunks: Vec<crate::index::ParallelChunks> = Vec::new();
+    let mut total = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
+
+    for (batch_idx, batch) in inputs.chunks(batch_size).enumerate() {
+        let t_batch = std::time::Instant::now();
+        eprintln!(
+            "--- Batch {}/{}: {} files ---",
+            batch_idx + 1,
+            num_batches,
+            batch.len()
+        );
+
+        // ── Phase 2a: collect sorted unique strings per file (parallel) ────────
+        let t_2a = std::time::Instant::now();
+        eprintln!("  Phase 2a: collecting strings...");
+        let per_file_sorted: Vec<io::Result<Vec<String>>> = batch
+            .par_iter()
+            .enumerate()
+            .map(|(i, input)| {
+                eprintln!(
+                    "    [2a t{}]: {:?}",
+                    i,
+                    input.path.file_name().unwrap_or_default()
+                );
+                collect_strings_for_file_sorted(input)
+            })
+            .collect();
+
+        let per_file_sorted: Vec<Vec<String>> =
+            per_file_sorted.into_iter().collect::<io::Result<_>>()?;
+
+        let total_queries: usize = per_file_sorted.iter().map(|v| v.len()).sum();
+        eprintln!(
+            "  Phase 2a done: {} query strings ({:.1}s)",
+            total_queries,
+            t_2a.elapsed().as_secs_f64()
+        );
+
+        // ── Join: scan dict_sorted.bin once, build LocalMaps ──────────────────
+        let t_join = std::time::Instant::now();
+        eprintln!("  Join: scanning dict_sorted.bin...");
+        let local_maps = join_batch_with_dict(dict_path, &per_file_sorted)?;
+        eprintln!("  Join done ({:.1}s)", t_join.elapsed().as_secs_f64());
+
+        // per_file_sorted no longer needed — release memory before Phase 2b.
+        drop(per_file_sorted);
+
+        // ── Phase 2b: load triples using LocalMaps (parallel) ─────────────────
+        let t_2b = std::time::Instant::now();
+        eprintln!("  Phase 2b: loading triples...");
+        let results: Vec<io::Result<(crate::index::ParallelChunks, LoadStats)>> = batch
+            .par_iter()
+            .zip(local_maps.into_par_iter())
+            .enumerate()
+            .map(|(i, (input, local_map))| {
+                let thread_tmp =
+                    tmp_dir.join(format!("p2s_B{:04}_{:06}", batch_idx, i));
+                let graph_label = input
+                    .graph
+                    .as_deref()
+                    .map(|g| format!(" → <{}>", g))
+                    .unwrap_or_default();
+                eprintln!(
+                    "    [2b t{}]: {:?}{}",
+                    i,
+                    input.path.file_name().unwrap_or_default(),
+                    graph_label
+                );
+                let mut builders =
+                    AllBuilders::new_streaming_in(&thread_tmp, per_thread_chunk_size)?;
+                let stats = load_triple_from_one_input_local(input, &local_map, &mut builders)?;
+                eprintln!(
+                    "      → {} triples ({} errors)",
+                    stats.triples_loaded, stats.errors
+                );
+                let chunks = builders.flush_and_return_chunks()?;
+                Ok((chunks, stats))
+            })
+            .collect();
+
+        for r in results {
+            let (chunks, stats) = r?;
+            all_chunks.push(chunks);
+            total.triples_loaded += stats.triples_loaded;
+            total.lines_processed += stats.lines_processed;
+            total.errors += stats.errors;
+        }
+
+        eprintln!(
+            "  Phase 2b done ({:.1}s)  |  Batch total {:.1}s",
+            t_2b.elapsed().as_secs_f64(),
+            t_batch.elapsed().as_secs_f64()
+        );
+    }
+
+    Ok((all_chunks, total))
+}
+
+// ── Phase 2 mmap binary-search helpers (original path) ───────────────────────
 
 #[inline]
 fn lookup(dict: &crate::dict_builder::ReadonlyDict, s: &str) -> io::Result<u64> {
