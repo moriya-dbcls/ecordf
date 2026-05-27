@@ -409,6 +409,7 @@ ecordf/
 │   │                    ecordf.toml を serde+toml でデシリアライズ
 │   │                    ファイル探索順: --config > <store-dir>/ecordf.toml > デフォルト値
 │   │                    BuildConfig: chunk_size / dict_chunk_mb / parallel_threads
+│   │                    ServerConfig: host / port / cors_origins / max_concurrent_queries / warmup_mb
 │   ├── dict.rs        辞書 (レガシー・1パス用): 文字列 ↔ u64 ID
 │   │                    RwLock による interior mutability
 │   │                    19プレフィックスの名前空間圧縮
@@ -605,6 +606,7 @@ $EDITOR ./uniprot-store/ecordf.toml
 | `server.port` | `7878` | TCPポート |
 | `server.cors_origins` | `""` | CORS設定（`"*"` or カンマ区切りオリジン） |
 | `server.max_concurrent_queries` | `0` | 同時クエリ数上限（0=無制限） |
+| `server.warmup_mb` | `0` | 起動直後にバックグラウンドでページキャッシュへ読み込む MB 数（0=無効）。`--warmup-mb` CLI フラグで上書き可 |
 
 ### HTTPサーバー
 
@@ -621,6 +623,10 @@ $EDITOR ./uniprot-store/ecordf.toml
 # CORS許可（特定オリジン）
 ./target/release/ecordf serve --dir ./uniprot-store \
   --cors 'https://app.example.com,https://sparql.example.com'
+
+# コールドスタート対策: 起動直後に 8 GB 分のインデックスをページキャッシュへ読み込む
+# （CLIフラグで指定; ecordf.toml の server.warmup_mb でデフォルト化も可能）
+./target/release/ecordf serve --dir ./uniprot-store --warmup-mb 8192
 ```
 
 ### SPARQL 1.1 Protocol
@@ -646,7 +652,7 @@ POST http://localhost:7878/sparql
 
 | 特性 | EcoRDF の動作 |
 |------|-------------|
-| 起動時間 | mmap のため即時（インデックスファイルを開くだけ） |
+| 起動時間 | mmap のため即時（インデックスファイルを開くだけ）。`server.warmup_mb` または `--warmup-mb` でバックグラウンドウォームアップを有効化するとコールドスタート後の初回クエリが速くなる |
 | クエリ時 RAM | ワーキングセット依存（OS ページキャッシュで管理） |
 | ビルド時ピーク RAM | 2パス外部ソートにより定数。Phase 1: `dict_chunk_mb × スレッド数` MB。Phase 2A: `chunk_size × 72B`。Phase 2B (Streaming): Phase 1 と同予算（`dict_chunk_mb × スレッド数`）|
 | 並列クエリ処理 | 対応（tokio blocking pool） |

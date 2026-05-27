@@ -110,7 +110,8 @@ enum Command {
         /// Pre-populate the OS page cache by reading this many MB of index data
         /// in the background after startup.  The budget is spread across SPO/POS/OSP
         /// and the dictionary (POS gets a 2× share as the most-used index).
-        /// 0 = disabled (default).  For UniProt-scale stores, 4096–16384 is useful.
+        /// When 0 (default), falls back to [server] warmup_mb in ecordf.toml.
+        /// For UniProt-scale stores, 4096–16384 is useful.
         #[arg(long, default_value_t = 0, value_name = "MB")]
         warmup_mb: u64,
     },
@@ -255,9 +256,11 @@ async fn main() -> anyhow::Result<()> {
                 store.config.query.max_intermediate_rows,
                 store.config.query.bind_join_threshold,
             );
-            if warmup_mb > 0 {
-                eprintln!("Warming up {} MB of indexes in background...", warmup_mb);
-                store.warmup_background(warmup_mb);
+            // CLI --warmup-mb takes precedence; fall back to config file value.
+            let effective_warmup_mb = if warmup_mb > 0 { warmup_mb } else { store.config.server.warmup_mb };
+            if effective_warmup_mb > 0 {
+                eprintln!("Warming up {} MB of indexes in background...", effective_warmup_mb);
+                store.warmup_background(effective_warmup_mb);
             }
             ecordf::server::serve(store, &effective_host, effective_port, effective_cors.as_deref()).await?;
         }

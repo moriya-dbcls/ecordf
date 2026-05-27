@@ -172,3 +172,27 @@ max_concurrent_queries = 0
 #
 # Overridable with --cors on the command line.
 cors_origins = ""
+
+# MiB of index data to read into the OS page cache in a background thread
+# immediately after startup.
+#
+# EcoRDF uses memmap2 — index pages are loaded on first access.  For large
+# stores the first few queries after a cold start can be slow due to page
+# faults.  Setting warmup_mb > 0 pre-populates the page cache before any
+# queries arrive, eliminating that initial latency.
+#
+# The budget is spread across SPO / POS / OSP / dict (and GSPO if present).
+# POS receives a 2× share as the most-heavily-used index at query time.
+#
+#   warmup_mb    effect
+#   ---------    ------
+#   0            disabled — no warmup (default)
+#   4096         warm 4 GB; good starting point for medium stores
+#   16384        warm 16 GB; suitable for UniProt-scale datasets
+#
+# RAM note: warmed data goes into the OS page cache, NOT the process heap.
+# Process RSS barely changes.  The kernel will evict pages under memory
+# pressure automatically.
+#
+# Overridable with --warmup-mb on the command line (CLI value wins when > 0).
+warmup_mb = 0

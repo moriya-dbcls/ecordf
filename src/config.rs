@@ -26,6 +26,9 @@
 //! host        = "127.0.0.1"
 //! port        = 7878
 //! cors_origins = ""
+//! # Pre-populate the OS page cache on startup (0 = disabled).
+//! # For UniProt-scale stores, 4096–16384 MB is useful.
+//! warmup_mb   = 0
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -270,6 +273,29 @@ pub struct ServerConfig {
     /// I/O-bound or short queries; lower for RAM-heavy analytical queries
     /// where running too many in parallel causes memory pressure.
     pub max_concurrent_queries: usize,
+
+    /// MiB of index data to read into the OS page cache in a background thread
+    /// immediately after startup.
+    ///
+    /// EcoRDF uses `memmap2` — index pages are loaded on first access.  For
+    /// large stores the first few queries after a cold start can be slow due to
+    /// page faults.  This setting pre-populates the page cache before any
+    /// queries arrive, eliminating that latency.
+    ///
+    /// The budget is spread across SPO / POS / OSP / dict (and GSPO if present);
+    /// POS receives a 2× share as the most-heavily-used index.
+    ///
+    /// - `0` — disabled (default); no warmup is performed.
+    /// - `4096`  — warm 4 GB; good starting point for medium stores.
+    /// - `16384` — warm 16 GB; suitable for UniProt-scale datasets.
+    ///
+    /// Overridable with `--warmup-mb` on the command line (CLI takes precedence
+    /// over this config value when non-zero).
+    ///
+    /// **RAM note**: warmup data goes into the OS page cache, not the process
+    /// heap.  Process RSS barely changes.  The cache is evictable by the kernel
+    /// under memory pressure.
+    pub warmup_mb: u64,
 }
 
 impl Default for ServerConfig {
@@ -279,6 +305,7 @@ impl Default for ServerConfig {
             port: 7878,
             cors_origins: String::new(),
             max_concurrent_queries: 0, // unlimited by default
+            warmup_mb: 0,              // disabled by default
         }
     }
 }
