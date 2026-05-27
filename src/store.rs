@@ -424,6 +424,60 @@ impl Store {
         self.config = config;
     }
 
+    /// Spawn a background thread that sequentially reads through the store's
+    /// index files to pre-populate the OS page cache.
+    ///
+    /// `warmup_mb` is the **total** number of megabytes to read across all files.
+    /// The budget is split evenly across the three triple indexes (SPO/POS/OSP)
+    /// and the dictionary, prioritising the POS index (most used for predicate
+    /// lookups) with a 2× share.
+    ///
+    /// Returns immediately; the actual I/O happens on a detached thread.
+    /// A progress log line is emitted when each file's quota is reached.
+    pub fn warmup_background(&self, warmup_mb: u64) {
+        if warmup_mb == 0 {
+            return;
+        }
+
+        // File list: POS gets a double share because predicate scans dominate.
+        // Each entry: (path, share_weight)
+        let files: Vec<(std::path::PathBuf, u64)> = {
+            let d = &self.dir;
+            let mut v = vec![
+                (d.join("pos.bin"),          2),
+                (d.join("spo.bin"),          1),
+                (d.join("osp.bin"),          1),
+                (d.join("dict_sorted.bin"),  1),
+            ];
+            if d.join("gspo.bin").exists() {
+                v.push((d.join("gspo.bin"), 1));
+            }
+            v
+        };
+
+        let total_weight: u64 = files.iter().map(|(_, w)| w).sum();
+        let bytes_per_weight = (warmup_mb * 1024 * 1024) / total_weight.max(1);
+
+        std::thread::spawn(move || {
+            for (path, weight) in files {
+                let budget = bytes_per_weight * weight;
+                let label = path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                match warmup_file(&path, budget) {
+                    Ok(read) => tracing::info!(
+                        "warmup {}: read {:.1} MB",
+                        label,
+                        read as f64 / (1024.0 * 1024.0)
+                    ),
+                    Err(e) => tracing::warn!("warmup {}: {}", label, e),
+                }
+            }
+            tracing::info!("warmup complete");
+        });
+    }
+
     /// Execute a SPARQL query string and return the result set.
     pub fn query(&self, sparql: &str) -> Result<QueryResult, QueryError> {
         let t0 = Instant::now();
@@ -561,6 +615,30 @@ fn collect_p1_chunks(tmp_dir: &Path) -> io::Result<Vec<PathBuf>> {
 ///
 /// Returns `Some(error_message)` when ungrouped variables are found, `None` when the query is valid.
 ///
+/// Sequentially read up to `budget` bytes from `path`, returning bytes read.
+/// Used to pre-populate the OS page cache at warmup time.
+fn warmup_file(path: &Path, budget: u64) -> io::Result<u64> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    // 2 MiB buffer: large enough for sequential throughput, fits in L3 cache.
+    let mut reader = std::io::BufReader::with_capacity(2 * 1024 * 1024, file);
+    let mut buf = vec![0u8; 2 * 1024 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let remaining = (budget - total).min(buf.len() as u64) as usize;
+        if remaining == 0 {
+            break;
+        }
+        match reader.read(&mut buf[..remaining]) {
+            Ok(0) => break,              // EOF
+            Ok(n) => total += n as u64,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(total)
+}
+
 /// Example error:
 ///   "Variable(s) ?c, ?c_label appear in SELECT but not in GROUP BY or an aggregate.
 ///    Add them to GROUP BY, e.g.: GROUP BY ?p ?c ?c_label"

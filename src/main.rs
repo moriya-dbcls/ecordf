@@ -107,6 +107,12 @@ enum Command {
         /// Path to the config file (default: <store-dir>/ecordf.toml)
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
+        /// Pre-populate the OS page cache by reading this many MB of index data
+        /// in the background after startup.  The budget is spread across SPO/POS/OSP
+        /// and the dictionary (POS gets a 2× share as the most-used index).
+        /// 0 = disabled (default).  For UniProt-scale stores, 4096–16384 is useful.
+        #[arg(long, default_value_t = 0, value_name = "MB")]
+        warmup_mb: u64,
     },
 
     /// Execute a SPARQL query from command line
@@ -230,7 +236,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Command::Serve { dir, host, port, cors, config } => {
+        Command::Serve { dir, host, port, cors, config, warmup_mb } => {
             let store = Store::open_with_config(&dir, config.as_deref())?;
             let stats = store.stats();
             eprintln!(
@@ -249,6 +255,10 @@ async fn main() -> anyhow::Result<()> {
                 store.config.query.max_intermediate_rows,
                 store.config.query.bind_join_threshold,
             );
+            if warmup_mb > 0 {
+                eprintln!("Warming up {} MB of indexes in background...", warmup_mb);
+                store.warmup_background(warmup_mb);
+            }
             ecordf::server::serve(store, &effective_host, effective_port, effective_cors.as_deref()).await?;
         }
 

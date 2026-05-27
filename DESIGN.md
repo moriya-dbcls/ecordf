@@ -251,16 +251,19 @@ pub fn encode(&self, s: &str) -> u64 { ... }
 | FILTER (REGEX, STR, LANG, DATATYPE, 比較, 論理演算) | `eval_bool` / `eval_string` |
 | BIND | `ExecutionPlan::Extend` |
 | VALUES | インライン値表 |
-| GROUP BY / HAVING / 集計 (COUNT, SUM, MIN, MAX, AVG) | `apply_group_by` |
-| ORDER BY / LIMIT / OFFSET | `execute_select` |
+| GROUP BY / HAVING / 集計 (COUNT, SUM, MIN, MAX, AVG, GROUP_CONCAT, SAMPLE) | `apply_group_by` |
+| **COUNT without GROUP BY** | 全行を暗黙的1グループとして扱う（SPARQL 1.1 §11） |
+| ORDER BY / LIMIT / OFFSET | 数値・文字列の型対応比較 |
 | DISTINCT | 重複除去 |
-| プレフィックス宣言 (PREFIX) | パーサー |
+| プレフィックス宣言 (PREFIX) | パーサー（**空プレフィックス `PREFIX : <iri>` も対応**） |
 | 算術演算 (+, -, *, /) | `eval_term` |
-| 文字列関数 (UCASE, LCASE, CONCAT, CONTAINS, STRSTARTS, STRENDS) | `eval_term` |
+| 文字列関数 (UCASE, LCASE, CONCAT, CONTAINS, STRSTARTS, STRENDS, **REPLACE**) | `eval_term` |
 | 型検査 (isIRI, isLiteral, isBlank, BOUND) | `eval_bool` |
 | **Property Paths** (* + ? / \| ^ ) | BFS転移閉包 + 再帰評価 |
 | **GRAPH clause / Named Graphs** | GSPO索引 + `execute_named_graph` |
 | **STR(IRI) のリテラル型化** | `encode` on `&self` で辞書に登録 |
+| **ブランクノード存在変数** (`_:b`, `[]`, `[pred obj]`) | パース時に `Term::Variable("_:b")` へ変換 |
+| **サブクエリの WHERE 省略** | `SELECT ?x { ... }` と `SELECT ?x WHERE { ... }` を同等に扱う |
 
 ### 未対応 / 制限事項
 
@@ -269,7 +272,6 @@ pub fn encode(&self, s: &str) -> u64 { ... }
 | CONSTRUCT | 未実装（`QueryError::Unsupported`） |
 | SPARQL UPDATE (INSERT/DELETE) | 未実装 |
 | SERVICE (フェデレーション) | 未実装 |
-| サブクエリ (SELECT in WHERE) | パーサー対応済み、実行は outer plan として処理 |
 | Leapfrog の多変数完全実装 | 共有変数が2つ以上のとき hash join にフォールバック |
 
 ---
