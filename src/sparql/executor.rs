@@ -410,17 +410,23 @@ impl<'a> Executor<'a> {
             // BIND-JOIN RULE: if a Variable is bound in `outer`, treat it as a constant
             // (targeted index probe instead of full scan).
             ExecutionPlan::ScanAst(ast_pat) => {
-                // Collect variable→position mappings for variables NOT bound in outer
+                // Collect variable→position mappings for variables NOT bound in outer.
+                // Term::BlankNode is handled as a fallback for any blank-node term that
+                // was not converted to Term::Variable by the parser.
                 let mut variables: Vec<(String, u8)> = Vec::new();
-                if let Term::Variable(v) = &ast_pat.s {
-                    if !outer.contains_key(v.as_str()) { variables.push((v.clone(), 0)); }
-                }
-                if let Term::Variable(v) = &ast_pat.p {
-                    if !outer.contains_key(v.as_str()) { variables.push((v.clone(), 1)); }
-                }
-                if let Term::Variable(v) = &ast_pat.o {
-                    if !outer.contains_key(v.as_str()) { variables.push((v.clone(), 2)); }
-                }
+                let collect_var = |t: &Term, pos: u8, vars: &mut Vec<(String, u8)>| {
+                    let name = match t {
+                        Term::Variable(v) => Some(v.clone()),
+                        Term::BlankNode(b) => Some(b.clone()),
+                        _ => None,
+                    };
+                    if let Some(n) = name {
+                        if !outer.contains_key(n.as_str()) { vars.push((n, pos)); }
+                    }
+                };
+                collect_var(&ast_pat.s, 0, &mut variables);
+                collect_var(&ast_pat.p, 1, &mut variables);
+                collect_var(&ast_pat.o, 2, &mut variables);
                 let var_names = || variables.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
 
                 // Encode one AST term to a TermId.
@@ -436,9 +442,18 @@ impl<'a> Executor<'a> {
                                 Some(UNBOUND) // free variable → wildcard
                             }
                         }
+                        // Blank nodes that reach here were not converted by the parser
+                        // (e.g. from programmatic plan construction).  Treat like a free
+                        // variable: check outer binding first, fall back to UNBOUND.
+                        Term::BlankNode(b) => {
+                            if let Some(&id) = outer.get(b.as_str()) {
+                                Some(id)
+                            } else {
+                                Some(UNBOUND)
+                            }
+                        }
                         Term::Iri(iri) => self.dict.lookup(iri.as_str()),
                         Term::Literal(lit) => self.dict.lookup(&lit.to_ntriples()),
-                        Term::BlankNode(b) => self.dict.lookup(b.as_str()),
                     }
                 };
 
@@ -2108,11 +2123,12 @@ fn estimate_pattern_cardinality(
     // Returns None for variables and for constants not (yet) in the dictionary.
     let resolve_const = |term: &Term| -> Option<TermId> {
         match term {
-            Term::Variable(_)   => None,
-            // BlankNode stores the full "_:label" form; look it up as a constant.
-            Term::BlankNode(b)  => dict.lookup(b.as_str()),
-            Term::Iri(iri)      => dict.lookup(iri.as_str()),
-            Term::Literal(lit)  => dict.lookup(&lit.to_ntriples()),
+            // Variables and blank nodes are unbound — they are wildcards in the scan.
+            // (Blank nodes in WHERE patterns are converted to Term::Variable by the
+            // parser; Term::BlankNode here would only arrive from unusual code paths.)
+            Term::Variable(_) | Term::BlankNode(_) => None,
+            Term::Iri(iri)     => dict.lookup(iri.as_str()),
+            Term::Literal(lit) => dict.lookup(&lit.to_ntriples()),
         }
     };
 
@@ -2207,10 +2223,17 @@ fn optimize_triple_patterns(
             .unwrap();
 
         let best = remaining.remove(best_idx);
-        // Add variables this pattern introduces to the bound set.
-        if let Term::Variable(v) = &best.s { bound.insert(v.clone()); }
-        if let Term::Variable(v) = &best.p { bound.insert(v.clone()); }
-        if let Term::Variable(v) = &best.o { bound.insert(v.clone()); }
+        // Add variables (and any residual blank-node terms) to the bound set.
+        let add_var = |t: &Term, bound: &mut HashSet<String>| {
+            match t {
+                Term::Variable(v) => { bound.insert(v.clone()); }
+                Term::BlankNode(b) => { bound.insert(b.clone()); }
+                _ => {}
+            }
+        };
+        add_var(&best.s, &mut bound);
+        add_var(&best.p, &mut bound);
+        add_var(&best.o, &mut bound);
         ordered.push(best);
     }
 
@@ -2252,7 +2275,11 @@ fn plan_needs_outer_binding(plan: &ExecutionPlan, left_vars: &[String]) -> bool 
     match plan {
         ExecutionPlan::ScanAst(p) => {
             let has_var = |t: &Term| -> bool {
-                if let Term::Variable(v) = t { left_vars.contains(v) } else { false }
+                match t {
+                    Term::Variable(v) => left_vars.contains(v),
+                    Term::BlankNode(b) => left_vars.contains(b),
+                    _ => false,
+                }
             };
             has_var(&p.s) || has_var(&p.p) || has_var(&p.o)
         }

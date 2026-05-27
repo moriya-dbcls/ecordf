@@ -919,10 +919,13 @@ impl<'a> Parser<'a> {
         path_patterns: &mut Vec<GraphPattern>,
     ) -> ParseResult<Term> {
         // Handle blank node property lists: [ pred obj ; ... ]
+        // The blank node acts as an existential variable scoped to this BGP.
         if matches!(self.lexer.peek(), Token::LBracket) {
             self.lexer.next();
             let bn_id = self.fresh_blank();
-            let bn = Term::BlankNode(bn_id);
+            // Use Term::Variable so the full join/bind-join machinery handles the
+            // existential blank node correctly (same as any named variable).
+            let bn = Term::Variable(bn_id);
             self.parse_property_list(&bn, triples, path_patterns)?;
             self.expect(Token::RBracket)?;
             return Ok(bn);
@@ -959,10 +962,13 @@ impl<'a> Parser<'a> {
                     .clone();
                 Ok(Term::Iri(format!("{}{}", base, local)))
             }
-            // Keep the full "_:label" form so the executor can look it up in the
-            // dictionary, which stores blank nodes with the "_:" prefix.
-            Token::BlankNodeLabel(l) => Ok(Term::BlankNode(format!("_:{}", l))),
-            Token::Anon => Ok(Term::BlankNode(self.fresh_blank())),
+            // Blank nodes in WHERE clause patterns are existential variables scoped to
+            // the enclosing BGP — semantically equivalent to anonymous ?variables.
+            // Convert to Term::Variable so join planning, bind-join, and variable
+            // collection all handle them correctly without any special cases.
+            // The "_:" prefix keeps them distinct from user-written ?variables.
+            Token::BlankNodeLabel(l) => Ok(Term::Variable(format!("_:{}", l))),
+            Token::Anon => Ok(Term::Variable(self.fresh_blank())),
             Token::StringLit(s) => {
                 // Check for datatype or lang tag
                 let (dt, lang) = self.parse_literal_suffix()?;
