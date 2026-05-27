@@ -223,6 +223,7 @@ pub enum Expression {
     Datatype(Box<Expression>),
     LangMatches(Box<Expression>, Box<Expression>),
     Regex(Box<Expression>, Box<Expression>, Option<Box<Expression>>),
+    Replace(Box<Expression>, Box<Expression>, Box<Expression>, Option<Box<Expression>>),
     Substr(Box<Expression>, Box<Expression>, Option<Box<Expression>>),
     Strlen(Box<Expression>),
     UCase(Box<Expression>),

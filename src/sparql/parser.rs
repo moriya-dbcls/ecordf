@@ -224,6 +224,16 @@ impl<'a> Lexer<'a> {
                 }
             }
             b'-' => { self.pos += 1; Token::Minus }
+            b':' => {
+                // Bare colon: empty-prefix name — e.g. `: ` in `PREFIX : <iri>`
+                // or `:local` in triple patterns when the default prefix is declared.
+                self.pos += 1;
+                let local_start = self.pos;
+                while self.pos < self.input.len() && is_name_char(self.input.as_bytes()[self.pos]) {
+                    self.pos += 1;
+                }
+                Token::PrefixedName("", &self.input[local_start..self.pos])
+            }
             b'"' | b'\'' => self.lex_string(),
             b'_' => self.lex_blank_or_kw(),
             b'0'..=b'9' => self.lex_number(),
@@ -406,16 +416,29 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_prefix_decl(&mut self) -> ParseResult<()> {
-        // prefix: <iri>
+        // Recognise the prefix name before the IRI.
+        //
+        // Common tokenisations of "PREFIX foo: <iri>", "PREFIX : <iri>", etc.:
+        //   "foo:"   → PrefixedName("foo", "")   — colon already consumed
+        //   ":"      → PrefixedName("", "")       — bare colon (empty prefix)
+        //   "foo" " " ":" → Kw("foo") + PrefixedName("","") — space before colon
         let prefix = match self.lexer.next() {
-            Token::PrefixedName(p, "") => p.to_string(),
+            // Colon was already consumed by the lexer as part of the prefixed-name token.
+            // This covers "foo:", ":", and even ":local" where local must be empty here.
+            Token::PrefixedName(p, local) if local.is_empty() => p.to_string(),
+            // The prefix name was tokenised as a keyword (happens when there is a space
+            // between the name and the colon, e.g. "PREFIX rdf : <iri>").
+            // In that case the very next token is the bare colon PrefixedName("","").
             Token::Kw(k) => {
-                // prefix: might be tokenized as Kw then Colon
-                k.to_string()
+                let p = k.to_string();
+                // Consume the trailing bare colon if present.
+                if matches!(self.lexer.peek(), Token::PrefixedName(pn, ln) if pn.is_empty() && ln.is_empty()) {
+                    self.lexer.next();
+                }
+                p
             }
             other => return Err(ParseError(format!("expected prefix name, got {:?}", other))),
         };
-        // Consume the colon if not already consumed
         let iri = self.expect_iri_ref()?;
         self.prefixes.insert(prefix, iri);
         Ok(())
@@ -1241,6 +1264,22 @@ impl<'a> Parser<'a> {
                 let b = self.parse_expression()?;
                 self.expect(Token::RParen)?;
                 Ok(Expression::Contains(Box::new(a), Box::new(b)))
+            }
+            "replace" => {
+                self.expect(Token::LParen)?;
+                let s = self.parse_expression()?;
+                self.expect(Token::Comma)?;
+                let pattern = self.parse_expression()?;
+                self.expect(Token::Comma)?;
+                let replacement = self.parse_expression()?;
+                let flags = if matches!(self.lexer.peek(), Token::Comma) {
+                    self.lexer.next();
+                    Some(Box::new(self.parse_expression()?))
+                } else {
+                    None
+                };
+                self.expect(Token::RParen)?;
+                Ok(Expression::Replace(Box::new(s), Box::new(pattern), Box::new(replacement), flags))
             }
             "strstarts" => {
                 self.expect(Token::LParen)?;

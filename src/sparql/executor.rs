@@ -204,8 +204,10 @@ impl<'a> Executor<'a> {
             return bindings;
         }
 
-        // 3. Apply GROUP BY + aggregates if present
-        if !query.group_by.is_empty() {
+        // 3. Apply GROUP BY + aggregates if present.
+        //    If GROUP BY is absent but the projection contains aggregate expressions
+        //    (e.g. COUNT(*), SUM(?x)), all rows form a single implicit group — SPARQL 1.1 §11.
+        if !query.group_by.is_empty() || projection_has_aggregates(query) {
             bindings = self.apply_group_by(&bindings, query);
         }
 
@@ -1341,6 +1343,26 @@ impl<'a> Executor<'a> {
             Expression::Round(e) => self.numeric_unary(e, binding, |x| x.round()),
             Expression::Ceil(e) => self.numeric_unary(e, binding, |x| x.ceil()),
             Expression::Floor(e) => self.numeric_unary(e, binding, |x| x.floor()),
+            // REPLACE(?str, ?pattern, ?replacement [, ?flags])
+            // Applies a regex substitution; honours the 'i' flag for case-insensitive matching.
+            Expression::Replace(s_expr, pat_expr, repl_expr, flags_expr) => {
+                let text = self.eval_string(s_expr, binding)?;
+                let pat  = self.eval_string(pat_expr, binding)?;
+                let repl = self.eval_string(repl_expr, binding)?;
+                let flag_str = flags_expr
+                    .as_ref()
+                    .and_then(|f| self.eval_string(f, binding))
+                    .unwrap_or_default();
+                let full_pat = if flag_str.contains('i') {
+                    format!("(?i){}", pat)
+                } else {
+                    pat
+                };
+                let replaced = regex::Regex::new(&full_pat)
+                    .ok()
+                    .map(|re| re.replace_all(&text, repl.as_str()).into_owned())?;
+                Some(self.dict.encode(&format!("\"{}\"", replaced)))
+            }
             _ => None,
         }
     }
@@ -2274,6 +2296,35 @@ fn extract_datatype(s: &str) -> Option<&str> {
 fn parse_numeric(s: &str) -> Option<f64> {
     let val = extract_literal_value(s);
     val.parse::<f64>().ok()
+}
+
+/// Returns true when the SELECT projection contains at least one aggregate expression
+/// (COUNT, SUM, MIN, MAX, AVG, GROUP_CONCAT, SAMPLE).
+/// Used to trigger implicit single-group aggregation when GROUP BY is absent.
+fn projection_has_aggregates(query: &SelectQuery) -> bool {
+    fn is_aggregate(expr: &Expression) -> bool {
+        matches!(
+            expr,
+            Expression::Count { .. }
+                | Expression::Sum { .. }
+                | Expression::Min { .. }
+                | Expression::Max { .. }
+                | Expression::Avg { .. }
+                | Expression::GroupConcat { .. }
+                | Expression::Sample { .. }
+        )
+    }
+    if let Projection::Variables(items) = &query.projection {
+        items.iter().any(|item| {
+            if let SelectItem::Alias(expr, _) = item {
+                is_aggregate(expr)
+            } else {
+                false
+            }
+        })
+    } else {
+        false
+    }
 }
 
 fn eval_expr_to_string(expr: &Expression, binding: &Binding, dict: &QueryDict) -> String {
