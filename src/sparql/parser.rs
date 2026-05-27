@@ -510,7 +510,10 @@ impl<'a> Parser<'a> {
         };
 
         let dataset = self.parse_dataset_clauses()?;
-        self.expect_kw("where")?;
+        // WHERE is optional (commonly omitted in subqueries)
+        if matches!(self.lexer.peek(), Token::Kw(k) if k.eq_ignore_ascii_case("where")) {
+            self.lexer.next();
+        }
         let pattern = self.parse_group_graph_pattern()?;
         let group_by = self.parse_group_by()?;
         let having = self.parse_having()?;
