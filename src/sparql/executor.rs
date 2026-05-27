@@ -223,14 +223,13 @@ impl<'a> Executor<'a> {
         if !query.order_by.is_empty() {
             let vars = bindings.variables.clone();
             let order = query.order_by.clone();
-            let dict = self.dict;
             bindings.rows.sort_by(|a, b| {
                 for cond in &order {
                     let ba = row_to_binding(&vars, a);
                     let bb = row_to_binding(&vars, b);
-                    let va = eval_expr_to_string(&cond.expr, &ba, dict);
-                    let vb = eval_expr_to_string(&cond.expr, &bb, dict);
-                    let cmp = va.cmp(&vb);
+                    let va = self.eval_order_key(&cond.expr, &ba);
+                    let vb = self.eval_order_key(&cond.expr, &bb);
+                    let cmp = compare_order_keys(&va, &vb);
                     let cmp = if cond.direction == OrderDirection::Desc { cmp.reverse() } else { cmp };
                     if cmp != std::cmp::Ordering::Equal {
                         return cmp;
@@ -1025,7 +1024,21 @@ impl<'a> Executor<'a> {
 
         for (key, group_rows) in groups {
             let mut row = vec![None; out_vars.len()];
-            // Fill group-by variables
+
+            // Build a binding from the GROUP BY key variables so that scalar
+            // alias expressions (e.g. REPLACE(STR(?ontology), …)) can be evaluated
+            // even when the variable is not explicitly listed in the SELECT projection.
+            let key_binding: Binding = query.group_by.iter().zip(key.iter())
+                .filter_map(|(gc, val)| {
+                    if let Expression::Variable(v) = &gc.expr {
+                        val.map(|id| (v.clone(), id))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Fill group-by variables that appear in the output projection
             for (i, gc) in query.group_by.iter().enumerate() {
                 if let Expression::Variable(v) = &gc.expr {
                     if let Some(out_i) = result.variable_index(v) {
@@ -1033,11 +1046,19 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
-            // Compute aggregates
+
+            // Compute aliases: use eval_aggregate for real aggregates, eval_term for scalars.
             if let Projection::Variables(items) = &query.projection {
                 for (out_i, item) in items.iter().enumerate() {
                     if let SelectItem::Alias(expr, _) = item {
-                        row[out_i] = self.eval_aggregate(expr, &group_rows, rs);
+                        row[out_i] = if is_aggregate_expr(expr) {
+                            self.eval_aggregate(expr, &group_rows, rs)
+                        } else {
+                            // Scalar expression (e.g. REPLACE, STR, CONCAT, …):
+                            // evaluate using the GROUP BY key binding so that GROUP BY
+                            // variables are available even if not in the SELECT projection.
+                            self.eval_term(expr, &key_binding)
+                        };
                     }
                 }
             }
@@ -1882,6 +1903,24 @@ impl<'a> Executor<'a> {
             }
         }
     }
+
+    /// Produce a sort key for ORDER BY: evaluates the expression and returns the
+    /// decoded string form (e.g. `"42"` for `"\"42\"^^xsd:integer"`).
+    /// Returns an empty string when the expression cannot be evaluated.
+    fn eval_order_key(&self, expr: &Expression, binding: &Binding) -> String {
+        // Fast path: variable already in binding
+        if let Expression::Variable(v) = expr {
+            if let Some(&id) = binding.get(v.as_str()) {
+                return extract_literal_value(&self.dict.decode(id));
+            }
+            return String::new();
+        }
+        // General expression (e.g. arithmetic, function call)
+        if let Some(id) = self.eval_term(expr, binding) {
+            return extract_literal_value(&self.dict.decode(id));
+        }
+        String::new()
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2298,41 +2337,44 @@ fn parse_numeric(s: &str) -> Option<f64> {
     val.parse::<f64>().ok()
 }
 
+/// Compare two ORDER BY sort keys (already lexical-value strings, not N-Triples).
+/// Numeric strings are compared numerically; everything else lexicographically.
+/// This ensures `ORDER BY ?count` works correctly for integer/decimal aggregates.
+fn compare_order_keys(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(na), Ok(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+        _ => a.cmp(b),
+    }
+}
+
+/// Returns true when `expr` is a SPARQL aggregate function.
+fn is_aggregate_expr(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::Count { .. }
+            | Expression::Sum { .. }
+            | Expression::Min { .. }
+            | Expression::Max { .. }
+            | Expression::Avg { .. }
+            | Expression::GroupConcat { .. }
+            | Expression::Sample { .. }
+    )
+}
+
 /// Returns true when the SELECT projection contains at least one aggregate expression
 /// (COUNT, SUM, MIN, MAX, AVG, GROUP_CONCAT, SAMPLE).
 /// Used to trigger implicit single-group aggregation when GROUP BY is absent.
 fn projection_has_aggregates(query: &SelectQuery) -> bool {
-    fn is_aggregate(expr: &Expression) -> bool {
-        matches!(
-            expr,
-            Expression::Count { .. }
-                | Expression::Sum { .. }
-                | Expression::Min { .. }
-                | Expression::Max { .. }
-                | Expression::Avg { .. }
-                | Expression::GroupConcat { .. }
-                | Expression::Sample { .. }
-        )
-    }
     if let Projection::Variables(items) = &query.projection {
         items.iter().any(|item| {
             if let SelectItem::Alias(expr, _) = item {
-                is_aggregate(expr)
+                is_aggregate_expr(expr)
             } else {
                 false
             }
         })
     } else {
         false
-    }
-}
-
-fn eval_expr_to_string(expr: &Expression, binding: &Binding, dict: &QueryDict) -> String {
-    match expr {
-        Expression::Variable(v) => binding.get(v.as_str())
-            .map(|&id| dict.decode(id))
-            .unwrap_or_default(),
-        _ => String::new(),
     }
 }
 
