@@ -237,7 +237,7 @@ impl StringChunkReader {
 ///
 /// On Linux reads `/proc/self/limits` (no extra dependencies).
 /// Falls back to 1024 on other platforms or if parsing fails.
-fn fd_soft_limit() -> usize {
+pub(crate) fn fd_soft_limit() -> usize {
     #[cfg(target_os = "linux")]
     {
         if let Ok(text) = std::fs::read_to_string("/proc/self/limits") {
@@ -763,6 +763,170 @@ impl DictScanner {
         let id = self.next_id;
         self.next_id += 1;
         Ok(Some((id, s)))
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// LocalDictBuilder / LocalDict — per-file sub-dictionary for streaming Phase 2
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Magic bytes for the per-file local dictionary format.
+const LOCAL_DICT_MAGIC: &[u8; 8] = b"ELOC0001";
+
+/// Builds a `local_dict.bin` file during the streaming Phase 2 join.
+///
+/// Entries **must be added in lexicographic string order** (the same order as
+/// the main dict scanner yields them).  After the join pass, call [`finish`]
+/// to assemble and persist the final file.
+///
+/// ## File format (`ELOC0001`)
+///
+/// ```text
+/// [magic:         u8×8  ]   = b"ELOC0001"
+/// [count:         u64   ]   number of entries
+/// [offsets_start: u64   ]   byte offset of offsets section
+/// ── strings section (byte 24 …) ──────────────────────────────────────────
+/// for each entry in lex order:
+///   [global_id: u64]  [len: u32]  [bytes: len × u8]
+/// ── offsets section (at offsets_start) ───────────────────────────────────
+/// for each entry i: [u64]  byte offset of entry i's global_id field
+/// ```
+pub struct LocalDictBuilder {
+    strings_w:   BufWriter<File>,
+    offsets_w:   BufWriter<File>,
+    strings_tmp: PathBuf,
+    offsets_tmp: PathBuf,
+    /// Current byte position in the assembled file (advances with each `add`).
+    byte_pos: u64,
+    count:    u64,
+}
+
+impl LocalDictBuilder {
+    /// Create a new builder that writes temporary files under `tmp_dir`.
+    ///
+    /// `file_index` is used only to give the temp files unique names within a batch.
+    pub fn new(tmp_dir: &Path, file_index: usize) -> io::Result<Self> {
+        fs::create_dir_all(tmp_dir)?;
+        let strings_tmp = tmp_dir.join(format!("ldstr_{:06}.tmp", file_index));
+        let offsets_tmp = tmp_dir.join(format!("ldoff_{:06}.tmp", file_index));
+        Ok(Self {
+            strings_w:   BufWriter::new(File::create(&strings_tmp)?),
+            offsets_w:   BufWriter::new(File::create(&offsets_tmp)?),
+            strings_tmp,
+            offsets_tmp,
+            byte_pos: 24, // header occupies bytes 0..24
+            count: 0,
+        })
+    }
+
+    /// Record that `string` has global dictionary ID `global_id`.
+    ///
+    /// Must be called in lexicographic order (the same order the dict scanner
+    /// yields strings, which is ascending lex order).
+    #[inline]
+    pub fn add(&mut self, global_id: u64, string: &str) -> io::Result<()> {
+        let b = string.as_bytes();
+        // Offsets file: one u64 per entry, pointing to entry's start in strings section.
+        self.offsets_w.write_all(&self.byte_pos.to_le_bytes())?;
+        // Strings file: [global_id: u64][len: u32][bytes].
+        self.strings_w.write_all(&global_id.to_le_bytes())?;
+        self.strings_w.write_all(&(b.len() as u32).to_le_bytes())?;
+        self.strings_w.write_all(b)?;
+        self.byte_pos += 8 + 4 + b.len() as u64;
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Flush temporary files and assemble the final `local_dict.bin` at `out_path`.
+    ///
+    /// Returns the number of entries written.
+    pub fn finish(mut self, out_path: &Path) -> io::Result<u64> {
+        self.strings_w.flush()?;
+        self.offsets_w.flush()?;
+        drop(self.strings_w);
+        drop(self.offsets_w);
+
+        let offsets_start = self.byte_pos;
+        let count = self.count;
+
+        // Assemble: header + strings section + offsets section.
+        {
+            let mut out = BufWriter::new(File::create(out_path)?);
+            out.write_all(LOCAL_DICT_MAGIC)?;
+            out.write_all(&count.to_le_bytes())?;
+            out.write_all(&offsets_start.to_le_bytes())?;
+            let mut sf = File::open(&self.strings_tmp)?;
+            io::copy(&mut sf, &mut out)?;
+            let mut of = File::open(&self.offsets_tmp)?;
+            io::copy(&mut of, &mut out)?;
+            out.flush()?;
+        }
+
+        let _ = fs::remove_file(&self.strings_tmp);
+        let _ = fs::remove_file(&self.offsets_tmp);
+        Ok(count)
+    }
+}
+
+/// Memory-mapped per-file sub-dictionary for streaming Phase 2b.
+///
+/// Supports O(log N) string → global-ID lookup via binary search over the
+/// mmap-ed offsets section.  Built by [`LocalDictBuilder`] during the join step.
+///
+/// Unlike [`ReadonlyDict`] (which assigns IDs by sorted position), `LocalDict`
+/// stores the actual global dictionary IDs inline in each entry.
+pub struct LocalDict {
+    mmap:          Mmap,
+    count:         u64,
+    offsets_start: usize,
+}
+
+impl LocalDict {
+    /// Open a `local_dict.bin` file produced by [`LocalDictBuilder::finish`].
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        if mmap.len() < 24 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData, "local_dict.bin too small"));
+        }
+        if &mmap[..8] != LOCAL_DICT_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "local_dict.bin: invalid magic bytes (expected ELOC0001)"));
+        }
+        let count         = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
+        let offsets_start = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
+        Ok(Self { mmap, count, offsets_start })
+    }
+
+    /// Look up a string and return its global dictionary ID, or `None` if absent.
+    pub fn get_id(&self, s: &str) -> Option<u64> {
+        if self.count == 0 { return None; }
+        let mut lo: u64 = 0;
+        let mut hi: u64 = self.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (global_id, entry_str) = self.entry_at(mid);
+            match entry_str.cmp(s) {
+                std::cmp::Ordering::Equal   => return Some(global_id),
+                std::cmp::Ordering::Less    => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        None
+    }
+
+    fn entry_at(&self, id: u64) -> (u64, &str) {
+        let off_pos = self.offsets_start + id as usize * 8;
+        let off = u64::from_le_bytes(
+            self.mmap[off_pos..off_pos + 8].try_into().unwrap()
+        ) as usize;
+        let global_id = u64::from_le_bytes(self.mmap[off..off + 8].try_into().unwrap());
+        let len       = u32::from_le_bytes(self.mmap[off + 8..off + 12].try_into().unwrap()) as usize;
+        let s = std::str::from_utf8(&self.mmap[off + 12..off + 12 + len])
+            .expect("local_dict.bin contains invalid UTF-8");
+        (global_id, s)
     }
 }
 

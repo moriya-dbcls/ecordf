@@ -13,14 +13,14 @@
 //! (e.g. `foo.nt.gz`) before falling back to the last extension alone (`foo.gz`).
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
+use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use rustc_hash::FxHashMap;
-
 use crate::dict::Dictionary;
+use crate::dict_builder::{DictBuilder, DictScanner, LocalDict, LocalDictBuilder};
 use crate::index::AllBuilders;
 use crate::triple::{Quad, Triple};
 
