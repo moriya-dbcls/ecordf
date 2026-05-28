@@ -809,94 +809,134 @@ impl<'a> Executor<'a> {
 
     // ── Bind-join (index nested-loop join) ────────────────────────────────────
 
-    /// For each row in `left`, re-execute `right_plan` with variables from that
-    /// row substituted as constants (targeted index probes).  Then hash-join the
-    /// partial right result with the single left row.
+    /// For each *unique binding* seen in `left` that is actually referenced by
+    /// `right_plan`, execute `right_plan` once and distribute the results across
+    /// all left rows that share that binding.
     ///
-    /// This is O(|left| × probe_cost) vs hash_join's O(|left| + |right|), so it
-    /// is dramatically better when |right| is large but the probe produces few rows.
+    /// ## Why this matters
+    ///
+    /// Naively executing right_plan once per left row causes redundant work
+    /// whenever two left rows produce the same substitution for the variables
+    /// right_plan actually uses.  The classic case is an independent join branch:
+    ///
+    /// ```text
+    /// left = [(?protein=P, ?tax=T1),   ← same ?protein, different ?tax
+    ///         (?protein=P, ?tax=T2),
+    ///         (?protein=P, ?tax=T3)]
+    /// right_plan = ?protein jpo:hasPeptideEvidence ?pepevi … (100 rows)
+    /// ```
+    ///
+    /// `?tax` is irrelevant to right_plan.  Without deduplication, right_plan
+    /// runs 3 times and produces 300 rows (3 × 100).  With deduplication it
+    /// runs once and still produces 300 rows — but at 1/3 the work.
+    ///
+    /// ## Algorithm
+    ///
+    /// 1. Identify which left variables right_plan actually references
+    ///    (`plan_referenced_vars`).
+    /// 2. Group left rows by their values at those positions.
+    /// 3. For each group: execute right_plan once with the shared binding,
+    ///    then cross-join the result with every left row in the group.
     fn bind_join(&self, left: ResultSet, right_plan: &ExecutionPlan, outer: &Binding) -> ResultSet {
-        // Determine output variable set (union of left and right, discovered lazily)
-        let mut out_vars: Vec<String> = left.variables.clone();
-        let mut result = ResultSet::empty(out_vars.clone()); // will be grown below
+        // Variables that right_plan will substitute from the outer context.
+        let right_refs = plan_referenced_vars(right_plan);
 
-        for left_row in &left.rows {
-            // Build a binding from this left row + outer context
+        // Indices (and names) of left variables that right_plan actually needs.
+        let needed: Vec<(usize, String)> = left.variables.iter().enumerate()
+            .filter(|(_, v)| right_refs.contains(v.as_str()))
+            .map(|(i, v)| (i, v.clone()))
+            .collect();
+
+        // Group left rows by the binding key right_plan actually uses.
+        // Insertion-order Vec preserves output row order.
+        let mut key_to_group: HashMap<Vec<Option<TermId>>, usize> = HashMap::new();
+        let mut groups: Vec<(Vec<Option<TermId>>, Vec<usize>)> = Vec::new();
+        for (row_idx, row) in left.rows.iter().enumerate() {
+            let key: Vec<Option<TermId>> = needed.iter()
+                .map(|(i, _)| row.get(*i).copied().flatten())
+                .collect();
+            let g = *key_to_group.entry(key.clone()).or_insert_with(|| {
+                let id = groups.len();
+                groups.push((key, Vec::new()));
+                id
+            });
+            groups[g].1.push(row_idx);
+        }
+
+        let mut out_vars: Vec<String> = left.variables.clone();
+        let mut result = ResultSet::empty(out_vars.clone());
+
+        for (key, row_indices) in &groups {
+            // Build binding: outer context + the needed left variables for this group.
             let mut row_binding = outer.clone();
-            for (i, var) in left.variables.iter().enumerate() {
-                if let Some(Some(id)) = left_row.get(i) {
-                    row_binding.insert(var.clone(), *id);
+            for (key_pos, (left_idx, var_name)) in needed.iter().enumerate() {
+                if let Some(id) = key.get(key_pos).copied().flatten() {
+                    row_binding.insert(var_name.clone(), id);
                 }
+                let _ = left_idx; // used via key indexing above
             }
 
-            // Execute right plan with this row's bindings substituted
+            // Execute right plan ONCE for this unique binding.
             let right_rs = self.execute_plan_with_ctx(right_plan, &row_binding);
-            // Note: even if right_rs overflowed, we still process its partial rows
-            // before returning, so the error message shows a meaningful row count.
             let right_overflow = right_rs.overflow;
 
-            // Merge output variable schema on first non-empty right result
+            // Expand output schema on first non-empty right result.
             for rv in &right_rs.variables {
-                if !out_vars.contains(rv) {
-                    out_vars.push(rv.clone());
-                }
+                if !out_vars.contains(rv) { out_vars.push(rv.clone()); }
             }
-            // Grow result schema if needed
             if result.variables.len() < out_vars.len() {
                 result.variables = out_vars.clone();
-                // Pad existing rows
                 let new_len = out_vars.len();
-                for row in &mut result.rows {
-                    row.resize(new_len, None);
-                }
+                for row in &mut result.rows { row.resize(new_len, None); }
             }
 
             let out_len = result.variables.len();
+
             if right_rs.rows.is_empty() {
-                // No match for this left row → skip (inner join semantics)
+                // No match for any row in this group → inner join semantics: skip all.
+                if right_overflow { result.overflow = true; return result; }
                 continue;
             }
-            for right_row in &right_rs.rows {
-                let mut row = vec![None; out_len];
-                // Fill from left
-                for (li, lv) in left.variables.iter().enumerate() {
-                    if let Some(oi) = result.variable_index(lv) {
-                        row[oi] = *left_row.get(li).unwrap_or(&None);
-                    }
-                }
-                // Fill from right — and check consistency on shared variables.
-                //
-                // Normally, ScanAst-based right plans substitute bound variables as
-                // constants (targeted index probes), so they can only return rows that
-                // already agree with the left row.  But for plans that ignore the outer
-                // binding (e.g. Subquery, Values), the right side may return rows with
-                // conflicting values for shared variables.  We must skip those rows to
-                // maintain correct inner-join semantics.
-                let mut consistent = true;
-                for (ri, rv) in right_rs.variables.iter().enumerate() {
-                    if let Some(oi) = result.variable_index(rv) {
-                        let right_val = *right_row.get(ri).unwrap_or(&None);
-                        match (row[oi], right_val) {
-                            // Conflict: both sides have different concrete values → skip row
-                            (Some(l), Some(r)) if l != r => { consistent = false; break; }
-                            // Right fills an empty slot
-                            (None, rv) => { row[oi] = rv; }
-                            // Both None, or both same value → no-op
-                            _ => {}
+
+            // Distribute right results across all left rows in this group.
+            for &row_idx in row_indices {
+                let left_row = &left.rows[row_idx];
+                for right_row in &right_rs.rows {
+                    let mut row = vec![None; out_len];
+                    // Fill from left.
+                    for (li, lv) in left.variables.iter().enumerate() {
+                        if let Some(oi) = result.variable_index(lv) {
+                            row[oi] = left_row.get(li).copied().flatten();
                         }
                     }
-                }
-                if !consistent { continue; }
-                result.rows.push(row);
-                if result.rows.len() >= self.config.max_intermediate_rows {
-                    tracing::warn!(
-                        rows = result.rows.len(),
-                        "bind_join: intermediate result exceeded limit, truncating"
-                    );
-                    result.overflow = true;
-                    return result;
+                    // Fill from right — skip inconsistent rows (plan-binding mismatch).
+                    //
+                    // With ScanAst-based plans, right can only return rows consistent
+                    // with the substituted binding, so this check is mostly a guard.
+                    let mut consistent = true;
+                    for (ri, rv) in right_rs.variables.iter().enumerate() {
+                        if let Some(oi) = result.variable_index(rv) {
+                            let rv_val = right_row.get(ri).copied().flatten();
+                            match (row[oi], rv_val) {
+                                (Some(l), Some(r)) if l != r => { consistent = false; break; }
+                                (None, v) => { row[oi] = v; }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if !consistent { continue; }
+                    result.rows.push(row);
+                    if result.rows.len() >= self.config.max_intermediate_rows {
+                        tracing::warn!(
+                            rows = result.rows.len(),
+                            "bind_join: intermediate result exceeded limit, truncating"
+                        );
+                        result.overflow = true;
+                        return result;
+                    }
                 }
             }
+
             if right_overflow {
                 result.overflow = true;
                 return result;
@@ -2295,6 +2335,47 @@ fn plan_needs_outer_binding(plan: &ExecutionPlan, left_vars: &[String]) -> bool 
         // Subquery and Values are self-contained — they never look at left_vars.
         ExecutionPlan::Subquery(_) | ExecutionPlan::Values(_) => false,
         _ => false,
+    }
+}
+
+/// Collect all variable names referenced by `plan` — i.e. variables that would
+/// be substituted as constants when the plan is executed inside a bind-join
+/// context (via `execute_plan_with_ctx`).  Used by `bind_join` to group left
+/// rows by the subset of bindings that actually affect the right plan, so each
+/// unique binding is executed only once rather than once per left row.
+fn plan_referenced_vars(plan: &ExecutionPlan) -> HashSet<String> {
+    let mut vars = HashSet::new();
+    collect_referenced_vars(plan, &mut vars);
+    vars
+}
+
+fn collect_referenced_vars(plan: &ExecutionPlan, out: &mut HashSet<String>) {
+    match plan {
+        ExecutionPlan::ScanAst(p) => {
+            for t in [&p.s, &p.p, &p.o] {
+                match t {
+                    Term::Variable(v) => { out.insert(v.clone()); }
+                    Term::BlankNode(b) => { out.insert(b.clone()); }
+                    _ => {}
+                }
+            }
+        }
+        ExecutionPlan::Join(l, r)
+        | ExecutionPlan::Optional(l, r)
+        | ExecutionPlan::Union(l, r) => {
+            collect_referenced_vars(l, out);
+            collect_referenced_vars(r, out);
+        }
+        ExecutionPlan::Filter(inner, _) | ExecutionPlan::Extend(inner, _, _) => {
+            collect_referenced_vars(inner, out);
+        }
+        ExecutionPlan::PathPattern { s, o, .. } => {
+            if let Term::Variable(v) = s { out.insert(v.clone()); }
+            if let Term::Variable(v) = o { out.insert(v.clone()); }
+        }
+        ExecutionPlan::NamedGraph { inner, .. } => collect_referenced_vars(inner, out),
+        // Subquery and Values are self-contained — they do not reference outer variables.
+        _ => {}
     }
 }
 
