@@ -20,7 +20,8 @@ name = "ecordf"
 path = "src/lib.rs"
 
 [dependencies]
-# Memory-mapped file I/O — the key to beating Qlever's memory usage
+# Memory-mapped file I/O — the key to beating Qlever's memory usage.
+# Advice::WillNeed (madvise) is used to pipeline disk I/O with CPU work.
 memmap2 = "0.9"
 
 # Async HTTP server for SPARQL 1.1 Protocol endpoint

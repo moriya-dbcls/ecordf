@@ -31,7 +31,7 @@
 //! offset 16: data    [u32; count*3]  in sorted order
 //! ```
 
-use memmap2::Mmap;
+use memmap2::{Advice, Mmap};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::{File, OpenOptions};
@@ -61,10 +61,11 @@ const SKIP_HDR: usize = 24; // 8 + 4 + 4 + 8
 
 /// One skip anchor every SKIP_STRIDE entries in c0.
 ///
-/// At 3 B triples: ~732 K anchors × 8 B ≈ 5.9 MB per index (17.7 MB total).
-/// After narrowing the range is ≤ SKIP_STRIDE entries = 32 KB of contiguous c0 —
-/// the OS reads that in 1-2 sequential I/Os instead of ~31 random seeks.
-const SKIP_STRIDE: usize = 4096;
+/// At 3 B triples: ~5.86 M anchors × 8 B ≈ 46.9 MB per index (140 MB total).
+/// After narrowing the range is exactly SKIP_STRIDE entries = 4 KB = 1 OS page.
+/// The binary search after narrow() runs entirely within that single page —
+/// 1 page fault per cold search vs ~31 without the skip index.
+const SKIP_STRIDE: usize = 512;
 
 // ── Helper: derive the three column paths from a base index path ──────────────
 //
@@ -101,15 +102,16 @@ fn skip_path_from_c0(c0: &Path) -> PathBuf {
 /// Sparse in-memory index over the primary-key column (c0) of a columnar index.
 ///
 /// Stores one anchor value per `SKIP_STRIDE` entries: `anchors[i] = c0[i × SKIP_STRIDE]`.
-/// Because the anchor array is small it stays hot in CPU cache; `narrow()` costs
-/// ~20 cache-resident comparisons and then returns a ≤ SKIP_STRIDE-entry range —
-/// at most 32 KB of *contiguous* c0 data that the OS can read in one I/O.
+/// With SKIP_STRIDE = 512 the anchor array for 3 B triples is ~5.86 M entries × 8 B ≈ 47 MB,
+/// which stays hot in CPU cache; `narrow()` costs ~23 cache-resident comparisons and
+/// returns a ≤ 512-entry range — exactly 4 KB = 1 OS page of *contiguous* c0 data.
 ///
-/// ## I/O improvement (3 B triples, 22 GiB c0 file)
+/// ## I/O improvement (3 B triples, 22 GiB c0 file, SKIP_STRIDE = 512)
 ///
 /// Before: `lower_bound_0` does log₂(3 × 10⁹) ≈ 31 random page faults.
-/// After:  `narrow()` in hot RAM → binary search over ≤ 4096 contiguous entries
-///         → 1–2 sequential I/Os (often zero when pages are already cached).
+/// After:  `narrow()` in hot RAM → `prefetch_c0` fires async MADV_WILLNEED on 4 KB →
+///         binary search over 512 entries fits in the 1 resident page →
+///         **1 page fault per cold search** (physical minimum without loading c0 into RAM).
 struct SkipIndex {
     /// `anchors[i] == c0[i * SKIP_STRIDE]`
     anchors: Vec<u64>,
@@ -194,8 +196,9 @@ impl SkipIndex {
     /// Return the narrowed `[lo, hi)` range that is guaranteed to contain the
     /// position `lower_bound(key)` in c0.
     ///
-    /// The range spans at most `SKIP_STRIDE + 1` contiguous entries — 32 KB of
-    /// c0 data that the OS can load in a single sequential I/O.
+    /// The range spans at most `SKIP_STRIDE + 1` contiguous entries — 4 KB (1 OS
+    /// page) with SKIP_STRIDE = 512.  A single `prefetch_c0` hint on this range
+    /// is enough to load the entire binary search window in one disk I/O.
     #[inline]
     fn narrow(&self, key: u64) -> (usize, usize) {
         if self.anchors.is_empty() {
@@ -768,6 +771,35 @@ impl IndexFile {
     pub fn len(&self) -> usize { self.count }
     pub fn is_empty(&self) -> bool { self.count == 0 }
 
+    // ── Async prefetch ────────────────────────────────────────────────────────
+
+    /// Non-blocking hint to the OS to prefetch the c0 pages covering entry
+    /// range `[lo, hi)` into the page cache.
+    ///
+    /// Called immediately after `narrow()` so that while the CPU performs the
+    /// binary search on already-hot skip-index anchors, the kernel can pipeline
+    /// the disk read for the target 4 KB page.
+    ///
+    /// No-op for interleaved format, empty ranges, and already-resident pages
+    /// (the OS just notes the hint and returns immediately in those cases).
+    /// On non-Unix platforms `Advice::WillNeed` is a no-op in memmap2.
+    #[inline]
+    fn prefetch_c0(&self, lo: usize, hi: usize) {
+        if lo >= hi {
+            return;
+        }
+        if let IndexStorage::Columnar { mmaps, .. } = &self.storage {
+            let byte_start = HEADER_SIZE + lo * COL_VALUE_BYTES;
+            let byte_end   = HEADER_SIZE + hi * COL_VALUE_BYTES;
+            // Page-align downward so madvise gets a valid aligned address.
+            const PAGE: usize = 4096;
+            let aligned_start = (byte_start / PAGE) * PAGE;
+            let len = byte_end.saturating_sub(aligned_start);
+            // Ignore errors — this is a best-effort performance hint.
+            let _ = mmaps[0].advise_range(Advice::WillNeed, aligned_start, len);
+        }
+    }
+
     // ── Column accessors ──────────────────────────────────────────────────────
     //
     // Three granularities let callers load only the columns they need:
@@ -852,13 +884,15 @@ impl IndexFile {
 
     /// First position where `col0 >= key`.  Reads only column 0.
     ///
-    /// Uses the skip index (if available) to narrow the binary search to a
-    /// ≤ SKIP_STRIDE-entry, ≤ 32 KB contiguous slice of c0 before searching.
+    /// Uses the skip index to narrow the binary search to exactly 1 OS page
+    /// (SKIP_STRIDE = 512 entries = 4 KB), then fires a non-blocking prefetch
+    /// so the kernel pipelines the disk read while the CPU works.
     fn lower_bound_0(&self, key: u64) -> usize {
         let (mut lo, mut hi) = match &self.skip {
             Some(s) => s.narrow(key),
             None    => (0, self.count),
         };
+        self.prefetch_c0(lo, hi);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             if self.get_col0(mid) < key { lo = mid + 1; } else { hi = mid; }
@@ -868,13 +902,14 @@ impl IndexFile {
 
     /// First position where `(col0, col1) >= (k0, k1)`.  Reads columns 0 and 1.
     ///
-    /// Narrows by `k0` using the skip index first (sort order ensures all
-    /// positions with col0 < k0 are before the narrow range).
+    /// Narrows by `k0` using the skip index, fires a prefetch on the target
+    /// c0 page, then binary-searches the narrow range with both columns.
     fn lower_bound_01(&self, k0: u64, k1: u64) -> usize {
         let (mut lo, mut hi) = match &self.skip {
             Some(s) => s.narrow(k0),
             None    => (0, self.count),
         };
+        self.prefetch_c0(lo, hi);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let (c0, c1) = self.get_col01(mid);
@@ -960,6 +995,9 @@ impl IndexFile {
         if let Some(ref s) = self.skip {
             // ── Skip-index path ───────────────────────────────────────────────
             let (slo, shi) = s.narrow(target);
+            // Fire a non-blocking prefetch on the target c0 page so the kernel
+            // can pipeline the disk read while we finish the anchor search.
+            self.prefetch_c0(slo, shi);
             // Never regress below `from + 1` (current position is already < target).
             let (mut a, mut b) = (slo.max(from + 1), shi);
             while a < b {

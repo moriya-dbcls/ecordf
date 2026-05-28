@@ -63,10 +63,19 @@ const SORTED_MAGIC: &[u8; 8] = b"ESRT0001";
 const MAX_FAN_IN: usize = 64;
 
 /// Strings in the hot cache after this many entries, new entries are dropped.
-/// At ~88 bytes per entry (key Box<str> + value u64 + HashMap overhead) this
-/// caps the cache at roughly 352 MB, while covering all predicates and most
-/// common objects in typical bio-RDF datasets.
-const MAX_CACHE_ENTRIES: usize = 4_000_000;
+///
+/// Memory cost per entry: ~88 bytes (Box<str> key + u64 value + FxHashMap overhead).
+///
+/// | Entries    | RAM    | Notes                                              |
+/// |------------|--------|----------------------------------------------------|
+/// | 4_000_000  | ~352 MB | original default                                  |
+/// | 20_000_000 | ~1.7 GB | covers ~all predicates + hot subjects/objects      |
+///
+/// At 20 M entries, virtually all repeated IRI lookups during query execution
+/// hit the cache, eliminating binary-search page faults in dict_sorted.bin for
+/// hot terms.  The remaining misses (rare literals, long-tail IRIs) still fall
+/// back to the mmap binary search.
+const MAX_CACHE_ENTRIES: usize = 20_000_000;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // DictBuilder — Phase 1
@@ -521,8 +530,9 @@ fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
 /// log₂(N) pivots accessed during binary search quickly become hot in the
 /// OS page cache, so amortised lookup cost is low even for large dictionaries.
 ///
-/// A bounded in-memory hot cache avoids repeated binary searches for
-/// high-frequency terms such as predicates and `rdf:type` objects.
+/// A bounded in-memory hot cache (up to `MAX_CACHE_ENTRIES` ≈ 20 M entries,
+/// ~1.7 GB) avoids repeated binary searches for high-frequency terms such as
+/// predicates, common subjects, and `rdf:type` objects.
 pub struct ReadonlyDict {
     mmap: Mmap,
     count: u64,
