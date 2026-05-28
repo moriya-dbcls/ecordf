@@ -500,6 +500,54 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+
+            // ScanBound: constants were pre-encoded at plan-compile time.
+            // Runtime work is O(|outer_vars|) hash lookups — no dictionary scan.
+            ExecutionPlan::ScanBound { base, free_vars, outer_vars } => {
+                let mut pattern = *base;
+                let mut outer_additions: Vec<(String, TermId)> = Vec::new();
+
+                for (var, pos) in outer_vars {
+                    if let Some(&id) = outer.get(var.as_str()) {
+                        match pos {
+                            0 => pattern.s = id,
+                            1 => pattern.p = id,
+                            _ => pattern.o = id,
+                        }
+                        outer_additions.push((var.clone(), id));
+                    }
+                    // If var is absent from outer (e.g. hash_join context with empty outer),
+                    // the position stays UNBOUND → wildcard scan.  Correctness is preserved
+                    // because the enclosing hash_join will filter incompatible rows.
+                }
+
+                let scan_rs = self.execute_scan(&pattern, free_vars);
+
+                if outer_additions.is_empty() {
+                    scan_rs
+                } else {
+                    // Re-inject outer-bound variables so subsequent joins can match on them.
+                    let mut all_vars = scan_rs.variables.clone();
+                    let mut to_add: Vec<(String, TermId)> = Vec::new();
+                    for (var, id) in &outer_additions {
+                        if !all_vars.contains(var) {
+                            all_vars.push(var.clone());
+                            to_add.push((var.clone(), *id));
+                        }
+                    }
+                    if to_add.is_empty() {
+                        scan_rs
+                    } else {
+                        let mut out_rs = ResultSet::empty(all_vars);
+                        out_rs.overflow = scan_rs.overflow;
+                        for mut row in scan_rs.rows {
+                            for (_, id) in &to_add { row.push(Some(*id)); }
+                            out_rs.rows.push(row);
+                        }
+                        out_rs
+                    }
+                }
+            }
         }
     }
 
@@ -1593,6 +1641,22 @@ impl<'a> Executor<'a> {
                 }
                 rs
             }
+            // ScanBound inside GRAPH: outer_vars are unsubstituted (no outer context
+            // here), so those positions stay UNBOUND (wildcard).  Correctness is
+            // maintained by the enclosing hash_join that will filter the rows.
+            ExecutionPlan::ScanBound { base, free_vars, outer_vars: _ } => {
+                let pattern = *base;
+                let mut rs = ResultSet::empty(free_vars.iter().map(|(n, _)| n.clone()).collect());
+                for triple in gspo.scan_graph(g_id, &pattern) {
+                    let mut row = vec![None; free_vars.len()];
+                    for (i, (_, pos)) in free_vars.iter().enumerate() {
+                        row[i] = Some(match pos { 0 => triple.s, 1 => triple.p, _ => triple.o });
+                    }
+                    rs.rows.push(row);
+                }
+                rs
+            }
+
             // Delegate everything else to the normal executor.
             _ => self.execute_plan(plan),
         }
@@ -1635,6 +1699,11 @@ impl<'a> Executor<'a> {
                     if let Term::Variable(v) = t {
                         if !out.contains(v) { out.push(v.clone()); }
                     }
+                }
+            }
+            ExecutionPlan::ScanBound { free_vars, outer_vars, .. } => {
+                for (v, _) in free_vars.iter().chain(outer_vars.iter()) {
+                    if !out.contains(v) { out.push(v.clone()); }
                 }
             }
             ExecutionPlan::Join(l, r) | ExecutionPlan::Optional(l, r)
@@ -2236,52 +2305,168 @@ fn optimize_triple_patterns(
     stats: Option<&StoreStatistics>,
     initially_bound: &HashSet<String>,
 ) -> ExecutionPlan {
-    // Greedy join ordering driven by cardinality estimation:
-    //   At each step pick the remaining pattern with the lowest estimated result
-    //   count given the variables already bound by previously selected patterns.
+    // ── Phase 1: Greedy join ordering ─────────────────────────────────────────
+    //
+    // At each step pick the remaining pattern with the lowest estimated result
+    // count, subject to the **connected-component constraint**:
+    //
+    //   If any remaining pattern shares at least one variable with the already-
+    //   bound set, only those connected patterns are considered.  This prevents
+    //   Cartesian products — a disconnected pattern is never chosen while a
+    //   connected one exists, regardless of their absolute cardinalities.
+    //
+    // Within the connected candidates the most selective pattern wins.
+    // When no pattern shares a variable with `bound` (first step, or genuinely
+    // disjoint groups), all candidates are considered globally.
     //
     // Estimation priority (see `estimate_pattern_cardinality`):
-    //   1. Index probe for constant positions (O(log N), always used)
-    //   2. Predicate-fanout statistics for variable positions (when stats.bin exists)
-    //   3. Bound-variable discount: each already-bound variable reduces the estimate
-    //      by ×1/100 to reflect runtime substitution.
-    //
-    // "bound" starts with variables provided by the outer context (e.g. VALUES),
-    // then grows as each pattern is selected and contributes its own variables.
+    //   1. Index binary-search range count for constant positions (always used)
+    //   2. Predicate-fanout statistics for ?-position cardinality (needs stats.bin)
+    //   3. Bound-variable discount ×1/100 for each already-bound variable position
 
     let mut remaining: Vec<&TriplePatternAst> = triples.iter().collect();
     let mut bound = initially_bound.clone();
     let mut ordered: Vec<&TriplePatternAst> = Vec::with_capacity(triples.len());
 
     while !remaining.is_empty() {
-        // Pick the pattern with the smallest estimated cardinality.
-        // `min_by_key` returns the *first* minimum on ties, preserving the original
-        // parse order for equally-estimated patterns (stable, no random tie-breaking).
+        // Connected-component constraint: prefer patterns sharing a variable with
+        // already-bound variables to avoid premature cross products.
+        let any_connected = !bound.is_empty()
+            && remaining.iter().any(|t| shares_var_with_bound(t, &bound));
+
         let best_idx = remaining.iter().enumerate()
+            .filter(|(_, t)| !any_connected || shares_var_with_bound(t, &bound))
             .min_by_key(|(_, t)| estimate_pattern_cardinality(t, &bound, index, dict, stats))
             .map(|(i, _)| i)
-            .unwrap();
+            .unwrap(); // safe: remaining is non-empty
 
         let best = remaining.remove(best_idx);
-        // Add variables (and any residual blank-node terms) to the bound set.
-        let add_var = |t: &Term, bound: &mut HashSet<String>| {
-            match t {
-                Term::Variable(v) => { bound.insert(v.clone()); }
-                Term::BlankNode(b) => { bound.insert(b.clone()); }
+        // Extend bound with all variables introduced by the chosen pattern.
+        for term in [&best.s, &best.p, &best.o] {
+            match term {
+                Term::Variable(v) | Term::BlankNode(v) => { bound.insert(v.clone()); }
                 _ => {}
             }
-        };
-        add_var(&best.s, &mut bound);
-        add_var(&best.p, &mut bound);
-        add_var(&best.o, &mut bound);
+        }
         ordered.push(best);
     }
 
-    // Build a left-deep join tree.
-    let first = ExecutionPlan::ScanAst(ordered[0].clone());
-    ordered[1..].iter().fold(first, |acc, pat| {
-        ExecutionPlan::Join(Box::new(acc), Box::new(ExecutionPlan::ScanAst((*pat).clone())))
+    // ── Phase 2: Build a left-deep plan tree with pre-encoded scan nodes ──────
+    //
+    // Re-derive `current_bound` from `initially_bound`, growing it pattern by
+    // pattern.  `pattern_to_scan_plan` uses it to partition each pattern's
+    // variables into `free_vars` (output columns) and `outer_vars` (positions
+    // that will be substituted from the bind-join context at runtime).
+    //
+    // Result: `ScanBound` nodes whose `base` already holds pre-encoded TermIds
+    // for constants — zero dictionary lookups in the execution inner loop.
+
+    let mut current_bound = initially_bound.clone();
+    let mut plan_opt: Option<ExecutionPlan> = None;
+
+    for pat in &ordered {
+        let scan = pattern_to_scan_plan(pat, dict, &current_bound);
+        // Extend current_bound for the next pattern.
+        for term in [&pat.s, &pat.p, &pat.o] {
+            match term {
+                Term::Variable(v) | Term::BlankNode(v) => { current_bound.insert(v.clone()); }
+                _ => {}
+            }
+        }
+        plan_opt = Some(match plan_opt {
+            None => scan,
+            Some(acc) => ExecutionPlan::Join(Box::new(acc), Box::new(scan)),
+        });
+    }
+
+    plan_opt.unwrap_or(ExecutionPlan::Empty)
+}
+
+/// Returns true if at least one variable or blank-node in `t` appears in `bound`.
+/// Used by the connected-component constraint in `optimize_triple_patterns`.
+fn shares_var_with_bound(t: &TriplePatternAst, bound: &HashSet<String>) -> bool {
+    [&t.s, &t.p, &t.o].iter().any(|term| match term {
+        Term::Variable(v) | Term::BlankNode(v) => bound.contains(v.as_str()),
+        _ => false,
     })
+}
+
+/// Compile one triple-pattern AST node into a pre-encoded scan plan.
+///
+/// - Constant IRIs and literals are looked up in the dictionary **once** at
+///   plan-compile time and stored as TermIds in `base`.
+/// - Variables listed in `bound` (already bound by earlier patterns or VALUES)
+///   are placed in `outer_vars`; they will be substituted from the outer
+///   `Binding` at execution time — no dictionary lookup needed.
+/// - Variables not in `bound` go into `free_vars` (output columns, UNBOUND
+///   wildcard positions in `base`).
+///
+/// Returns:
+///   `Scan`      — all constants encoded, no outer substitution needed.
+///   `ScanBound` — some positions need runtime substitution from outer context.
+///   `Values{rows:[]}` — a constant IRI/literal is absent from the dictionary;
+///                        the pattern can never match, so zero rows are produced.
+fn pattern_to_scan_plan(
+    t: &TriplePatternAst,
+    dict: &QueryDict,
+    bound: &HashSet<String>,
+) -> ExecutionPlan {
+    let mut base = TriplePattern { s: UNBOUND, p: UNBOUND, o: UNBOUND };
+    let mut free_vars: Vec<(String, u8)> = Vec::new();
+    let mut outer_vars: Vec<(String, u8)> = Vec::new();
+    let mut missing_constant = false;
+
+    let mut process = |term: &Term, pos: u8| {
+        match term {
+            Term::Variable(v) => {
+                if bound.contains(v.as_str()) {
+                    outer_vars.push((v.clone(), pos));
+                } else {
+                    free_vars.push((v.clone(), pos));
+                }
+            }
+            Term::BlankNode(b) => {
+                // Blank nodes in WHERE patterns behave like anonymous variables.
+                if bound.contains(b.as_str()) {
+                    outer_vars.push((b.clone(), pos));
+                } else {
+                    free_vars.push((b.clone(), pos));
+                }
+            }
+            Term::Iri(iri) => match dict.lookup(iri.as_str()) {
+                Some(id) => match pos { 0 => base.s = id, 1 => base.p = id, _ => base.o = id },
+                None => missing_constant = true,
+            },
+            Term::Literal(lit) => match dict.lookup(&lit.to_ntriples()) {
+                Some(id) => match pos { 0 => base.s = id, 1 => base.p = id, _ => base.o = id },
+                None => missing_constant = true,
+            },
+        }
+    };
+
+    process(&t.s, 0);
+    process(&t.p, 1);
+    process(&t.o, 2);
+    // Drop the closure here to release its mutable borrows on base/free_vars/etc.
+    // Without this explicit drop, the Rust borrow checker would refuse to let us
+    // consume free_vars or move outer_vars in the code below.
+    drop(process);
+
+    if missing_constant {
+        // A constant term is absent from the dictionary — no triple can match.
+        // Return an empty Values (zero rows) with the correct variable schema.
+        return ExecutionPlan::Values(ValuesClause {
+            variables: free_vars.into_iter().map(|(v, _)| v).collect(),
+            rows: vec![],
+        });
+    }
+
+    if outer_vars.is_empty() {
+        // No runtime outer substitution needed → plain pre-encoded Scan.
+        ExecutionPlan::Scan { pattern: base, variables: free_vars }
+    } else {
+        ExecutionPlan::ScanBound { base, free_vars, outer_vars }
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -2323,6 +2508,11 @@ fn plan_needs_outer_binding(plan: &ExecutionPlan, left_vars: &[String]) -> bool 
             };
             has_var(&p.s) || has_var(&p.p) || has_var(&p.o)
         }
+        // ScanBound: outer_vars explicitly lists the variables from the left side
+        // that this scan expects.  Check if any of them appear in left_vars.
+        ExecutionPlan::ScanBound { outer_vars, .. } => {
+            outer_vars.iter().any(|(v, _)| left_vars.contains(v))
+        }
         ExecutionPlan::Join(l, r)
         | ExecutionPlan::Optional(l, r)
         | ExecutionPlan::Union(l, r) => {
@@ -2359,6 +2549,11 @@ fn collect_referenced_vars(plan: &ExecutionPlan, out: &mut HashSet<String>) {
                     _ => {}
                 }
             }
+        }
+        // ScanBound: the variables referenced from the outer context are outer_vars.
+        // free_vars are output variables produced by this scan, not inputs.
+        ExecutionPlan::ScanBound { outer_vars, .. } => {
+            for (v, _) in outer_vars { out.insert(v.clone()); }
         }
         ExecutionPlan::Join(l, r)
         | ExecutionPlan::Optional(l, r)
@@ -2506,6 +2701,7 @@ fn plan_type_name(plan: &ExecutionPlan) -> &'static str {
         ExecutionPlan::Empty           => "Empty",
         ExecutionPlan::Scan { .. }     => "Scan",
         ExecutionPlan::ScanAst(_)      => "ScanAst",
+        ExecutionPlan::ScanBound{..}   => "ScanBound",
         ExecutionPlan::LeapfrogJoin{..}=> "LeapfrogJoin",
         ExecutionPlan::Join(_, _)      => "Join",
         ExecutionPlan::Optional(_, _)  => "Optional",
@@ -2528,6 +2724,16 @@ fn describe_plan(plan: &ExecutionPlan, indent: usize) -> String {
             let pp = match &p.p { Term::Variable(v) => format!("?{}", v), Term::Iri(i) => format!("<{}>", i), _ => format!("{:?}", p.p) };
             let o = match &p.o { Term::Variable(v) => format!("?{}", v), Term::Iri(i) => format!("<{}>", i), _ => format!("{:?}", p.o) };
             format!("{}ScanAst({} {} {})", pad, s, pp, o)
+        }
+        ExecutionPlan::ScanBound { base, free_vars, outer_vars } => {
+            let free = free_vars.iter().map(|(v, p)| format!("?{}@{}", v, p)).collect::<Vec<_>>().join(",");
+            let outer = outer_vars.iter().map(|(v, p)| format!("?{}@{}", v, p)).collect::<Vec<_>>().join(",");
+            format!("{}ScanBound(s={} p={} o={} free=[{}] outer=[{}])",
+                pad,
+                if base.s == UNBOUND { "?".to_string() } else { base.s.to_string() },
+                if base.p == UNBOUND { "?".to_string() } else { base.p.to_string() },
+                if base.o == UNBOUND { "?".to_string() } else { base.o.to_string() },
+                free, outer)
         }
         ExecutionPlan::Join(l, r) => {
             format!("{}Join\n{}\n{}", pad,
