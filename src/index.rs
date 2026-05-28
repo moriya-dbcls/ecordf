@@ -54,6 +54,18 @@ const TRIPLE_BYTES: usize = 24; // 3 × u64
 const COL_MAGIC: &[u8; 8] = b"ECOCOL01";
 const COL_VALUE_BYTES: usize = 8; // one u64 per entry
 
+/// Skip index magic and header size.
+/// File layout: magic(8) + stride(4) + entry_count(4) + total_count(8) + entries[u64…]
+const SKIP_MAGIC: &[u8; 8] = b"ECOSKIP1";
+const SKIP_HDR: usize = 24; // 8 + 4 + 4 + 8
+
+/// One skip anchor every SKIP_STRIDE entries in c0.
+///
+/// At 3 B triples: ~732 K anchors × 8 B ≈ 5.9 MB per index (17.7 MB total).
+/// After narrowing the range is ≤ SKIP_STRIDE entries = 32 KB of contiguous c0 —
+/// the OS reads that in 1-2 sequential I/Os instead of ~31 random seeks.
+const SKIP_STRIDE: usize = 4096;
+
 // ── Helper: derive the three column paths from a base index path ──────────────
 //
 // `col_paths(dir/spo.bin)` → `[dir/spo.c0, dir/spo.c1, dir/spo.c2]`
@@ -70,6 +82,138 @@ fn col_paths(base: &Path) -> [PathBuf; 3] {
         dir.join(format!("{}.c1", stem)),
         dir.join(format!("{}.c2", stem)),
     ]
+}
+
+/// Derive the skip-index path from the c0 column path.
+/// `dir/spo.c0` → `dir/spo.skip`
+fn skip_path_from_c0(c0: &Path) -> PathBuf {
+    let stem = c0
+        .file_stem()
+        .expect("c0 path must have a filename")
+        .to_str()
+        .expect("c0 path must be valid UTF-8");
+    let dir = c0.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!("{}.skip", stem))
+}
+
+// ── Skip index ────────────────────────────────────────────────────────────────
+
+/// Sparse in-memory index over the primary-key column (c0) of a columnar index.
+///
+/// Stores one anchor value per `SKIP_STRIDE` entries: `anchors[i] = c0[i × SKIP_STRIDE]`.
+/// Because the anchor array is small it stays hot in CPU cache; `narrow()` costs
+/// ~20 cache-resident comparisons and then returns a ≤ SKIP_STRIDE-entry range —
+/// at most 32 KB of *contiguous* c0 data that the OS can read in one I/O.
+///
+/// ## I/O improvement (3 B triples, 22 GiB c0 file)
+///
+/// Before: `lower_bound_0` does log₂(3 × 10⁹) ≈ 31 random page faults.
+/// After:  `narrow()` in hot RAM → binary search over ≤ 4096 contiguous entries
+///         → 1–2 sequential I/Os (often zero when pages are already cached).
+struct SkipIndex {
+    /// `anchors[i] == c0[i * SKIP_STRIDE]`
+    anchors: Vec<u64>,
+    /// Total number of entries in the c0 column.
+    count: usize,
+}
+
+impl SkipIndex {
+    /// Build from an in-memory sorted slice of triples.
+    /// Samples c0 (column 0) every `SKIP_STRIDE` rows.
+    fn build_from_triples(triples: &[[u64; 3]]) -> Self {
+        let count = triples.len();
+        let anchors = (0..)
+            .map(|i: usize| i * SKIP_STRIDE)
+            .take_while(|&pos| pos < count)
+            .map(|pos| triples[pos][0])
+            .collect();
+        SkipIndex { anchors, count }
+    }
+
+    /// Build by doing one sequential scan over an already-open c0 mmap.
+    ///
+    /// Called when an existing index was built before skip support was added.
+    /// One sequential pass — OS sequential prefetcher makes this fast.
+    fn build_from_mmap(mmap: &Mmap, count: usize) -> Self {
+        let anchors = (0..)
+            .map(|i: usize| i * SKIP_STRIDE)
+            .take_while(|&pos| pos < count)
+            .map(|pos| {
+                let off = HEADER_SIZE + pos * COL_VALUE_BYTES;
+                u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap())
+            })
+            .collect();
+        SkipIndex { anchors, count }
+    }
+
+    /// Save to a `.skip` file alongside the `.c0` column.
+    fn save(&self, path: &Path) -> io::Result<()> {
+        let f = File::create(path)?;
+        let mut w = BufWriter::new(f);
+        w.write_all(SKIP_MAGIC)?;
+        w.write_all(&(SKIP_STRIDE as u32).to_le_bytes())?;
+        w.write_all(&(self.anchors.len() as u32).to_le_bytes())?;
+        w.write_all(&(self.count as u64).to_le_bytes())?;
+        for &v in &self.anchors {
+            w.write_all(&v.to_le_bytes())?;
+        }
+        w.flush()
+    }
+
+    /// Load from a `.skip` file.
+    fn load(path: &Path) -> io::Result<Self> {
+        let mut buf = Vec::new();
+        File::open(path)?.read_to_end(&mut buf)?;
+        if buf.len() < SKIP_HDR {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "skip file too small"));
+        }
+        if &buf[0..8] != SKIP_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad skip magic"));
+        }
+        let stride = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let n      = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        let count  = u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize;
+        if stride != SKIP_STRIDE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("skip stride mismatch: file={} code={}", stride, SKIP_STRIDE),
+            ));
+        }
+        if buf.len() != SKIP_HDR + n * 8 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "skip file size mismatch"));
+        }
+        let anchors = (0..n)
+            .map(|i| {
+                let off = SKIP_HDR + i * 8;
+                u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+            })
+            .collect();
+        Ok(SkipIndex { anchors, count })
+    }
+
+    /// Return the narrowed `[lo, hi)` range that is guaranteed to contain the
+    /// position `lower_bound(key)` in c0.
+    ///
+    /// The range spans at most `SKIP_STRIDE + 1` contiguous entries — 32 KB of
+    /// c0 data that the OS can load in a single sequential I/O.
+    #[inline]
+    fn narrow(&self, key: u64) -> (usize, usize) {
+        if self.anchors.is_empty() {
+            return (0, self.count);
+        }
+        // `slot` = first anchor index where anchors[slot] >= key.
+        let slot = self.anchors.partition_point(|&a| a < key);
+        // Everything before (slot-1)*SKIP_STRIDE is guaranteed < key (sorted).
+        let lo = slot.saturating_sub(1) * SKIP_STRIDE;
+        let hi = if slot < self.anchors.len() {
+            // anchors[slot] >= key, so lower_bound is at most slot*SKIP_STRIDE.
+            (slot * SKIP_STRIDE + 1).min(self.count)
+        } else {
+            // All anchors < key; lower_bound is somewhere in the tail.
+            self.count
+        };
+        (lo, hi)
+    }
 }
 
 // ── GSPO quad index constants ─────────────────────────────────────────────────
@@ -249,12 +393,13 @@ pub(crate) fn write_index_from_sorted(triples: &[[u64; 3]], path: &Path) -> io::
     w.flush()
 }
 
-/// Write a sorted slice of triples as three columnar files.
+/// Write a sorted slice of triples as three columnar files plus a skip index.
 ///
 /// Given `base_path = dir/spo.bin`, creates:
-///   `dir/spo.c0` — primary-key column (u64 values, count × 8 bytes)
-///   `dir/spo.c1` — secondary-key column
-///   `dir/spo.c2` — tertiary-key column
+///   `dir/spo.c0`   — primary-key column (u64 values, count × 8 bytes)
+///   `dir/spo.c1`   — secondary-key column
+///   `dir/spo.c2`   — tertiary-key column
+///   `dir/spo.skip` — sparse skip index over c0 (built in-memory, no extra I/O)
 ///
 /// Each column file: `magic(8) + count(8) + data[u64 × count]`
 pub(crate) fn write_columnar_from_sorted(triples: &[[u64; 3]], base_path: &Path) -> io::Result<()> {
@@ -270,6 +415,9 @@ pub(crate) fn write_columnar_from_sorted(triples: &[[u64; 3]], base_path: &Path)
         }
         w.flush()?;
     }
+    // Build and save the skip index from in-memory c0 data — zero extra I/O.
+    let skip = SkipIndex::build_from_triples(triples);
+    skip.save(&skip_path_from_c0(&paths[0]))?;
     Ok(())
 }
 
@@ -345,11 +493,16 @@ fn merge_to_columnar_direct(chunks: &[PathBuf], base_path: &Path) -> io::Result<
         }
     }
 
-    // ── Merge with deduplication ──────────────────────────────────────────────
+    // ── Merge with deduplication + skip anchor collection ────────────────────
     let mut count = 0u64;
     let mut prev: Option<[u64; 3]> = None;
+    let mut skip_anchors: Vec<u64> = Vec::new();
     while let Some(Reverse((t, i))) = heap.pop() {
         if Some(t) != prev {
+            // Record one anchor every SKIP_STRIDE deduplicated output rows.
+            if (count as usize) % SKIP_STRIDE == 0 {
+                skip_anchors.push(t[0]);
+            }
             writers[0].write_all(&t[0].to_le_bytes())?;
             writers[1].write_all(&t[1].to_le_bytes())?;
             writers[2].write_all(&t[2].to_le_bytes())?;
@@ -369,6 +522,10 @@ fn merge_to_columnar_direct(chunks: &[PathBuf], base_path: &Path) -> io::Result<
         f.seek(SeekFrom::Start(8))?;
         f.write_all(&count.to_le_bytes())?;
     }
+
+    // ── Write skip index (anchors collected during merge, no extra I/O) ───────
+    let skip = SkipIndex { anchors: skip_anchors, count: count as usize };
+    skip.save(&skip_path_from_c0(&cpaths[0]))?;
 
     Ok(())
 }
@@ -486,6 +643,10 @@ pub struct IndexFile {
     pub kind: IndexKind,
     count:    usize,
     storage:  IndexStorage,
+    /// Sparse in-memory index over c0: narrows binary search from ~31 random
+    /// I/Os to a ≤32 KB contiguous range (1–2 sequential I/Os).
+    /// `None` for legacy interleaved indexes (skip not supported there).
+    skip:     Option<SkipIndex>,
 }
 
 impl IndexFile {
@@ -520,10 +681,12 @@ impl IndexFile {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 format!("index size mismatch: {} vs {}", mmap.len(), expected)));
         }
-        Ok(Self { kind, count, storage: IndexStorage::Interleaved { _file: file, mmap } })
+        Ok(Self { kind, count, storage: IndexStorage::Interleaved { _file: file, mmap }, skip: None })
     }
 
     /// Open three columnar column files (`.c0`, `.c1`, `.c2`).
+    ///
+    /// Also loads (or builds-and-saves) the `.skip` file alongside c0.
     fn open_columnar(paths: &[PathBuf; 3], kind: IndexKind) -> io::Result<Self> {
         let mut count_opt: Option<usize> = None;
         let mut files: Vec<File> = Vec::with_capacity(3);
@@ -558,6 +721,31 @@ impl IndexFile {
         }
 
         let count = count_opt.unwrap_or(0);
+
+        // ── Load or build the skip index while we still own mmaps as a Vec ─────
+        // (mmaps[0] is borrowed here; it will be consumed into the array below.)
+        let skip_p = skip_path_from_c0(&paths[0]);
+        let skip = if skip_p.exists() {
+            match SkipIndex::load(&skip_p) {
+                Ok(s) if s.count == count => {
+                    Some(s) // fast path: valid cached skip file
+                }
+                _ => {
+                    // Stale or corrupt skip file — rebuild from a sequential scan.
+                    let s = SkipIndex::build_from_mmap(&mmaps[0], count);
+                    let _ = s.save(&skip_p); // best-effort; ignore write errors
+                    Some(s)
+                }
+            }
+        } else {
+            // First open after migration from interleaved or pre-skip build.
+            // One sequential pass over c0 — fast due to OS sequential prefetch.
+            eprintln!("  [{:?}] Building skip index (one-time scan of c0)…", kind);
+            let s = SkipIndex::build_from_mmap(&mmaps[0], count);
+            let _ = s.save(&skip_p);
+            Some(s)
+        };
+
         // Convert Vec<T> into [T; 3] — safe because we pushed exactly 3 elements.
         let [f0, f1, f2]: [File; 3] = files.try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "column count != 3"))?;
@@ -571,6 +759,7 @@ impl IndexFile {
                 _files: [f0, f1, f2],
                 mmaps:  [m0, m1, m2],
             },
+            skip,
         })
     }
 
@@ -662,8 +851,14 @@ impl IndexFile {
     // ── Binary search (primary key only) ─────────────────────────────────────
 
     /// First position where `col0 >= key`.  Reads only column 0.
+    ///
+    /// Uses the skip index (if available) to narrow the binary search to a
+    /// ≤ SKIP_STRIDE-entry, ≤ 32 KB contiguous slice of c0 before searching.
     fn lower_bound_0(&self, key: u64) -> usize {
-        let (mut lo, mut hi) = (0, self.count);
+        let (mut lo, mut hi) = match &self.skip {
+            Some(s) => s.narrow(key),
+            None    => (0, self.count),
+        };
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             if self.get_col0(mid) < key { lo = mid + 1; } else { hi = mid; }
@@ -672,8 +867,14 @@ impl IndexFile {
     }
 
     /// First position where `(col0, col1) >= (k0, k1)`.  Reads columns 0 and 1.
+    ///
+    /// Narrows by `k0` using the skip index first (sort order ensures all
+    /// positions with col0 < k0 are before the narrow range).
     fn lower_bound_01(&self, k0: u64, k1: u64) -> usize {
-        let (mut lo, mut hi) = (0, self.count);
+        let (mut lo, mut hi) = match &self.skip {
+            Some(s) => s.narrow(k0),
+            None    => (0, self.count),
+        };
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let (c0, c1) = self.get_col01(mid);
@@ -737,12 +938,16 @@ impl IndexFile {
     /// Seek to the first position where `col0 >= target`.
     /// Returns `(pos, col0_value)`, or `(count, u64::MAX)` when exhausted.
     ///
-    /// Uses **galloping search** — O(log k) where k is the distance from
-    /// `from` to the result, much faster than O(log n) when advances are small
-    /// (the common case inside Leapfrog Triejoin).
+    /// ## Search strategy
     ///
-    /// With columnar storage all probes read only from the `.c0` mmap page,
-    /// keeping `.c1` and `.c2` pages cold during the seek phase.
+    /// **With skip index** (columnar format): `narrow(target)` narrows the
+    /// range to ≤ `SKIP_STRIDE` contiguous entries in one cache-resident step,
+    /// then binary-searches that 32 KB slice.  Handles both small advances
+    /// (same skip block — pages already warm) and large jumps (different block —
+    /// touches only one contiguous 32 KB region instead of ~31 random pages).
+    ///
+    /// **Without skip index** (interleaved legacy): galloping search —
+    /// O(log k) where k is the distance from `from` to the result.
     pub fn seek_0(&self, from: usize, target: u64) -> (usize, u64) {
         if from >= self.count {
             return (self.count, u64::MAX);
@@ -752,13 +957,28 @@ impl IndexFile {
             return (from, cur);
         }
 
-        // Galloping phase: exponential probe until we overshoot.
+        if let Some(ref s) = self.skip {
+            // ── Skip-index path ───────────────────────────────────────────────
+            let (slo, shi) = s.narrow(target);
+            // Never regress below `from + 1` (current position is already < target).
+            let (mut a, mut b) = (slo.max(from + 1), shi);
+            while a < b {
+                let mid = a + (b - a) / 2;
+                if self.get_col0(mid) < target { a = mid + 1; } else { b = mid; }
+            }
+            return if a < self.count {
+                (a, self.get_col0(a))
+            } else {
+                (self.count, u64::MAX)
+            };
+        }
+
+        // ── Galloping path (legacy interleaved, no skip) ──────────────────────
         let mut lo = from;
         let mut step = 1usize;
         loop {
             let probe = lo + step;
             if probe >= self.count || self.get_col0(probe) >= target {
-                // Binary refinement in (lo, min(probe, count)).
                 let hi = probe.min(self.count);
                 let (mut a, mut b) = (lo + 1, hi);
                 while a < b {
