@@ -2096,7 +2096,109 @@ pub fn optimize_bgp(
     dict: &QueryDict,
     stats: Option<&StoreStatistics>,
 ) -> ExecutionPlan {
-    optimize_bgp_with_bound(pattern, index, dict, stats, &HashSet::new())
+    // Normalize first: merge fragmented BGPs so the greedy join-order optimizer
+    // can see all triple patterns in a group as a single unit.
+    let normalized = normalize_graph_pattern(pattern.clone());
+    optimize_bgp_with_bound(&normalized, index, dict, stats, &HashSet::new())
+}
+
+// ── BGP normalization ─────────────────────────────────────────────────────────
+
+/// Extract (triples, filter_exprs) from a sub-tree built *only* from
+/// `Bgp`, `Join`, and `Filter` nodes.  Returns `None` if any other node
+/// type (Optional, Union, Subquery, Values, Extend, …) is encountered,
+/// which prevents unsafe cross-boundary merging.
+fn extract_bgp_with_filters(pat: &GraphPattern)
+    -> Option<(Vec<TriplePatternAst>, Vec<Expression>)>
+{
+    match pat {
+        GraphPattern::Bgp(triples) => Some((triples.clone(), vec![])),
+        GraphPattern::Filter(inner, expr) => {
+            let (triples, mut filters) = extract_bgp_with_filters(inner)?;
+            filters.push(expr.clone());
+            Some((triples, filters))
+        }
+        GraphPattern::Join(l, r) => {
+            let (mut lt, mut lf) = extract_bgp_with_filters(l)?;
+            let (rt, rf)         = extract_bgp_with_filters(r)?;
+            lt.extend(rt);
+            lf.extend(rf);
+            Some((lt, lf))
+        }
+        _ => None,
+    }
+}
+
+/// Try to fuse two already-normalised patterns when both decompose into a
+/// pure (BGP + filters) tree.  Falls back to `Join(l, r)` otherwise.
+fn normalize_join(l: GraphPattern, r: GraphPattern) -> GraphPattern {
+    match (extract_bgp_with_filters(&l), extract_bgp_with_filters(&r)) {
+        (Some((mut lt, mut lf)), Some((rt, rf))) => {
+            // Both sides are pure BGP-or-Filter-over-BGP trees.  Merge triples
+            // and re-wrap with all extracted filter expressions (inner-first).
+            lt.extend(rt);
+            lf.extend(rf);
+            lf.into_iter().fold(
+                GraphPattern::Bgp(lt),
+                |acc, expr| GraphPattern::Filter(Box::new(acc), expr),
+            )
+        }
+        _ => GraphPattern::Join(Box::new(l), Box::new(r)),
+    }
+}
+
+/// Normalise a `GraphPattern` for better BGP join optimisation.
+///
+/// **BGP fusion** — merges adjacent BGPs across `Join` nodes so that
+/// `optimize_triple_patterns` can consider all triple patterns in a group
+/// as a single unit and choose a globally optimal join order:
+///
+/// ```text
+/// Join(Bgp(A), Bgp(B))  →  Bgp(A ++ B)
+/// ```
+///
+/// **Filter lifting** — SPARQL 1.1 §18.2.2.6 specifies that `FILTER`
+/// expressions in a GroupGraphPattern apply to the *whole* group, but the
+/// parser wraps earlier patterns eagerly, producing
+/// `Join(Filter(Bgp(A), e), Bgp(B))` instead of `Filter(Bgp(A ++ B), e)`.
+/// Normalization restores the correct flat form:
+///
+/// ```text
+/// Join(Filter(pure_bgp_tree, e), Bgp(B))  →  Filter(Bgp(A ++ B), e)
+/// Join(Bgp(A), Filter(pure_bgp_tree, e))  →  Filter(Bgp(A ++ B), e)
+/// Join(Filter(T1, e1), Filter(T2, e2))    →  Filter(Filter(Bgp(T1 ++ T2), e1), e2)
+/// ```
+///
+/// The fusion is applied bottom-up and stops at any non-BGP boundary
+/// (`Optional`, `Union`, `Subquery`, `Values`, `Extend`, …) to preserve the
+/// semantics of those constructs.
+pub fn normalize_graph_pattern(pat: GraphPattern) -> GraphPattern {
+    match pat {
+        GraphPattern::Join(l, r) => {
+            let l = normalize_graph_pattern(*l);
+            let r = normalize_graph_pattern(*r);
+            normalize_join(l, r)
+        }
+        GraphPattern::Optional(main, opt) => GraphPattern::Optional(
+            Box::new(normalize_graph_pattern(*main)),
+            Box::new(normalize_graph_pattern(*opt)),
+        ),
+        GraphPattern::Union(a, b) => GraphPattern::Union(
+            Box::new(normalize_graph_pattern(*a)),
+            Box::new(normalize_graph_pattern(*b)),
+        ),
+        GraphPattern::Filter(inner, expr) => {
+            GraphPattern::Filter(Box::new(normalize_graph_pattern(*inner)), expr)
+        }
+        GraphPattern::Extend(inner, expr, var) => {
+            GraphPattern::Extend(Box::new(normalize_graph_pattern(*inner)), expr, var)
+        }
+        GraphPattern::Graph(g, inner) => {
+            GraphPattern::Graph(g, Box::new(normalize_graph_pattern(*inner)))
+        }
+        // Leaf nodes (Bgp, Values, PathPattern, Subquery, Empty): no change.
+        other => other,
+    }
 }
 
 fn optimize_bgp_with_bound(
@@ -2770,5 +2872,172 @@ fn describe_plan(plan: &ExecutionPlan, indent: usize) -> String {
             format!("{}Values({:?})", pad, vc.variables)
         }
         other => format!("{}{}", pad, plan_type_name(other)),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Unit tests — normalize_graph_pattern
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod normalize_tests {
+    use super::*;
+
+    fn var(name: &str) -> Term { Term::Variable(name.to_string()) }
+    fn iri(s: &str) -> Term  { Term::Iri(s.to_string()) }
+
+    fn tp(s: Term, p: Term, o: Term) -> TriplePatternAst {
+        TriplePatternAst { s, p, o }
+    }
+
+    fn bgp(triples: Vec<TriplePatternAst>) -> GraphPattern {
+        GraphPattern::Bgp(triples)
+    }
+
+    fn filter_expr() -> Expression {
+        // A minimal filter expression: ?x != <something>
+        Expression::Ne(
+            Box::new(Expression::Variable("x".to_string())),
+            Box::new(Expression::Iri("http://example.org/x".to_string())),
+        )
+    }
+
+    /// Rule 1: Join(Bgp(A), Bgp(B)) → Bgp(A ++ B)
+    #[test]
+    fn test_fuse_two_bgps() {
+        let a = tp(var("s"), iri("http://ex/p1"), var("o1"));
+        let b = tp(var("s"), iri("http://ex/p2"), var("o2"));
+        let pat = GraphPattern::Join(
+            Box::new(bgp(vec![a.clone()])),
+            Box::new(bgp(vec![b.clone()])),
+        );
+        let result = normalize_graph_pattern(pat);
+        match result {
+            GraphPattern::Bgp(triples) => {
+                assert_eq!(triples.len(), 2);
+            }
+            other => panic!("Expected Bgp, got {:?}", other),
+        }
+    }
+
+    /// Rule 1 (chained): Join(Join(Bgp(A), Bgp(B)), Bgp(C)) → Bgp(A ++ B ++ C)
+    #[test]
+    fn test_fuse_three_bgps() {
+        let a = tp(var("s"), iri("http://ex/p1"), var("o1"));
+        let b = tp(var("s"), iri("http://ex/p2"), var("o2"));
+        let c = tp(var("s"), iri("http://ex/p3"), var("o3"));
+        let pat = GraphPattern::Join(
+            Box::new(GraphPattern::Join(
+                Box::new(bgp(vec![a.clone()])),
+                Box::new(bgp(vec![b.clone()])),
+            )),
+            Box::new(bgp(vec![c.clone()])),
+        );
+        let result = normalize_graph_pattern(pat);
+        match result {
+            GraphPattern::Bgp(triples) => {
+                assert_eq!(triples.len(), 3, "All 3 triple patterns should be fused");
+            }
+            other => panic!("Expected Bgp, got {:?}", other),
+        }
+    }
+
+    /// Rule 2: Join(Filter(Bgp(A), e), Bgp(B)) → Filter(Bgp(A ++ B), e)
+    /// Models a FILTER between two groups of triple patterns.
+    #[test]
+    fn test_filter_lifting_left() {
+        let a = tp(var("s"), iri("http://ex/type"), iri("http://ex/Protein"));
+        let b = tp(var("s"), iri("http://ex/hasGO"), var("go"));
+        let pat = GraphPattern::Join(
+            Box::new(GraphPattern::Filter(
+                Box::new(bgp(vec![a.clone()])),
+                filter_expr(),
+            )),
+            Box::new(bgp(vec![b.clone()])),
+        );
+        let result = normalize_graph_pattern(pat);
+        // Expected: Filter(Bgp([a, b]), e)
+        match result {
+            GraphPattern::Filter(inner, _) => match *inner {
+                GraphPattern::Bgp(triples) => {
+                    assert_eq!(triples.len(), 2,
+                        "Both triple patterns should be inside the merged BGP");
+                }
+                other => panic!("Expected Bgp inside Filter, got {:?}", other),
+            },
+            other => panic!("Expected Filter, got {:?}", other),
+        }
+    }
+
+    /// Rule 2 + chaining: Join(Filter(Join(Bgp(A), Bgp(B)), e), Bgp(C))
+    /// → Filter(Bgp(A ++ B ++ C), e)
+    #[test]
+    fn test_filter_lifting_nested() {
+        let a = tp(var("s"), iri("http://ex/p1"), var("o1"));
+        let b = tp(var("s"), iri("http://ex/p2"), var("o2"));
+        let c = tp(var("s"), iri("http://ex/p3"), var("o3"));
+        let pat = GraphPattern::Join(
+            Box::new(GraphPattern::Filter(
+                Box::new(GraphPattern::Join(
+                    Box::new(bgp(vec![a.clone()])),
+                    Box::new(bgp(vec![b.clone()])),
+                )),
+                filter_expr(),
+            )),
+            Box::new(bgp(vec![c.clone()])),
+        );
+        let result = normalize_graph_pattern(pat);
+        match result {
+            GraphPattern::Filter(inner, _) => match *inner {
+                GraphPattern::Bgp(triples) => {
+                    assert_eq!(triples.len(), 3,
+                        "All 3 triple patterns should be inside the merged BGP");
+                }
+                other => panic!("Expected Bgp inside Filter, got {:?}", other),
+            },
+            other => panic!("Expected Filter, got {:?}", other),
+        }
+    }
+
+    /// Optional boundaries are NOT crossed.
+    /// Join(Optional(Bgp(A), Bgp(B)), Bgp(C)) must remain a Join.
+    #[test]
+    fn test_no_fusion_across_optional() {
+        let a = tp(var("s"), iri("http://ex/p1"), var("o1"));
+        let b = tp(var("s"), iri("http://ex/label"), var("l"));
+        let c = tp(var("s"), iri("http://ex/p2"), var("o2"));
+        let pat = GraphPattern::Join(
+            Box::new(GraphPattern::Optional(
+                Box::new(bgp(vec![a.clone()])),
+                Box::new(bgp(vec![b.clone()])),
+            )),
+            Box::new(bgp(vec![c.clone()])),
+        );
+        let result = normalize_graph_pattern(pat);
+        // Must remain a Join (not a Bgp) — Optional boundary is preserved.
+        match result {
+            GraphPattern::Join(_, _) => { /* correct */ }
+            other => panic!("Expected Join to be preserved, got {:?}", other),
+        }
+    }
+
+    /// Extend (BIND) boundaries are NOT crossed.
+    #[test]
+    fn test_no_fusion_across_extend() {
+        let a = tp(var("s"), iri("http://ex/p1"), var("o1"));
+        let b = tp(var("s"), iri("http://ex/p2"), var("o2"));
+        let pat = GraphPattern::Join(
+            Box::new(GraphPattern::Extend(
+                Box::new(bgp(vec![a.clone()])),
+                Expression::Variable("o1".to_string()),
+                "y".to_string(),
+            )),
+            Box::new(bgp(vec![b.clone()])),
+        );
+        let result = normalize_graph_pattern(pat);
+        match result {
+            GraphPattern::Join(_, _) => { /* correct — Extend boundary preserved */ }
+            other => panic!("Expected Join to be preserved, got {:?}", other),
+        }
     }
 }
