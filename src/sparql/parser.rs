@@ -232,6 +232,11 @@ impl<'a> Lexer<'a> {
                 while self.pos < self.input.len() && is_name_char(self.input.as_bytes()[self.pos]) {
                     self.pos += 1;
                 }
+                // Per SPARQL grammar, '.' is only allowed mid-name, not at the end.
+                // Strip trailing dots so that e.g. `:foo.` tokenises as `:foo` + Dot.
+                while self.pos > local_start && self.input.as_bytes()[self.pos - 1] == b'.' {
+                    self.pos -= 1;
+                }
                 Token::PrefixedName("", &self.input[local_start..self.pos])
             }
             b'"' | b'\'' => self.lex_string(),
@@ -319,6 +324,10 @@ impl<'a> Lexer<'a> {
             while self.pos < self.input.len() && is_name_char(self.input.as_bytes()[self.pos]) {
                 self.pos += 1;
             }
+            // Strip trailing dots (only allowed mid-name per SPARQL grammar).
+            while self.pos > start && self.input.as_bytes()[self.pos - 1] == b'.' {
+                self.pos -= 1;
+            }
             Token::BlankNodeLabel(&self.input[start..self.pos])
         } else {
             self.lex_keyword_or_prefixed()
@@ -338,6 +347,12 @@ impl<'a> Lexer<'a> {
             let local_start = self.pos;
             while self.pos < self.input.len() && is_name_char(self.input.as_bytes()[self.pos]) {
                 self.pos += 1;
+            }
+            // Per SPARQL grammar, '.' is only allowed mid-name, not at the end.
+            // Strip trailing dots so that e.g. `owl:Class.` tokenises as
+            // `PrefixedName("owl","Class")` followed by `Dot`.
+            while self.pos > local_start && self.input.as_bytes()[self.pos - 1] == b'.' {
+                self.pos -= 1;
             }
             return Token::PrefixedName(word, &self.input[local_start..self.pos]);
         }
