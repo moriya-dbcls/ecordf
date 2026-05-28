@@ -49,6 +49,29 @@ const INDEX_MAGIC: &[u8; 8] = b"ECOI0002";
 const HEADER_SIZE: usize = 16; // magic(8) + count(8)
 const TRIPLE_BYTES: usize = 24; // 3 × u64
 
+/// Columnar format: one file per column (`spo.c0`, `spo.c1`, `spo.c2`).
+/// Each file: magic(8) + count(8) + data[u64 × count].
+const COL_MAGIC: &[u8; 8] = b"ECOCOL01";
+const COL_VALUE_BYTES: usize = 8; // one u64 per entry
+
+// ── Helper: derive the three column paths from a base index path ──────────────
+//
+// `col_paths(dir/spo.bin)` → `[dir/spo.c0, dir/spo.c1, dir/spo.c2]`
+//
+fn col_paths(base: &Path) -> [PathBuf; 3] {
+    let stem = base
+        .file_stem()
+        .expect("index path must have a filename")
+        .to_str()
+        .expect("index path must be valid UTF-8");
+    let dir = base.parent().unwrap_or_else(|| Path::new("."));
+    [
+        dir.join(format!("{}.c0", stem)),
+        dir.join(format!("{}.c1", stem)),
+        dir.join(format!("{}.c2", stem)),
+    ]
+}
+
 // ── GSPO quad index constants ─────────────────────────────────────────────────
 const GSPO_MAGIC: &[u8; 8] = b"ECOG0002";
 const QUAD_BYTES: usize = 32; // 4 × u64 : (g, s, p, o)
@@ -169,17 +192,17 @@ impl IndexBuilder {
 
     // ── build ─────────────────────────────────────────────────────────────────
 
-    /// Sort and write to disk, then return a read-only `IndexFile`.
+    /// Sort and write to disk in columnar format, then return a read-only `IndexFile`.
     pub fn build(mut self, path: &Path) -> io::Result<IndexFile> {
         if self.chunks.is_empty() {
-            // ── In-memory path (chunk_size == 0 or dataset fits in one chunk)
+            // ── In-memory path: data already in RAM, write directly to columns.
             self.triples.sort_unstable();
-            write_index_from_sorted(&self.triples, path)?;
+            write_columnar_from_sorted(&self.triples, path)?;
         } else {
-            // ── External-sort path: flush remaining buffer, k-way merge
+            // ── External-sort path: flush remaining buffer, k-way merge → columns.
             self.flush_chunk()?;
             eprintln!(
-                "  Merging {} sorted chunks → {:?} index…",
+                "  Merging {} sorted chunks → {:?} index (columnar)…",
                 self.chunks.len(), self.kind
             );
             merge_triple_chunks(&self.chunks, path)?;
@@ -210,7 +233,9 @@ pub(crate) fn write_triple_chunk(triples: &[[u64; 3]], path: &Path) -> io::Resul
     w.flush()
 }
 
-/// Write a sorted slice of raw triples as a final index file (with header).
+/// Write a sorted slice of raw triples as a legacy interleaved index file (with header).
+/// Kept for testing and potential external tooling; new builds use `write_columnar_from_sorted`.
+#[allow(dead_code)]
 pub(crate) fn write_index_from_sorted(triples: &[[u64; 3]], path: &Path) -> io::Result<()> {
     let file = File::create(path)?;
     let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
@@ -224,30 +249,58 @@ pub(crate) fn write_index_from_sorted(triples: &[[u64; 3]], path: &Path) -> io::
     w.flush()
 }
 
-/// k-way merge of sorted triple chunk files into a single index file.
+/// Write a sorted slice of triples as three columnar files.
+///
+/// Given `base_path = dir/spo.bin`, creates:
+///   `dir/spo.c0` — primary-key column (u64 values, count × 8 bytes)
+///   `dir/spo.c1` — secondary-key column
+///   `dir/spo.c2` — tertiary-key column
+///
+/// Each column file: `magic(8) + count(8) + data[u64 × count]`
+pub(crate) fn write_columnar_from_sorted(triples: &[[u64; 3]], base_path: &Path) -> io::Result<()> {
+    let paths = col_paths(base_path);
+    let count = triples.len() as u64;
+    for (ci, path) in paths.iter().enumerate() {
+        let f = File::create(path)?;
+        let mut w = BufWriter::with_capacity(4 * 1024 * 1024, f);
+        w.write_all(COL_MAGIC)?;
+        w.write_all(&count.to_le_bytes())?;
+        for t in triples {
+            w.write_all(&t[ci].to_le_bytes())?;
+        }
+        w.flush()?;
+    }
+    Ok(())
+}
+
+/// k-way merge of sorted triple chunk files into columnar index files.
+///
+/// Final output is written as three `.c0`/`.c1`/`.c2` column files derived
+/// from `base_path` (e.g. `spo.bin` → `spo.c0`, `spo.c1`, `spo.c2`).
 ///
 /// When `chunks.len() > MAX_FAN_IN` a **hierarchical merge** is performed
-/// automatically to keep open-file-descriptor usage bounded (EMFILE-safe).
+/// automatically using plain chunk format for intermediate passes.
+/// Only the final merge writes columnar output.
 ///
 /// Consecutive duplicate triples are dropped so the output is a set.
-pub(crate) fn merge_triple_chunks(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
+pub(crate) fn merge_triple_chunks(chunks: &[PathBuf], base_path: &Path) -> io::Result<()> {
     if chunks.len() <= MAX_FAN_IN {
-        return merge_triple_chunks_direct(chunks, path);
+        return merge_to_columnar_direct(chunks, base_path);
     }
 
-    // ── Hierarchical pass: merge batches → intermediate chunk files ───────────
+    // ── Hierarchical pass: merge batches → intermediate plain chunk files ─────
     let mut intermediates: Vec<PathBuf> = Vec::new();
     for (i, batch) in chunks.chunks(MAX_FAN_IN).enumerate() {
-        let tmp = append_path_suffix(path, &format!(".__merge_{:04}.tmp", i));
+        let tmp = append_path_suffix(base_path, &format!(".__merge_{:04}.tmp", i));
         merge_triple_chunks_to_chunk(batch, &tmp)?;
         intermediates.push(tmp);
     }
 
-    // ── Final pass ────────────────────────────────────────────────────────────
+    // ── Final pass → columnar output ──────────────────────────────────────────
     let result = if intermediates.len() <= MAX_FAN_IN {
-        merge_triple_chunks_direct(&intermediates, path)
+        merge_to_columnar_direct(&intermediates, base_path)
     } else {
-        merge_triple_chunks(&intermediates, path)
+        merge_triple_chunks(&intermediates, base_path)
     };
 
     for p in &intermediates {
@@ -257,21 +310,32 @@ pub(crate) fn merge_triple_chunks(chunks: &[PathBuf], path: &Path) -> io::Result
     result
 }
 
-/// Merge up to `MAX_FAN_IN` chunk files directly into a final index file.
+/// Merge up to `MAX_FAN_IN` chunk files directly into three columnar files.
 ///
-/// The output has the full index-file header (`INDEX_MAGIC` + count).
-/// The count is back-patched after writing all triples.
-fn merge_triple_chunks_direct(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
-    // ── Open all chunk readers ────────────────────────────────────────────────
+/// Writes `base_path`-derived `.c0`, `.c1`, `.c2` column files.
+/// Count is back-patched in each column file after the merge.
+fn merge_to_columnar_direct(chunks: &[PathBuf], base_path: &Path) -> io::Result<()> {
+    let cpaths = col_paths(base_path);
+
     let mut readers: Vec<TripleChunkReader> = chunks.iter()
         .map(|p| TripleChunkReader::open(p))
         .collect::<io::Result<Vec<_>>>()?;
 
-    // ── Write output header (count placeholder, back-patched later) ───────────
-    let out_file = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
-    let mut w = BufWriter::with_capacity(8 * 1024 * 1024, out_file);
-    w.write_all(INDEX_MAGIC)?;
-    w.write_all(&0u64.to_le_bytes())?; // placeholder
+    // Open one writer per column file.
+    let mut writers: [BufWriter<File>; 3] = [
+        BufWriter::with_capacity(8 * 1024 * 1024,
+            OpenOptions::new().create(true).write(true).truncate(true).open(&cpaths[0])?),
+        BufWriter::with_capacity(8 * 1024 * 1024,
+            OpenOptions::new().create(true).write(true).truncate(true).open(&cpaths[1])?),
+        BufWriter::with_capacity(8 * 1024 * 1024,
+            OpenOptions::new().create(true).write(true).truncate(true).open(&cpaths[2])?),
+    ];
+
+    // Write column headers with count placeholder.
+    for w in &mut writers {
+        w.write_all(COL_MAGIC)?;
+        w.write_all(&0u64.to_le_bytes())?; // back-patched below
+    }
 
     // ── Seed heap ─────────────────────────────────────────────────────────────
     let mut heap: BinaryHeap<Reverse<([u64; 3], usize)>> = BinaryHeap::new();
@@ -286,9 +350,9 @@ fn merge_triple_chunks_direct(chunks: &[PathBuf], path: &Path) -> io::Result<()>
     let mut prev: Option<[u64; 3]> = None;
     while let Some(Reverse((t, i))) = heap.pop() {
         if Some(t) != prev {
-            w.write_all(&t[0].to_le_bytes())?;
-            w.write_all(&t[1].to_le_bytes())?;
-            w.write_all(&t[2].to_le_bytes())?;
+            writers[0].write_all(&t[0].to_le_bytes())?;
+            writers[1].write_all(&t[1].to_le_bytes())?;
+            writers[2].write_all(&t[2].to_le_bytes())?;
             count += 1;
             prev = Some(t);
         }
@@ -296,13 +360,15 @@ fn merge_triple_chunks_direct(chunks: &[PathBuf], path: &Path) -> io::Result<()>
             heap.push(Reverse((next, i)));
         }
     }
-    w.flush()?;
+    for w in &mut writers { w.flush()?; }
+    drop(writers);
 
-    // ── Back-patch the count field (offset 8, after magic) ───────────────────
-    drop(w);
-    let mut f = OpenOptions::new().write(true).open(path)?;
-    f.seek(SeekFrom::Start(8))?;
-    f.write_all(&count.to_le_bytes())?;
+    // ── Back-patch count field (offset 8) in each column file ────────────────
+    for cpath in &cpaths {
+        let mut f = OpenOptions::new().write(true).open(cpath)?;
+        f.seek(SeekFrom::Start(8))?;
+        f.write_all(&count.to_le_bytes())?;
+    }
 
     Ok(())
 }
@@ -393,25 +459,55 @@ impl TripleChunkReader {
 
 // ── Read-only mmap-backed index ──────────────────────────────────────────────
 
-/// A read-only sorted index backed by a memory-mapped file.
+/// Internal storage backing for `IndexFile`.
 ///
-/// The `Mmap` struct itself is just a pointer + length; actual RAM pages are
-/// managed by the OS kernel. Cold pages are evicted automatically.
+/// **Interleaved** (legacy): one file, triples packed as `[a0,b0,c0, a1,b1,c1, …]`.
+/// **Columnar** (current):   three files, each a contiguous `[u64; count]` array.
+///
+/// The columnar layout gives much better CPU-cache behaviour for binary search
+/// and range-detection: searching the primary key (`raw[0]`) only touches the
+/// first column file; the other two pages stay cold until triples are emitted.
+enum IndexStorage {
+    Interleaved {
+        _file: File,
+        mmap:  Mmap,
+    },
+    Columnar {
+        /// One open `File` per column to keep the OS file handle alive.
+        _files: [File; 3],
+        /// Memory-mapped views of `.c0`, `.c1`, `.c2`.
+        mmaps:  [Mmap; 3],
+    },
+}
+
+/// A read-only sorted index, backed by either the legacy interleaved file or
+/// three separate columnar mmap files.
 pub struct IndexFile {
     pub kind: IndexKind,
-    _file: File, // keep file handle alive
-    mmap: Mmap,
-    count: usize,
+    count:    usize,
+    storage:  IndexStorage,
 }
 
 impl IndexFile {
-    /// Open an existing index file.
+    // ── Construction ──────────────────────────────────────────────────────────
+
+    /// Open an index, preferring the columnar format if the `.c0` file exists,
+    /// falling back to the legacy interleaved `.bin` file otherwise.
     pub fn open(path: &Path, kind: IndexKind) -> io::Result<Self> {
+        let cpaths = col_paths(path);
+        if cpaths[0].exists() {
+            Self::open_columnar(&cpaths, kind)
+        } else {
+            Self::open_interleaved(path, kind)
+        }
+    }
+
+    /// Open a legacy interleaved index file.
+    fn open_interleaved(path: &Path, kind: IndexKind) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
-        // Safety: we never modify the file while mapped.
+        // Safety: we never modify the file while it is mapped.
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // Validate header
         if mmap.len() < HEADER_SIZE {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "index too small"));
         }
@@ -419,117 +515,203 @@ impl IndexFile {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad index magic"));
         }
         let count = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
-
-        let expected_size = HEADER_SIZE + count * TRIPLE_BYTES;
-        if mmap.len() != expected_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("index size mismatch: {} vs {}", mmap.len(), expected_size),
-            ));
+        let expected = HEADER_SIZE + count * TRIPLE_BYTES;
+        if mmap.len() != expected {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("index size mismatch: {} vs {}", mmap.len(), expected)));
         }
+        Ok(Self { kind, count, storage: IndexStorage::Interleaved { _file: file, mmap } })
+    }
+
+    /// Open three columnar column files (`.c0`, `.c1`, `.c2`).
+    fn open_columnar(paths: &[PathBuf; 3], kind: IndexKind) -> io::Result<Self> {
+        let mut count_opt: Option<usize> = None;
+        let mut files: Vec<File> = Vec::with_capacity(3);
+        let mut mmaps: Vec<Mmap> = Vec::with_capacity(3);
+
+        for path in paths {
+            let file = OpenOptions::new().read(true).open(path)?;
+            let mmap = unsafe { Mmap::map(&file)? };
+
+            if mmap.len() < HEADER_SIZE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("column file {:?} too small", path)));
+            }
+            if &mmap[0..8] != COL_MAGIC {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("bad column magic in {:?}", path)));
+            }
+            let n = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
+            let expected = HEADER_SIZE + n * COL_VALUE_BYTES;
+            if mmap.len() != expected {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("column {:?} size mismatch: {} vs {}", path, mmap.len(), expected)));
+            }
+            match count_opt {
+                None => count_opt = Some(n),
+                Some(c) if c != n => return Err(io::Error::new(
+                    io::ErrorKind::InvalidData, "column count mismatch")),
+                _ => {}
+            }
+            files.push(file);
+            mmaps.push(mmap);
+        }
+
+        let count = count_opt.unwrap_or(0);
+        // Convert Vec<T> into [T; 3] — safe because we pushed exactly 3 elements.
+        let [f0, f1, f2]: [File; 3] = files.try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "column count != 3"))?;
+        let [m0, m1, m2]: [Mmap; 3] = mmaps.try_into()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "column mmap count != 3"))?;
 
         Ok(Self {
             kind,
-            _file: file,
-            mmap,
             count,
+            storage: IndexStorage::Columnar {
+                _files: [f0, f1, f2],
+                mmaps:  [m0, m1, m2],
+            },
         })
     }
 
-    /// Number of triples in this index.
-    pub fn len(&self) -> usize {
-        self.count
+    // ── Public size info ──────────────────────────────────────────────────────
+
+    pub fn len(&self) -> usize { self.count }
+    pub fn is_empty(&self) -> bool { self.count == 0 }
+
+    // ── Column accessors ──────────────────────────────────────────────────────
+    //
+    // Three granularities let callers load only the columns they need:
+    //
+    //  `get_col0`  — primary key only   (binary search, range-end scan)
+    //  `get_col01` — primary + secondary (two-key binary search, (k0,k1) range-end)
+    //  `get_raw`   — all three          (emitting full triples to the caller)
+    //
+    // With columnar storage `get_col0` touches only the `.c0` mmap page; the
+    // `.c1` and `.c2` pages remain cold.  For a binary search over 1 B triples
+    // (log₂ ≈ 30 steps × 8 B) this is roughly 4 cache misses vs 12 for interleaved.
+
+    /// Read only column 0 — primary sort key.
+    #[inline]
+    fn get_col0(&self, pos: usize) -> u64 {
+        debug_assert!(pos < self.count);
+        match &self.storage {
+            IndexStorage::Interleaved { mmap, .. } => {
+                let off = HEADER_SIZE + pos * TRIPLE_BYTES;
+                u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap())
+            }
+            IndexStorage::Columnar { mmaps, .. } => {
+                let off = HEADER_SIZE + pos * COL_VALUE_BYTES;
+                u64::from_le_bytes(mmaps[0][off..off + 8].try_into().unwrap())
+            }
+        }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
+    /// Read columns 0 and 1 — primary and secondary sort keys.
+    #[inline]
+    fn get_col01(&self, pos: usize) -> (u64, u64) {
+        debug_assert!(pos < self.count);
+        match &self.storage {
+            IndexStorage::Interleaved { mmap, .. } => {
+                let off = HEADER_SIZE + pos * TRIPLE_BYTES;
+                (
+                    u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap()),
+                    u64::from_le_bytes(mmap[off + 8..off + 16].try_into().unwrap()),
+                )
+            }
+            IndexStorage::Columnar { mmaps, .. } => {
+                let off = HEADER_SIZE + pos * COL_VALUE_BYTES;
+                (
+                    u64::from_le_bytes(mmaps[0][off..off + 8].try_into().unwrap()),
+                    u64::from_le_bytes(mmaps[1][off..off + 8].try_into().unwrap()),
+                )
+            }
+        }
     }
 
-    /// Read a triple by index position (in the index's sort order, not SPO).
+    /// Read all three columns — needed when emitting a full triple.
     #[inline]
     fn get_raw(&self, pos: usize) -> [u64; 3] {
         debug_assert!(pos < self.count);
-        let off = HEADER_SIZE + pos * TRIPLE_BYTES;
-        let s = u64::from_le_bytes(self.mmap[off..off + 8].try_into().unwrap());
-        let p = u64::from_le_bytes(self.mmap[off + 8..off + 16].try_into().unwrap());
-        let o = u64::from_le_bytes(self.mmap[off + 16..off + 24].try_into().unwrap());
-        [s, p, o]
+        match &self.storage {
+            IndexStorage::Interleaved { mmap, .. } => {
+                let off = HEADER_SIZE + pos * TRIPLE_BYTES;
+                [
+                    u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap()),
+                    u64::from_le_bytes(mmap[off + 8..off + 16].try_into().unwrap()),
+                    u64::from_le_bytes(mmap[off + 16..off + 24].try_into().unwrap()),
+                ]
+            }
+            IndexStorage::Columnar { mmaps, .. } => {
+                let off = HEADER_SIZE + pos * COL_VALUE_BYTES;
+                [
+                    u64::from_le_bytes(mmaps[0][off..off + 8].try_into().unwrap()),
+                    u64::from_le_bytes(mmaps[1][off..off + 8].try_into().unwrap()),
+                    u64::from_le_bytes(mmaps[2][off..off + 8].try_into().unwrap()),
+                ]
+            }
+        }
     }
 
-    /// Convert a raw (reordered) triple back to SPO order.
+    /// Convert a raw (index-reordered) triple back to SPO order.
     #[inline]
     fn to_triple(&self, raw: [u64; 3]) -> Triple {
         reorder_back(raw, self.kind)
     }
 
-    // ── Scan API ──────────────────────────────────────────────────────────────
+    // ── Binary search (primary key only) ─────────────────────────────────────
 
-    /// Binary search: find the first position where raw[0] >= key.
+    /// First position where `col0 >= key`.  Reads only column 0.
     fn lower_bound_0(&self, key: u64) -> usize {
         let (mut lo, mut hi) = (0, self.count);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.get_raw(mid)[0] < key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+            if self.get_col0(mid) < key { lo = mid + 1; } else { hi = mid; }
         }
         lo
     }
 
-    /// Binary search: find first pos where (raw[0], raw[1]) >= (k0, k1).
+    /// First position where `(col0, col1) >= (k0, k1)`.  Reads columns 0 and 1.
     fn lower_bound_01(&self, k0: u64, k1: u64) -> usize {
         let (mut lo, mut hi) = (0, self.count);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let r = self.get_raw(mid);
-            if (r[0], r[1]) < (k0, k1) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
+            let (c0, c1) = self.get_col01(mid);
+            if (c0, c1) < (k0, k1) { lo = mid + 1; } else { hi = mid; }
         }
         lo
     }
 
-    /// Scan the index for all triples matching the pattern.
-    /// Yields triples in SPO order.
+    // ── Scan API ──────────────────────────────────────────────────────────────
+
+    /// Scan the index for all triples matching `pat`. Yields triples in SPO order.
     pub fn scan(&self, pat: &TriplePattern) -> TripleScan {
         let raw_pat = pattern_to_raw(*pat, self.kind);
         let (start, end) = self.range_for_pattern(&raw_pat);
-        TripleScan {
-            index: self,
-            raw_pat,
-            pos: start,
-            end,
-        }
+        TripleScan { index: self, raw_pat, pos: start, end }
     }
 
+    /// Compute the [start, end) range in the index that covers `raw`.
+    ///
+    /// With columnar storage the range-end scan reads only col0 or col01,
+    /// which keeps the tertiary-key pages cold until triples are emitted.
     fn range_for_pattern(&self, raw: &[Option<u64>; 3]) -> (usize, usize) {
         match (raw[0], raw[1]) {
             (Some(k0), Some(k1)) => {
-                // Seek to exact (k0, k1) range
                 let start = self.lower_bound_01(k0, k1);
-                // End is where k0 or k1 changes
                 let mut end = start;
                 while end < self.count {
-                    let r = self.get_raw(end);
-                    if r[0] != k0 || r[1] != k1 {
-                        break;
-                    }
+                    let (c0, c1) = self.get_col01(end);
+                    if c0 != k0 || c1 != k1 { break; }
                     end += 1;
                 }
                 (start, end)
             }
             (Some(k0), None) => {
-                // Seek to k0 range
                 let start = self.lower_bound_0(k0);
                 let mut end = start;
                 while end < self.count {
-                    if self.get_raw(end)[0] != k0 {
-                        break;
-                    }
+                    if self.get_col0(end) != k0 { break; }
                     end += 1;
                 }
                 (start, end)
@@ -538,13 +720,12 @@ impl IndexFile {
         }
     }
 
-    /// Estimate cardinality for a triple pattern (used by the optimizer).
+    /// Estimate cardinality for a triple pattern (used by the query optimizer).
     pub fn estimate_cardinality(&self, pat: &TriplePattern) -> u64 {
         let raw_pat = pattern_to_raw(*pat, self.kind);
         let (start, end) = self.range_for_pattern(&raw_pat);
-        // Filter estimate for the 3rd component if needed
         if raw_pat[2].is_some() {
-            // Assume ~50% selectivity for the unindexed 3rd component
+            // Assume ~50% selectivity for the unindexed tertiary component.
             ((end - start) as u64).saturating_add(1) / 2
         } else {
             (end - start) as u64
@@ -553,46 +734,39 @@ impl IndexFile {
 
     // ── Leapfrog Triejoin support ─────────────────────────────────────────────
 
-    /// Seek to the first position where raw[0] >= target.
-    /// Returns the actual raw[0] at that position, or `u64::MAX` if exhausted.
+    /// Seek to the first position where `col0 >= target`.
+    /// Returns `(pos, col0_value)`, or `(count, u64::MAX)` when exhausted.
     ///
-    /// Uses **galloping search** (exponential probe + binary search in the
-    /// narrowed range): O(log k) where k = distance from `from` to the result.
-    /// This is significantly faster than O(log n) binary search over the entire
-    /// index when the target is close — the common case in Leapfrog Triejoin
-    /// because successive `seek` calls advance by small amounts.
+    /// Uses **galloping search** — O(log k) where k is the distance from
+    /// `from` to the result, much faster than O(log n) when advances are small
+    /// (the common case inside Leapfrog Triejoin).
+    ///
+    /// With columnar storage all probes read only from the `.c0` mmap page,
+    /// keeping `.c1` and `.c2` pages cold during the seek phase.
     pub fn seek_0(&self, from: usize, target: u64) -> (usize, u64) {
         if from >= self.count {
             return (self.count, u64::MAX);
         }
-        // If already at or past target, return immediately.
-        let cur = self.get_raw(from)[0];
+        let cur = self.get_col0(from);
         if cur >= target {
             return (from, cur);
         }
 
-        // ── Galloping phase ───────────────────────────────────────────────────
-        // `lo` always satisfies get_raw(lo)[0] < target.
-        // We probe at lo+step, doubling step each time until we overshoot or
-        // run off the end of the index.
+        // Galloping phase: exponential probe until we overshoot.
         let mut lo = from;
         let mut step = 1usize;
         loop {
             let probe = lo + step;
-            if probe >= self.count || self.get_raw(probe)[0] >= target {
-                // Binary search in the range (lo, min(probe, count))
+            if probe >= self.count || self.get_col0(probe) >= target {
+                // Binary refinement in (lo, min(probe, count)).
                 let hi = probe.min(self.count);
-                let (mut a, mut b) = (lo + 1, hi); // a > lo so a-1 is guaranteed < target
+                let (mut a, mut b) = (lo + 1, hi);
                 while a < b {
                     let mid = a + (b - a) / 2;
-                    if self.get_raw(mid)[0] < target {
-                        a = mid + 1;
-                    } else {
-                        b = mid;
-                    }
+                    if self.get_col0(mid) < target { a = mid + 1; } else { b = mid; }
                 }
                 return if a < self.count {
-                    (a, self.get_raw(a)[0])
+                    (a, self.get_col0(a))
                 } else {
                     (self.count, u64::MAX)
                 };
@@ -1265,10 +1439,10 @@ impl AllBuilders {
         })
     }
 
-    /// Helper: merge chunks into `path`, or write an empty index if no chunks.
+    /// Helper: merge chunks into columnar files at `path`, or write empty columns if no chunks.
     fn merge_or_empty(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
         if chunks.is_empty() {
-            write_index_from_sorted(&[], path)
+            write_columnar_from_sorted(&[], path)
         } else {
             merge_triple_chunks(chunks, path)
         }
