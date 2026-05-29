@@ -800,6 +800,53 @@ impl IndexFile {
         }
     }
 
+    /// Fire `madvise(MADV_WILLNEED)` on **all three** column files for entry
+    /// range `[lo, hi)`.  Returns immediately; the kernel reads the pages
+    /// asynchronously in the background.
+    ///
+    /// Use this before a full triple read (`get_raw`), which touches all three
+    /// columns.  Firing hints for many ranges in a tight loop lets the OS
+    /// pipeline their I/Os in parallel (up to the SSD's native queue depth),
+    /// converting O(N × serial_latency) to O(⌈N/queue_depth⌉ × latency).
+    pub fn prefetch_all_cols(&self, lo: usize, hi: usize) {
+        if lo >= hi { return; }
+        if let IndexStorage::Columnar { mmaps, .. } = &self.storage {
+            let byte_start = HEADER_SIZE + lo * COL_VALUE_BYTES;
+            let byte_end   = HEADER_SIZE + hi * COL_VALUE_BYTES;
+            const PAGE: usize = 4096;
+            let aligned_start = (byte_start / PAGE) * PAGE;
+            let len = byte_end.saturating_sub(aligned_start);
+            if len == 0 { return; }
+            for mmap in mmaps.iter() {
+                let _ = mmap.advise_range(Advice::WillNeed, aligned_start, len);
+            }
+        }
+    }
+
+    /// Return the skip-index narrow range for primary key `k0` using **only
+    /// in-RAM data** (no disk access).
+    ///
+    /// The returned `(lo, hi)` guarantees `lower_bound_0(k0) ∈ [lo, hi)`.
+    /// With `SKIP_STRIDE = 512` the range covers at most 513 entries — one 4 KB
+    /// page — so a single `prefetch_all_cols(lo, hi)` call loads exactly the
+    /// pages the binary search will touch.
+    #[inline]
+    pub fn skip_narrow(&self, k0: u64) -> (usize, usize) {
+        match &self.skip {
+            Some(s) => s.narrow(k0),
+            None    => (0, self.count),
+        }
+    }
+
+    /// Prefetch (non-blocking) the single 4 KB page that contains the binary
+    /// search target for primary key `k0`.  Uses `skip_narrow` (in-RAM) to
+    /// locate the page, then fires `prefetch_all_cols`.
+    #[inline]
+    pub fn prefetch_for_key(&self, k0: u64) {
+        let (lo, hi) = self.skip_narrow(k0);
+        self.prefetch_all_cols(lo, hi);
+    }
+
     // ── Column accessors ──────────────────────────────────────────────────────
     //
     // Three granularities let callers load only the columns they need:
@@ -1526,6 +1573,30 @@ impl TripleIndex {
     pub fn pos_scan_all(&self) -> TripleScan {
         let pat = TriplePattern { s: UNBOUND, p: UNBOUND, o: UNBOUND };
         self.pos.scan(&pat)
+    }
+
+    /// Fire a non-blocking prefetch hint for the pages that `scan(pat)` will
+    /// read, using only the in-RAM skip index (no disk I/O).
+    ///
+    /// Fire hints for many patterns in a tight loop before doing any reads so
+    /// the OS can pipeline the physical I/Os in parallel:
+    ///
+    /// ```text
+    /// // Phase 1: submit all hints (pure CPU + madvise syscalls, ~1 µs each)
+    /// for pat in patterns { index.prefetch_pattern(pat); }
+    ///
+    /// // Phase 2: read data — pages are warm (OS loaded them concurrently)
+    /// for pat in patterns { index.scan(pat).collect::<Vec<_>>(); }
+    /// ```
+    pub fn prefetch_pattern(&self, pat: &TriplePattern) {
+        let (idx, k0) = match pat.best_index() {
+            IndexKind::Spo => (&self.spo, if pat.s != UNBOUND { Some(pat.s) } else { None }),
+            IndexKind::Pos => (&self.pos, if pat.p != UNBOUND { Some(pat.p) } else { None }),
+            IndexKind::Osp => (&self.osp, if pat.o != UNBOUND { Some(pat.o) } else { None }),
+        };
+        if let Some(k) = k0 {
+            idx.prefetch_for_key(k);
+        }
     }
 
     pub fn triple_count(&self) -> usize { self.spo.len() }

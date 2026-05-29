@@ -333,8 +333,39 @@ impl<'a> Executor<'a> {
                 self.execute_scan(pattern, variables)
             }
             ExecutionPlan::Join(left, right) => {
+                let t_join = std::time::Instant::now();
                 let left_rs = self.execute_plan_with_ctx(left, outer);
                 if left_rs.overflow { return left_rs; }
+                let left_us = t_join.elapsed().as_micros();
+
+                // Log the right-plan type and left-side row count so we can
+                // identify which join step is slow.
+                let right_desc = match right.as_ref() {
+                    ExecutionPlan::ScanAst(p) => {
+                        let pred = match &p.p {
+                            crate::sparql::ast::Term::Iri(iri) => {
+                                let s = iri.as_str();
+                                s.rsplit('/').next().unwrap_or(s).rsplit('#').next().unwrap_or(s).to_string()
+                            },
+                            other => format!("{other:?}"),
+                        };
+                        format!("ScanAst({})", pred)
+                    },
+                    ExecutionPlan::ScanBound { outer_vars, .. } => {
+                        format!("ScanBound(outer={:?})", outer_vars.iter().map(|(v,_)| v.as_str()).collect::<Vec<_>>())
+                    },
+                    ExecutionPlan::PathPattern { path, .. } => {
+                        format!("PathPattern({path:?})")
+                    },
+                    ExecutionPlan::Join(..) => "Join(nested)".to_string(),
+                    other => format!("{other:?}").chars().take(40).collect(),
+                };
+                tracing::debug!(
+                    left_rows = left_rs.rows.len(),
+                    left_us,
+                    right = %right_desc,
+                    "Join: left done"
+                );
 
                 let needs_binding = plan_needs_outer_binding(right, &left_rs.variables);
 
@@ -771,6 +802,23 @@ impl<'a> Executor<'a> {
 
     /// Classic hash join: build a hash table on the smaller side, probe with the larger.
     fn hash_join(&self, left: ResultSet, right: ResultSet) -> ResultSet {
+        // Always build on the smaller side to minimise HashMap allocation cost.
+        // The caller passes (left, right) by convention but we may swap them here.
+        if right.rows.len() > left.rows.len() * 4 {
+            // right is significantly larger: swap so we build on left, probe right.
+            tracing::debug!(
+                left_rows = left.rows.len(),
+                right_rows = right.rows.len(),
+                "hash_join: swapping sides (build on smaller left)"
+            );
+            return self.hash_join_impl(right, left);
+        }
+        self.hash_join_impl(left, right)
+    }
+
+    /// Inner hash join: build on `right`, probe with `left`.
+    /// Output column order follows `left` variables first, then new `right` variables.
+    fn hash_join_impl(&self, left: ResultSet, right: ResultSet) -> ResultSet {
         // Find shared variables
         let shared: Vec<(usize, usize)> = left.variables.iter().enumerate()
             .filter_map(|(li, lv)| {
@@ -815,7 +863,7 @@ impl<'a> Executor<'a> {
             return result;
         }
 
-        // Build hash table on right side (smaller → fewer collisions)
+        // Build hash table on right side.
         let mut hash: HashMap<Vec<Option<TermId>>, Vec<Vec<Option<TermId>>>> = HashMap::new();
         for rr in &right.rows {
             let key: Vec<Option<TermId>> = shared.iter().map(|(_, ri)| rr[*ri]).collect();
@@ -929,6 +977,186 @@ impl<'a> Executor<'a> {
         result
     }
 
+    // ── Predicate-scan join ───────────────────────────────────────────────────
+
+    /// Replace N random ScanBound probes with **one sequential POS scan**.
+    ///
+    /// ## When this is used
+    ///
+    /// Triggered from `bind_join` when:
+    ///   - `right_plan` is `ScanBound` with outer var at **subject** position (0),
+    ///     a fixed predicate, and either a free object (join) or fixed object
+    ///     (membership filter).
+    ///   - The number of unique groups exceeds `PRED_SCAN_THRESHOLD`.
+    ///   - The outer var is NOT already bound in the enclosing `outer` context.
+    ///
+    /// ## Why this is faster
+    ///
+    /// Normal `bind_join` with N=508 groups calls `execute_scan` 508 times,
+    /// each doing a binary search + random SSD read → O(N × page_miss_latency).
+    /// At 150 ms per cold page: **508 × 150 ms ≈ 76 s per predicate**.
+    ///
+    /// This method instead scans the full POS range for the predicate once
+    /// (sequential I/O) and filters by the known subject set in memory:
+    /// O(|predicate_triples|) sequential I/O.  With 10 M triples at 500 MB/s:
+    /// **< 0.5 s per predicate**.
+    ///
+    /// Returns `None` if the pattern does not match; caller falls back to
+    /// `bind_join`.
+    fn try_predicate_scan_join(
+        &self,
+        left: &ResultSet,
+        right_plan: &ExecutionPlan,
+        groups: &[(Vec<Option<TermId>>, Vec<usize>)],
+        needed: &[(usize, String)],
+        outer: &Binding,
+    ) -> Option<ResultSet> {
+        // ── Pattern matching ──────────────────────────────────────────────────
+        let (base, free_vars, outer_vars) = match right_plan {
+            ExecutionPlan::ScanBound { base, free_vars, outer_vars } => (base, free_vars, outer_vars),
+            _ => return None,
+        };
+
+        // Require exactly one outer var at subject position (0).
+        if outer_vars.len() != 1 || outer_vars[0].1 != 0 {
+            return None;
+        }
+        let outer_var_name = &outer_vars[0].0;
+
+        // Skip if the var is already bound in the enclosing context — with all
+        // groups sharing the same S, the threshold wouldn't have triggered anyway.
+        if outer.contains_key(outer_var_name.as_str()) {
+            return None;
+        }
+
+        // Predicate must be fixed.
+        if base.p == UNBOUND {
+            return None;
+        }
+
+        // Distinguish join (O free, one free_var at pos 2) from filter (O fixed).
+        let is_join   = base.o == UNBOUND && free_vars.len() == 1 && free_vars[0].1 == 2;
+        let is_filter = base.o != UNBOUND && free_vars.is_empty();
+        if !is_join && !is_filter {
+            return None;
+        }
+
+        // Key position in group-key array for the outer var.
+        let kp = needed.iter().position(|(_, v)| v == outer_var_name)?;
+
+        let t0 = std::time::Instant::now();
+
+        // ── Collect unique subject values ─────────────────────────────────────
+        let subjects: HashSet<TermId> = groups.iter()
+            .filter_map(|(key, _)| key.get(kp).copied().flatten())
+            .collect();
+
+        // Scan pattern: P fixed, S/O as determined above.
+        let scan_pat = TriplePattern { s: UNBOUND, p: base.p, o: base.o };
+
+        tracing::debug!(
+            groups = groups.len(),
+            unique_subjects = subjects.len(),
+            pred = base.p,
+            is_filter,
+            "bind_join: switching to predicate scan (sequential POS)"
+        );
+
+        // ── Filter mode: membership test (S, P, O_fixed) ─────────────────────
+        if is_filter {
+            // Scan the (P, O_fixed) range in POS — typically just a handful of
+            // entries — and collect passing subject IDs.
+            let passing: HashSet<TermId> = self.index.scan(&scan_pat)
+                .filter(|t| subjects.contains(&t.s))
+                .map(|t| t.s)
+                .collect();
+
+            let mut result = ResultSet::empty(left.variables.clone());
+            for (key, row_indices) in groups {
+                if let Some(s_id) = key.get(kp).copied().flatten() {
+                    if passing.contains(&s_id) {
+                        for &ri in row_indices {
+                            result.rows.push(left.rows[ri].clone());
+                            if result.rows.len() >= self.config.max_intermediate_rows {
+                                result.overflow = true;
+                                return Some(result);
+                            }
+                        }
+                    }
+                }
+            }
+
+            tracing::debug!(
+                elapsed_us = t0.elapsed().as_micros(),
+                out_rows = result.rows.len(),
+                "bind_join predicate scan (filter) done"
+            );
+            return Some(result);
+        }
+
+        // ── Join mode: S=outer → O via predicate P ────────────────────────────
+        let free_var_name = &free_vars[0].0;
+
+        // One sequential POS scan: collect (S → [O]) pairs for matching subjects.
+        let mut s_to_objects: HashMap<TermId, Vec<TermId>> = HashMap::new();
+        for triple in self.index.scan(&scan_pat) {
+            if subjects.contains(&triple.s) {
+                s_to_objects.entry(triple.s).or_default().push(triple.o);
+            }
+        }
+
+        // Build output schema: left vars + the new free variable.
+        let mut out_vars = left.variables.clone();
+        if !out_vars.contains(free_var_name) {
+            out_vars.push(free_var_name.clone());
+        }
+
+        let mut result = ResultSet::empty(out_vars.clone());
+        let out_len = out_vars.len();
+
+        // Fast lookup: subject_id → row indices in the left result set.
+        let mut s_to_rows: HashMap<TermId, &Vec<usize>> = HashMap::new();
+        for (key, row_indices) in groups {
+            if let Some(s_id) = key.get(kp).copied().flatten() {
+                s_to_rows.insert(s_id, row_indices);
+            }
+        }
+
+        let triples_matched: usize = s_to_objects.values().map(|v| v.len()).sum();
+
+        // Expand: for each (S, O) pair, cross with all left rows sharing that S.
+        for (s_id, objects) in &s_to_objects {
+            let Some(row_indices) = s_to_rows.get(s_id) else { continue; };
+            for &o_id in objects {
+                for &row_idx in *row_indices {
+                    let lr = &left.rows[row_idx];
+                    let mut row = vec![None; out_len];
+                    for (li, lv) in left.variables.iter().enumerate() {
+                        if let Some(oi) = result.variable_index(lv) {
+                            row[oi] = lr.get(li).copied().flatten();
+                        }
+                    }
+                    if let Some(oi) = result.variable_index(free_var_name) {
+                        row[oi] = Some(o_id);
+                    }
+                    result.rows.push(row);
+                    if result.rows.len() >= self.config.max_intermediate_rows {
+                        result.overflow = true;
+                        return Some(result);
+                    }
+                }
+            }
+        }
+
+        tracing::debug!(
+            elapsed_us = t0.elapsed().as_micros(),
+            triples_matched,
+            out_rows = result.rows.len(),
+            "bind_join predicate scan (join) done"
+        );
+        Some(result)
+    }
+
     // ── Bind-join (index nested-loop join) ────────────────────────────────────
 
     /// For each *unique binding* seen in `left` that is actually referenced by
@@ -960,6 +1188,7 @@ impl<'a> Executor<'a> {
     /// 3. For each group: execute right_plan once with the shared binding,
     ///    then cross-join the result with every left row in the group.
     fn bind_join(&self, left: ResultSet, right_plan: &ExecutionPlan, outer: &Binding) -> ResultSet {
+        let t_bj = std::time::Instant::now();
         // Variables that right_plan will substitute from the outer context.
         let right_refs = plan_referenced_vars(right_plan);
 
@@ -987,6 +1216,84 @@ impl<'a> Executor<'a> {
 
         let mut out_vars: Vec<String> = left.variables.clone();
         let mut result = ResultSet::empty(out_vars.clone());
+
+        // Switch to faster I/O strategies when the group count is large enough
+        // that N individual random-I/O probes would dominate query time.
+        //
+        // At 150 ms per cold SSD page, PRED_SCAN_THRESHOLD=32 means we only
+        // pay ~5 s before switching to sub-second sequential alternatives.
+        const PRED_SCAN_THRESHOLD: usize = 32;
+
+        // ── I/O Optimization 1: Predicate Scan ───────────────────────────────
+        //
+        // Replace N ScanBound probes with one sequential POS scan.
+        // Converts O(N × random_io_latency) → O(|predicate_range|) sequential.
+        // For N=508 @ 150 ms each: ~76 s → ~0.5 s per predicate.
+        //
+        // Falls through to the normal loop if the ScanBound shape does not
+        // match (outer var must be at subject position, P must be fixed).
+        if groups.len() > PRED_SCAN_THRESHOLD {
+            if let Some(fast_result) = self.try_predicate_scan_join(
+                &left, right_plan, &groups, &needed, outer,
+            ) {
+                tracing::debug!(
+                    groups = groups.len(),
+                    left_rows = left.rows.len(),
+                    out_rows = fast_result.rows.len(),
+                    elapsed_us = t_bj.elapsed().as_micros(),
+                    "bind_join done (predicate scan)"
+                );
+                return fast_result;
+            }
+        }
+
+        // ── I/O Optimization 2: Batch madvise Prefetch (fallback) ────────────
+        //
+        // For ScanBound patterns not handled by the predicate scan above, fire
+        // all N madvise(MADV_WILLNEED) hints *before* executing any group.
+        //
+        // The OS pipelines the disk reads in the background (SSD queue depth
+        // ~32) while the CPU sets up the first execute call.  Converts
+        // O(N × serial_latency) → O(⌈N/32⌉ × latency) ≈ 32× speedup cold.
+        //
+        // Cost: N in-RAM SkipIndex lookups + N cheap madvise syscalls (≪ 1 ms).
+        if groups.len() > PRED_SCAN_THRESHOLD {
+            if let ExecutionPlan::ScanBound { base, outer_vars, .. } = right_plan {
+                for (key, _) in &groups {
+                    let mut pat = *base;
+                    // Fill in the group-key variables (left-side bindings).
+                    for (key_pos, (_, var_name)) in needed.iter().enumerate() {
+                        if let Some(id) = key.get(key_pos).copied().flatten() {
+                            for (ov_name, ov_pos) in outer_vars.iter() {
+                                if ov_name == var_name {
+                                    match *ov_pos {
+                                        0 => pat.s = id,
+                                        1 => pat.p = id,
+                                        _ => pat.o = id,
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // Also fill any variable already bound in the enclosing context.
+                    for (ov_name, ov_pos) in outer_vars.iter() {
+                        if let Some(&id) = outer.get(ov_name.as_str()) {
+                            match *ov_pos {
+                                0 => pat.s = id,
+                                1 => pat.p = id,
+                                _ => pat.o = id,
+                            }
+                        }
+                    }
+                    self.index.prefetch_pattern(&pat);
+                }
+                tracing::debug!(
+                    groups = groups.len(),
+                    "bind_join: batch prefetch fired (madvise WILLNEED)"
+                );
+            }
+        }
 
         for (key, row_indices) in &groups {
             // Build binding: outer context + the needed left variables for this group.
@@ -1064,6 +1371,13 @@ impl<'a> Executor<'a> {
                 return result;
             }
         }
+        tracing::debug!(
+            groups = groups.len(),
+            left_rows = left.rows.len(),
+            out_rows = result.rows.len(),
+            elapsed_us = t_bj.elapsed().as_micros(),
+            "bind_join done"
+        );
         result
     }
 
