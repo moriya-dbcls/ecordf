@@ -200,10 +200,16 @@ fn resolve_input_files(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging (RUST_LOG=ecordf=debug for verbose output)
+    // Initialize logging.
+    // Priority: RUST_LOG env var → fallback to "ecordf=info".
+    // Examples:
+    //   RUST_LOG=ecordf=debug   → DEBUG + INFO for all ecordf modules
+    //   RUST_LOG=ecordf=trace   → TRACE + DEBUG + INFO
+    //   RUST_LOG=info           → INFO for everything
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("ecordf=info"));
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env()
-            .add_directive("ecordf=info".parse()?))
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
 
