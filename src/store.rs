@@ -506,9 +506,30 @@ impl Store {
     }
 
     /// Execute a SPARQL query string and return the result set.
+    ///
+    /// Emits an `INFO` log line per query with a phase-level timing breakdown:
+    ///
+    /// ```text
+    /// INFO ecordf::store: query  parse_us=45  execute_us=12300  rows=10000  total_us=12350  q="SELECT ..."
+    /// ```
+    ///
+    /// | field        | meaning                                              |
+    /// |--------------|------------------------------------------------------|
+    /// | `parse_us`   | µs to tokenise + parse the SPARQL string             |
+    /// | `execute_us` | µs to optimise the plan + run all joins/index seeks  |
+    /// | `rows`       | number of result rows before serialisation           |
+    /// | `total_us`   | total µs inside `query()` (parse + execute)          |
+    ///
+    /// Serialisation / decode time is measured in `server::execute_query`.
+    /// Enable `RUST_LOG=ecordf=debug` to also see the physical execution plan
+    /// (optimizer output) and per-phase breakdown from the executor.
     pub fn query(&self, sparql: &str) -> Result<QueryResult, QueryError> {
-        let t0 = Instant::now();
+        let t_total = Instant::now();
+
+        // ── Phase 1: Parse ────────────────────────────────────────────────────
+        let t = Instant::now();
         let ast = parse_query(sparql).map_err(|e| QueryError::Parse(e.to_string()))?;
+        let parse_us = t.elapsed().as_micros();
 
         let executor = Executor::with_config_and_stats(
             &self.index,
@@ -517,34 +538,48 @@ impl Store {
             Some(&self.stats),
         );
 
+        // ── Phase 2: Execute (plan + BGP evaluation) ──────────────────────────
+        let t = Instant::now();
         let result = match ast.form {
             QueryForm::Select(ref sq) => {
                 // Validate GROUP BY consistency before executing.
-                // SPARQL 1.1 leaves the value of non-aggregate, non-GROUP-BY SELECT variables
-                // undefined when GROUP BY is present.  Rather than silently returning NULL or
-                // a random sample, we reject the query with a helpful suggestion.
                 if !sq.group_by.is_empty() {
                     if let Some(err) = validate_group_by(sq) {
                         return Err(QueryError::Parse(err));
                     }
                 }
                 let rs = executor.execute_select(sq);
+                let rows = rs.rows.len();
+                let execute_us = t.elapsed().as_micros();
+                let total_us   = t_total.elapsed().as_micros();
+                tracing::info!(
+                    parse_us,
+                    execute_us,
+                    total_us,
+                    rows,
+                    q = &sparql[..sparql.len().min(200)],
+                    "query"
+                );
                 QueryResult::Select(rs)
             }
             QueryForm::Ask(ref aq) => {
                 let b = executor.execute_ask(aq);
+                let execute_us = t.elapsed().as_micros();
+                let total_us   = t_total.elapsed().as_micros();
+                tracing::info!(
+                    parse_us,
+                    execute_us,
+                    total_us,
+                    result = b,
+                    q = &sparql[..sparql.len().min(200)],
+                    "query(ASK)"
+                );
                 QueryResult::Ask(b)
             }
             QueryForm::Construct(_) => {
                 return Err(QueryError::Unsupported("CONSTRUCT not yet implemented".into()));
             }
         };
-
-        let elapsed = t0.elapsed();
-        tracing::debug!(
-            elapsed_ms = elapsed.as_millis(),
-            "query executed"
-        );
 
         Ok(result)
     }

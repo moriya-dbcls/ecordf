@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     extract::{Query as AxumQuery, State},
@@ -229,34 +230,98 @@ async fn run_query(state: AppState, query: String, format: String) -> Response {
     }
 }
 
+/// Execute a query and build the HTTP response, timing the decode/serialise phase
+/// separately from index execution (which is timed in `store::query`).
+///
+/// Adds an `X-EcoRDF-Timing` response header:
+///   `X-EcoRDF-Timing: decode_us=NNN; serialize_us=NNN; total_us=NNN; rows=NNN`
+///
+/// Combined with the `INFO ecordf::store: query` log line you get the full breakdown:
+///   - `parse_us`     — SPARQL parser
+///   - `execute_us`   — optimizer + index seeks + join (from store log)
+///   - `decode_us`    — TermId → string (ReadonlyDict lookups)
+///   - `serialize_us` — JSON / XML / TSV formatting
+///   - `total_us`     — decode + serialize combined (this function)
 fn execute_query(store: &Store, query: &str, format: &str) -> Response {
-    match store.query(query) {
-        Ok(result) => match &result {
-            QueryResult::Select(rs) => {
-                if rs.overflow {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        &format!(
-                            "Query result exceeded memory limit ({} rows). \
-                             Add LIMIT / tighter FILTER to reduce result size.",
-                            rs.rows.len()
-                        ),
-                    );
-                }
-                format_select(rs, store, format)
+    let t_req = Instant::now();
+
+    let result = match store.query(query) {
+        Ok(r)  => r,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+
+    match &result {
+        QueryResult::Select(rs) => {
+            if rs.overflow {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!(
+                        "Query result exceeded memory limit ({} rows). \
+                         Add LIMIT / tighter FILTER to reduce result size.",
+                        rs.rows.len()
+                    ),
+                );
             }
-            QueryResult::Ask(b) => format_ask(*b, format),
-        },
-        Err(e) => error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+            let rows = rs.rows.len();
+
+            // ── Decode: TermId → String ───────────────────────────────────────
+            // This step touches the ReadonlyDict mmap for every result cell.
+            // For large result sets with cold page cache it can dominate total time.
+            let t_decode = Instant::now();
+            let decoded = decode_result_set(rs, store);
+            let decode_us = t_decode.elapsed().as_micros();
+
+            // ── Serialize: build JSON/XML/TSV bytes ───────────────────────────
+            let t_ser = Instant::now();
+            let mut response = format_decoded(&decoded, rs, format);
+            let serialize_us = t_ser.elapsed().as_micros();
+
+            let total_us = t_req.elapsed().as_micros();
+            tracing::info!(
+                decode_us,
+                serialize_us,
+                total_us,
+                rows,
+                "decode+serialize"
+            );
+
+            // Add timing header so it's visible in curl / browser devtools.
+            let timing_val = format!(
+                "decode_us={}; serialize_us={}; total_us={}; rows={}",
+                decode_us, serialize_us, total_us, rows
+            );
+            if let Ok(v) = header::HeaderValue::from_str(&timing_val) {
+                response.headers_mut().insert("x-ecordf-timing", v);
+            }
+            response
+        }
+        QueryResult::Ask(b) => format_ask(*b, format),
     }
 }
 
-// ── Formatters ────────────────────────────────────────────────────────────────
+/// Pre-decode all TermIds in a ResultSet to strings.
+///
+/// Separating this from serialisation lets us time just the dict-lookup cost.
+struct DecodedRow(Vec<Option<String>>);
 
-fn format_select(rs: &crate::sparql::ResultSet, store: &Store, format: &str) -> Response {
+fn decode_result_set(rs: &crate::sparql::ResultSet, store: &Store) -> Vec<DecodedRow> {
+    rs.rows.iter().map(|row| {
+        // .copied() converts &Option<TermId> → Option<TermId> (TermId = u64 is Copy)
+        DecodedRow(row.iter().copied().map(|cell| {
+            cell.map(|id| store.dict.decode(id))
+        }).collect())
+    }).collect()
+}
+
+/// Build the HTTP response body from pre-decoded strings.
+fn format_decoded(
+    decoded: &[DecodedRow],
+    rs: &crate::sparql::ResultSet,
+    format: &str,
+) -> Response {
     match format.to_ascii_lowercase().as_str() {
         "xml" | "application/sparql-results+xml" => {
-            let body = results_to_xml(rs, store);
+            let body = decoded_to_xml(decoded, rs);
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/sparql-results+xml; charset=utf-8")],
@@ -264,7 +329,7 @@ fn format_select(rs: &crate::sparql::ResultSet, store: &Store, format: &str) -> 
             ).into_response()
         }
         "tsv" | "text/tab-separated-values" => {
-            let body = results_to_tsv(rs, store);
+            let body = decoded_to_tsv(decoded, rs);
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/tab-separated-values; charset=utf-8")],
@@ -272,7 +337,7 @@ fn format_select(rs: &crate::sparql::ResultSet, store: &Store, format: &str) -> 
             ).into_response()
         }
         "csv" | "text/csv" => {
-            let body = results_to_csv(rs, store);
+            let body = decoded_to_csv(decoded, rs);
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/csv; charset=utf-8")],
@@ -280,8 +345,7 @@ fn format_select(rs: &crate::sparql::ResultSet, store: &Store, format: &str) -> 
             ).into_response()
         }
         _ => {
-            // Default: SPARQL Results JSON
-            let body = results_to_json(rs, store);
+            let body = decoded_to_json(decoded, rs);
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/sparql-results+json; charset=utf-8")],
@@ -290,6 +354,11 @@ fn format_select(rs: &crate::sparql::ResultSet, store: &Store, format: &str) -> 
         }
     }
 }
+
+// ── Formatters ────────────────────────────────────────────────────────────────
+//
+// All formatters now work from pre-decoded `DecodedRow` values so that the
+// decode (TermId→String) and serialise phases can be timed independently.
 
 fn format_ask(result: bool, format: &str) -> Response {
     let body = match format.to_ascii_lowercase().as_str() {
@@ -310,17 +379,15 @@ fn format_ask(result: bool, format: &str) -> Response {
     (StatusCode::OK, [(header::CONTENT_TYPE, ct)], body).into_response()
 }
 
-/// SPARQL Results JSON format (W3C standard)
-fn results_to_json(rs: &crate::sparql::ResultSet, store: &Store) -> Value {
+/// SPARQL Results JSON format (W3C standard) — uses pre-decoded strings.
+fn decoded_to_json(decoded: &[DecodedRow], rs: &crate::sparql::ResultSet) -> Value {
     let vars: Vec<Value> = rs.variables.iter().map(|v| json!(v)).collect();
 
-    let bindings: Vec<Value> = rs.rows.iter().map(|row| {
+    let bindings: Vec<Value> = decoded.iter().map(|row| {
         let mut obj = serde_json::Map::new();
         for (i, var) in rs.variables.iter().enumerate() {
-            if let Some(Some(id)) = row.get(i) {
-                let s = store.dict.decode(*id);
-                let term_json = encode_term_json(&s);
-                obj.insert(var.clone(), term_json);
+            if let Some(Some(s)) = row.0.get(i) {
+                obj.insert(var.clone(), encode_term_json(s));
             }
         }
         Value::Object(obj)
@@ -352,31 +419,27 @@ fn encode_term_json(s: &str) -> Value {
     }
 }
 
-/// SPARQL Results XML format
-fn results_to_xml(rs: &crate::sparql::ResultSet, store: &Store) -> String {
+/// SPARQL Results XML format — uses pre-decoded strings.
+fn decoded_to_xml(decoded: &[DecodedRow], rs: &crate::sparql::ResultSet) -> String {
     let mut xml = String::from(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<sparql xmlns="http://www.w3.org/2005/sparql-results#">
-  <head>"#
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <sparql xmlns=\"http://www.w3.org/2005/sparql-results#\">\n  <head>"
     );
     for var in &rs.variables {
         xml.push_str(&format!("\n    <variable name=\"{}\"/>", xml_escape(var)));
     }
     xml.push_str("\n  </head>\n  <results>");
-
-    for row in &rs.rows {
+    for row in decoded {
         xml.push_str("\n    <result>");
         for (i, var) in rs.variables.iter().enumerate() {
-            if let Some(Some(id)) = row.get(i) {
-                let s = store.dict.decode(*id);
+            if let Some(Some(s)) = row.0.get(i) {
                 xml.push_str(&format!("\n      <binding name=\"{}\">", xml_escape(var)));
-                xml.push_str(&encode_term_xml(&s));
+                xml.push_str(&encode_term_xml(s));
                 xml.push_str("</binding>");
             }
         }
         xml.push_str("\n    </result>");
     }
-
     xml.push_str("\n  </results>\n</sparql>");
     xml
 }
@@ -398,19 +461,16 @@ fn encode_term_xml(s: &str) -> String {
     }
 }
 
-fn results_to_tsv(rs: &crate::sparql::ResultSet, store: &Store) -> String {
+fn decoded_to_tsv(decoded: &[DecodedRow], rs: &crate::sparql::ResultSet) -> String {
     let mut out = String::new();
-    // Header
-    let header: Vec<String> = rs.variables.iter().map(|v| format!("?{}", v)).collect();
-    out.push_str(&header.join("\t"));
+    let hdr: Vec<String> = rs.variables.iter().map(|v| format!("?{}", v)).collect();
+    out.push_str(&hdr.join("\t"));
     out.push('\n');
-    // Rows
-    for row in &rs.rows {
+    for row in decoded {
         let cells: Vec<String> = (0..rs.variables.len()).map(|i| {
-            match row.get(i) {
-                Some(Some(id)) => {
-                    let s = store.dict.decode(*id);
-                    if s.starts_with('"') || s.starts_with("_:") { s }
+            match row.0.get(i) {
+                Some(Some(s)) => {
+                    if s.starts_with('"') || s.starts_with("_:") { s.clone() }
                     else { format!("<{}>", s) }
                 }
                 _ => String::new(),
@@ -422,17 +482,14 @@ fn results_to_tsv(rs: &crate::sparql::ResultSet, store: &Store) -> String {
     out
 }
 
-fn results_to_csv(rs: &crate::sparql::ResultSet, store: &Store) -> String {
+fn decoded_to_csv(decoded: &[DecodedRow], rs: &crate::sparql::ResultSet) -> String {
     let mut out = String::new();
     out.push_str(&rs.variables.join(","));
     out.push('\n');
-    for row in &rs.rows {
+    for row in decoded {
         let cells: Vec<String> = (0..rs.variables.len()).map(|i| {
-            match row.get(i) {
-                Some(Some(id)) => {
-                    let s = store.dict.decode(*id);
-                    csv_escape(&s)
-                }
+            match row.0.get(i) {
+                Some(Some(s)) => csv_escape(s),
                 _ => String::new(),
             }
         }).collect();

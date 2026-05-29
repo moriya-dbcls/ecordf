@@ -28,6 +28,7 @@
 //! This runs in O(output × k × log(n_i)) per variable.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use crate::config::QueryConfig;
 use crate::dict_builder::QueryDict;
@@ -191,12 +192,24 @@ impl<'a> Executor<'a> {
     }
 
     /// Execute a full query and return results as a ResultSet.
+    ///
+    /// Emits a `DEBUG` log with:
+    /// - `plan_us`  : µs spent in the optimizer (`optimize_bgp`)
+    /// - `bgp_us`   : µs spent executing the physical plan (index seeks + joins)
+    /// - `post_us`  : µs for GROUP BY / ORDER BY / DISTINCT / LIMIT
+    /// - `rows`     : final row count after all post-processing
+    /// - `plan`     : the physical plan chosen by the optimizer
     pub fn execute_select(&self, query: &SelectQuery) -> ResultSet {
         // 1. Optimize the join order
+        let t_plan = Instant::now();
         let plan = optimize_bgp(&query.pattern, self.index, self.dict, self.stats);
+        let plan_us = t_plan.elapsed().as_micros();
+        tracing::debug!(?plan, plan_us, "query plan");
 
         // 2. Execute
+        let t_bgp = Instant::now();
         let mut bindings = self.execute_plan(&plan);
+        let bgp_us = t_bgp.elapsed().as_micros();
 
         // Short-circuit: if execution was truncated, return immediately with the
         // overflow flag set so the caller can return an error to the client.
@@ -259,7 +272,16 @@ impl<'a> Executor<'a> {
         }
 
         // 8. Project output variables
-        self.project(&bindings, &query.projection)
+        let post_us = t_bgp.elapsed().as_micros() - bgp_us;
+        let result = self.project(&bindings, &query.projection);
+        tracing::debug!(
+            plan_us,
+            bgp_us,
+            post_us,
+            rows = result.rows.len(),
+            "execute_select"
+        );
+        result
     }
 
     pub fn execute_ask(&self, query: &AskQuery) -> bool {
