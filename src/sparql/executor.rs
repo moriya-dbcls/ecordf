@@ -348,6 +348,39 @@ impl<'a> Executor<'a> {
                     return self.hash_join(left_rs, right_rs);
                 }
 
+                // PathPattern right plans: hash_join (full sequential path scan
+                // + in-memory join) is cheaper than bind_join (N random probes)
+                // once the left side grows beyond a small threshold.
+                //
+                // Why hash_join works for PathPattern:
+                //   - bind_join: evaluates PathPattern N times, once per unique
+                //     left-variable group.  Each evaluation does 1 cold SSD read
+                //     per path hop → O(N × hops × page_miss_latency).
+                //   - hash_join: calls execute_path_pattern with s=None, o=None
+                //     (unbound endpoints) → eval_path does a full sequential scan
+                //     of each predicate in the path → all (s, o) pairs loaded
+                //     contiguously.  Then hash_join filters to the left rows.
+                //     Cost: O(|path_triples|) sequential I/O, which is typically
+                //     orders of magnitude faster than O(N) random reads on a cold
+                //     SSD index.
+                //
+                // Threshold is intentionally much smaller than bind_join_threshold
+                // (which is tuned for cheap ScanAst probes).
+                if matches!(right.as_ref(), ExecutionPlan::PathPattern { .. }) {
+                    const PATH_HASH_JOIN_THRESHOLD: usize = 32;
+                    if left_rs.rows.len() > PATH_HASH_JOIN_THRESHOLD {
+                        tracing::debug!(
+                            left_rows = left_rs.rows.len(),
+                            "Join PathPattern: switching to hash_join (full path scan)"
+                        );
+                        let right_rs = self.execute_plan_with_ctx(right, outer);
+                        if right_rs.overflow { return right_rs; }
+                        return self.hash_join(left_rs, right_rs);
+                    }
+                    // Small left side: targeted bind_join probes are fine.
+                    return self.bind_join(left_rs, right, outer);
+                }
+
                 // If the right plan contains ScanAsts that reference variables produced
                 // by the left side, bind_join MUST be used regardless of left size.
                 if needs_binding {
