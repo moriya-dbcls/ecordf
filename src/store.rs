@@ -428,9 +428,17 @@ impl Store {
     /// index files to pre-populate the OS page cache.
     ///
     /// `warmup_mb` is the **total** number of megabytes to read across all files.
-    /// The budget is split evenly across the three triple indexes (SPO/POS/OSP)
-    /// and the dictionary, prioritising the POS index (most used for predicate
-    /// lookups) with a 2× share.
+    ///
+    /// Budget allocation (share weights):
+    ///   - POS c0 ×2, POS c1 ×1 — predicate scans dominate; c0 for binary search,
+    ///     c1 for object-within-predicate scan
+    ///   - SPO c0 ×1, OSP c0 ×1 — subject/object binary search
+    ///   - dict_sorted.bin ×1
+    ///   - gspo.bin ×1 (if present)
+    ///
+    /// Columnar files (`.c0`, `.c1`) are preferred over legacy `.bin`.
+    /// `.skip` files are always in heap RAM (loaded via `read_to_end` at open
+    /// time), so they do not need page-cache warming.
     ///
     /// Returns immediately; the actual I/O happens on a detached thread.
     /// A progress log line is emitted when each file's quota is reached.
@@ -439,16 +447,35 @@ impl Store {
             return;
         }
 
-        // File list: POS gets a double share because predicate scans dominate.
-        // Each entry: (path, share_weight)
+        // Build the file list, preferring columnar (.c0/.c1) over interleaved (.bin).
+        // Each entry: (path, share_weight).
         let files: Vec<(std::path::PathBuf, u64)> = {
             let d = &self.dir;
-            let mut v = vec![
-                (d.join("pos.bin"),          2),
-                (d.join("spo.bin"),          1),
-                (d.join("osp.bin"),          1),
-                (d.join("dict_sorted.bin"),  1),
-            ];
+            let mut v: Vec<(std::path::PathBuf, u64)> = Vec::new();
+
+            // Triple indexes: (name, c0_weight, c1_weight)
+            // c1 is only warmed for POS (object scan within predicate is hot).
+            for &(name, c0_w, c1_w) in &[
+                ("pos", 2u64, 1u64),
+                ("spo", 1u64, 0u64),
+                ("osp", 1u64, 0u64),
+            ] {
+                let c0  = d.join(format!("{}.c0", name));
+                let c1  = d.join(format!("{}.c1", name));
+                let bin = d.join(format!("{}.bin", name));
+                if c0.exists() {
+                    v.push((c0, c0_w));
+                    if c1_w > 0 && c1.exists() {
+                        v.push((c1, c1_w));
+                    }
+                } else if bin.exists() {
+                    // Legacy interleaved format: single file, combined weight.
+                    v.push((bin, c0_w + c1_w));
+                }
+                // If neither exists, the index is missing — open() will error later.
+            }
+
+            v.push((d.join("dict_sorted.bin"), 1));
             if d.join("gspo.bin").exists() {
                 v.push((d.join("gspo.bin"), 1));
             }
