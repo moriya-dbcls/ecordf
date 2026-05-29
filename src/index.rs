@@ -902,20 +902,36 @@ impl IndexFile {
 
     /// First position where `(col0, col1) >= (k0, k1)`.  Reads columns 0 and 1.
     ///
-    /// Narrows by `k0` using the skip index, fires a prefetch on the target
-    /// c0 page, then binary-searches the narrow range with both columns.
+    /// ## Why narrow(k0).hi cannot be used here
+    ///
+    /// `narrow(k0)` returns a 512-entry window around the **first** occurrence
+    /// of k0 in c0.  When k0 is a common value (e.g. `rdf:type` spanning
+    /// billions of entries across thousands of skip blocks), the answer for
+    /// `(k0, k1)` with a large k1 lies deep inside k0's range — far beyond
+    /// the narrow window.  Clamping the binary search to that window would
+    /// cause the search to return `hi` (not found) and produce empty results.
+    ///
+    /// ## Two-phase approach
+    ///
+    /// Phase 1 — `lower_bound_0(k0)`: skip-optimised single-key search on c0.
+    ///   Touches exactly 1 OS page via skip + prefetch_c0.
+    ///   Result `lo` = first position where c0 >= k0.
+    ///
+    /// Phase 2 — binary search `[lo, count)` with `(c0, c1)` comparator.
+    ///   `lo` is tight (nothing before it can satisfy the predicate), so this
+    ///   is correct.  The range is `count - lo` which equals the size of the
+    ///   k0 range for exact predicate matches, giving O(log(|k0 range|)) steps.
     fn lower_bound_01(&self, k0: u64, k1: u64) -> usize {
-        let (mut lo, mut hi) = match &self.skip {
-            Some(s) => s.narrow(k0),
-            None    => (0, self.count),
-        };
-        self.prefetch_c0(lo, hi);
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
+        // Phase 1: find the exact start of k0's range, skip-optimised.
+        let lo = self.lower_bound_0(k0);
+        // Phase 2: binary search within [lo, count) with the two-key comparator.
+        let (mut a, mut b) = (lo, self.count);
+        while a < b {
+            let mid = a + (b - a) / 2;
             let (c0, c1) = self.get_col01(mid);
-            if (c0, c1) < (k0, k1) { lo = mid + 1; } else { hi = mid; }
+            if (c0, c1) < (k0, k1) { a = mid + 1; } else { b = mid; }
         }
-        lo
+        a
     }
 
     // ── Scan API ──────────────────────────────────────────────────────────────
