@@ -1880,13 +1880,47 @@ impl<'a> Executor<'a> {
                     }
                     let unique_mids = by_mid.len();
                     let mut next: Vec<(TermId, TermId)> = Vec::new();
-                    for (mid, srcs) in by_mid {
-                        for (_, dst) in self.eval_path(step, Some(mid), step_o) {
-                            for &src in &srcs {
-                                next.push((src, dst));
+
+                    // Batch-scan threshold: when the number of unique intermediate
+                    // nodes is large, N individual random SPO probes (one per node)
+                    // cause excessive random I/O.  Instead, do ONE sequential scan
+                    // over the predicate's entire POS/SPO range and filter in memory.
+                    // This mirrors QLever's per-predicate columnar scan approach:
+                    // sequential I/O is ~100× faster than random I/O on cold SSD.
+                    //
+                    // Heuristic: switch when unique_mids > BATCH_SCAN_THRESHOLD.
+                    // Tuning: lower = more scans (uses more I/O for small fan-outs);
+                    //         higher = more random probes (worse for large fan-outs).
+                    const BATCH_SCAN_THRESHOLD: usize = 32;
+
+                    if unique_mids > BATCH_SCAN_THRESHOLD {
+                        // Full-scan mode: enumerate all (s, o) for this step with
+                        // s=None (unbound), then filter by the known intermediate set.
+                        tracing::debug!(
+                            step = idx + 1,
+                            unique_mids,
+                            mode = "batch_scan",
+                            "eval_path Sequence: switching to batch scan"
+                        );
+                        let all_pairs = self.eval_path(step, None, step_o);
+                        for (s, o) in all_pairs {
+                            if let Some(srcs) = by_mid.get(&s) {
+                                for &src in srcs {
+                                    next.push((src, o));
+                                }
+                            }
+                        }
+                    } else {
+                        // Individual-probe mode: targeted index probe per mid.
+                        for (mid, srcs) in by_mid {
+                            for (_, dst) in self.eval_path(step, Some(mid), step_o) {
+                                for &src in &srcs {
+                                    next.push((src, dst));
+                                }
                             }
                         }
                     }
+
                     tracing::debug!(
                         step = idx + 1,
                         unique_mids,
