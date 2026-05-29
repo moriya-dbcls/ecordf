@@ -1858,10 +1858,19 @@ impl<'a> Executor<'a> {
 
             PropertyPath::Sequence(steps) => {
                 // Evaluate left-to-right; intermediate nodes are unbound
+                let t_seq = std::time::Instant::now();
                 let mut current: Vec<(TermId, TermId)> =
                     self.eval_path(&steps[0], s, if steps.len() == 1 { o } else { None });
 
+                tracing::debug!(
+                    step = 0,
+                    pairs = current.len(),
+                    elapsed_us = t_seq.elapsed().as_micros(),
+                    "eval_path Sequence step"
+                );
+
                 for (idx, step) in steps[1..].iter().enumerate() {
+                    let t_step = std::time::Instant::now();
                     let is_last = idx == steps.len() - 2;
                     let step_o = if is_last { o } else { None };
                     // Group by the right-hand intermediate node
@@ -1869,6 +1878,7 @@ impl<'a> Executor<'a> {
                     for (a, b) in &current {
                         by_mid.entry(*b).or_default().push(*a);
                     }
+                    let unique_mids = by_mid.len();
                     let mut next: Vec<(TermId, TermId)> = Vec::new();
                     for (mid, srcs) in by_mid {
                         for (_, dst) in self.eval_path(step, Some(mid), step_o) {
@@ -1877,8 +1887,20 @@ impl<'a> Executor<'a> {
                             }
                         }
                     }
+                    tracing::debug!(
+                        step = idx + 1,
+                        unique_mids,
+                        pairs_out = next.len(),
+                        elapsed_us = t_step.elapsed().as_micros(),
+                        "eval_path Sequence step"
+                    );
                     current = next;
                 }
+                tracing::debug!(
+                    total_us = t_seq.elapsed().as_micros(),
+                    final_pairs = current.len(),
+                    "eval_path Sequence done"
+                );
                 current
             }
 
