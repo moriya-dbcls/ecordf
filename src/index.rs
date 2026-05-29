@@ -33,7 +33,7 @@
 
 use memmap2::{Advice, Mmap};
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -219,6 +219,163 @@ impl SkipIndex {
     }
 }
 
+// ── Predicate secondary index ─────────────────────────────────────────────────
+
+/// Magic for the predicate index file format.
+/// File layout: magic(8) + pred_count(8) + entries[(pred:u64, lo:u64, hi:u64) × pred_count]
+const PIDX_MAGIC: &[u8; 8] = b"ECOPIDX1";
+const PIDX_HDR: usize = 16; // magic(8) + count(8)
+const PIDX_ENTRY: usize = 24; // pred(8) + lo(8) + hi(8)
+
+/// Derive the predicate-index path from the c0 column path.
+/// `dir/pos.c0` → `dir/pos.pidx`
+fn pidx_path_from_c0(c0: &Path) -> PathBuf {
+    let stem = c0
+        .file_stem()
+        .expect("c0 path must have a filename")
+        .to_str()
+        .expect("c0 path must be valid UTF-8");
+    let dir = c0.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!("{}.pidx", stem))
+}
+
+/// Dense in-memory secondary index mapping each predicate TermId to its exact
+/// `[lo, hi)` range in the POS columnar arrays.
+///
+/// ## What this replaces
+///
+/// Previously, `range_for_pattern({p=P, o=*, s=*})` did:
+///   1. `lower_bound_0(P)` — SkipIndex lookup + binary search on c0 → 1 page fault
+///   2. Linear scan forward until c0 changes → reading all of P's range
+///
+/// Step 1 is replaced by a single `HashMap::get` (~10 ns, pure RAM, no I/O).
+/// Step 2 is still needed to read the data, but now we jump *directly* to `lo`
+/// without any binary search overhead.
+///
+/// ## Memory
+///
+/// 24 bytes per unique predicate.  UniProt has ~200 K predicates → ~5 MB.
+/// Typical SPARQL datasets: < 10 K predicates → < 240 KB.
+///
+/// ## Build cost
+///
+/// One sequential scan of the POS c0 column.  Performed once at index-build
+/// time (written alongside `.c0`, `.c1`, `.c2`, `.skip`) or lazily on first
+/// open.  Subsequent opens load the `.pidx` file in microseconds.
+struct PredicateIndex {
+    /// predicate_id → (start_pos, end_pos) in the POS c0/c1/c2 column arrays.
+    ranges: HashMap<TermId, (usize, usize)>,
+}
+
+impl PredicateIndex {
+    /// Build by one sequential scan over sorted POS triples already in RAM.
+    /// Called from `write_columnar_from_sorted` at build time — zero extra I/O.
+    fn build_from_sorted(triples: &[[u64; 3]]) -> Self {
+        let mut ranges: HashMap<TermId, (usize, usize)> = HashMap::new();
+        if triples.is_empty() {
+            return Self { ranges };
+        }
+        let mut cur_pred = triples[0][0]; // c0 = predicate in POS ordering
+        let mut run_start = 0usize;
+        for (i, t) in triples.iter().enumerate().skip(1) {
+            if t[0] != cur_pred {
+                ranges.insert(cur_pred, (run_start, i));
+                cur_pred = t[0];
+                run_start = i;
+            }
+        }
+        ranges.insert(cur_pred, (run_start, triples.len()));
+        Self { ranges }
+    }
+
+    /// Build by one sequential scan over the POS c0 mmap.
+    /// Called on first open when the `.pidx` file is absent.
+    fn build_from_pos_c0(mmap: &Mmap, count: usize) -> Self {
+        let mut ranges: HashMap<TermId, (usize, usize)> = HashMap::new();
+        if count == 0 {
+            return Self { ranges };
+        }
+        let read = |pos: usize| -> u64 {
+            let off = HEADER_SIZE + pos * COL_VALUE_BYTES;
+            u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap())
+        };
+        let mut cur_pred = read(0);
+        let mut run_start = 0usize;
+        for i in 1..count {
+            let p = read(i);
+            if p != cur_pred {
+                ranges.insert(cur_pred, (run_start, i));
+                cur_pred = p;
+                run_start = i;
+            }
+        }
+        ranges.insert(cur_pred, (run_start, count));
+        Self { ranges }
+    }
+
+    /// Build from skip anchors collected during a k-way merge (no extra I/O).
+    /// `pred_runs` is a Vec of `(pred, lo, hi)` tuples collected during the merge loop.
+    fn build_from_runs(pred_runs: Vec<(TermId, usize, usize)>) -> Self {
+        let ranges = pred_runs.into_iter()
+            .map(|(p, lo, hi)| (p, (lo, hi)))
+            .collect();
+        Self { ranges }
+    }
+
+    /// Save to a `.pidx` file alongside the POS `.c0` column.
+    fn save(&self, path: &Path) -> io::Result<()> {
+        let f = File::create(path)?;
+        let mut w = BufWriter::new(f);
+        w.write_all(PIDX_MAGIC)?;
+        w.write_all(&(self.ranges.len() as u64).to_le_bytes())?;
+        let mut entries: Vec<_> = self.ranges.iter().collect();
+        entries.sort_by_key(|(&p, _)| p);
+        for (&pred, &(lo, hi)) in &entries {
+            w.write_all(&pred.to_le_bytes())?;
+            w.write_all(&(lo as u64).to_le_bytes())?;
+            w.write_all(&(hi as u64).to_le_bytes())?;
+        }
+        w.flush()
+    }
+
+    /// Load from a `.pidx` file.
+    fn load(path: &Path) -> io::Result<Self> {
+        let mut buf = Vec::new();
+        File::open(path)?.read_to_end(&mut buf)?;
+        if buf.len() < PIDX_HDR {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "pidx file too small"));
+        }
+        if &buf[0..8] != PIDX_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad pidx magic"));
+        }
+        let n = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
+        if buf.len() != PIDX_HDR + n * PIDX_ENTRY {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "pidx file size mismatch"));
+        }
+        let mut ranges = HashMap::with_capacity(n);
+        for i in 0..n {
+            let off = PIDX_HDR + i * PIDX_ENTRY;
+            let pred = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+            let lo   = u64::from_le_bytes(buf[off + 8..off + 16].try_into().unwrap()) as usize;
+            let hi   = u64::from_le_bytes(buf[off + 16..off + 24].try_into().unwrap()) as usize;
+            ranges.insert(pred, (lo, hi));
+        }
+        Ok(Self { ranges })
+    }
+
+    /// O(1) range lookup for a predicate.  Returns `None` if predicate has no triples.
+    #[inline]
+    fn get(&self, pred: TermId) -> Option<(usize, usize)> {
+        self.ranges.get(&pred).copied()
+    }
+
+    /// Number of distinct predicates tracked.
+    #[allow(dead_code)]
+    fn predicate_count(&self) -> usize {
+        self.ranges.len()
+    }
+}
+
 // ── GSPO quad index constants ─────────────────────────────────────────────────
 const GSPO_MAGIC: &[u8; 8] = b"ECOG0002";
 const QUAD_BYTES: usize = 32; // 4 × u64 : (g, s, p, o)
@@ -341,25 +498,26 @@ impl IndexBuilder {
 
     /// Sort and write to disk in columnar format, then return a read-only `IndexFile`.
     pub fn build(mut self, path: &Path) -> io::Result<IndexFile> {
+        let kind = self.kind;
         if self.chunks.is_empty() {
             // ── In-memory path: data already in RAM, write directly to columns.
             self.triples.sort_unstable();
-            write_columnar_from_sorted(&self.triples, path)?;
+            write_columnar_from_sorted(&self.triples, path, kind)?;
         } else {
             // ── External-sort path: flush remaining buffer, k-way merge → columns.
             self.flush_chunk()?;
             eprintln!(
                 "  Merging {} sorted chunks → {:?} index (columnar)…",
-                self.chunks.len(), self.kind
+                self.chunks.len(), kind
             );
-            merge_triple_chunks(&self.chunks, path)?;
+            merge_triple_chunks(&self.chunks, path, kind)?;
             // Remove individual chunk files (the _ecordf_tmp dir is removed by
             // AllBuilders::build once all indexes are written).
             for chunk in &self.chunks {
                 let _ = std::fs::remove_file(chunk);
             }
         }
-        IndexFile::open(path, self.kind)
+        IndexFile::open(path, kind)
     }
 }
 
@@ -398,14 +556,19 @@ pub(crate) fn write_index_from_sorted(triples: &[[u64; 3]], path: &Path) -> io::
 
 /// Write a sorted slice of triples as three columnar files plus a skip index.
 ///
-/// Given `base_path = dir/spo.bin`, creates:
-///   `dir/spo.c0`   — primary-key column (u64 values, count × 8 bytes)
-///   `dir/spo.c1`   — secondary-key column
-///   `dir/spo.c2`   — tertiary-key column
-///   `dir/spo.skip` — sparse skip index over c0 (built in-memory, no extra I/O)
+/// Given `base_path = dir/pos.bin` and `kind = Pos`, creates:
+///   `dir/pos.c0`   — primary-key column (u64 values, count × 8 bytes)
+///   `dir/pos.c1`   — secondary-key column
+///   `dir/pos.c2`   — tertiary-key column
+///   `dir/pos.skip` — sparse skip index over c0 (built in-memory, no extra I/O)
+///   `dir/pos.pidx` — predicate secondary index (only for Pos; built in-memory)
 ///
 /// Each column file: `magic(8) + count(8) + data[u64 × count]`
-pub(crate) fn write_columnar_from_sorted(triples: &[[u64; 3]], base_path: &Path) -> io::Result<()> {
+pub(crate) fn write_columnar_from_sorted(
+    triples: &[[u64; 3]],
+    base_path: &Path,
+    kind: IndexKind,
+) -> io::Result<()> {
     let paths = col_paths(base_path);
     let count = triples.len() as u64;
     for (ci, path) in paths.iter().enumerate() {
@@ -421,22 +584,32 @@ pub(crate) fn write_columnar_from_sorted(triples: &[[u64; 3]], base_path: &Path)
     // Build and save the skip index from in-memory c0 data — zero extra I/O.
     let skip = SkipIndex::build_from_triples(triples);
     skip.save(&skip_path_from_c0(&paths[0]))?;
+    // Build and save the predicate secondary index for POS — zero extra I/O.
+    if kind == IndexKind::Pos {
+        let pidx = PredicateIndex::build_from_sorted(triples);
+        pidx.save(&pidx_path_from_c0(&paths[0]))?;
+    }
     Ok(())
 }
 
 /// k-way merge of sorted triple chunk files into columnar index files.
 ///
 /// Final output is written as three `.c0`/`.c1`/`.c2` column files derived
-/// from `base_path` (e.g. `spo.bin` → `spo.c0`, `spo.c1`, `spo.c2`).
+/// from `base_path` (e.g. `pos.bin` → `pos.c0`, `pos.c1`, `pos.c2`).
+/// For `kind = Pos` a `.pidx` predicate secondary index is also emitted.
 ///
 /// When `chunks.len() > MAX_FAN_IN` a **hierarchical merge** is performed
 /// automatically using plain chunk format for intermediate passes.
 /// Only the final merge writes columnar output.
 ///
 /// Consecutive duplicate triples are dropped so the output is a set.
-pub(crate) fn merge_triple_chunks(chunks: &[PathBuf], base_path: &Path) -> io::Result<()> {
+pub(crate) fn merge_triple_chunks(
+    chunks: &[PathBuf],
+    base_path: &Path,
+    kind: IndexKind,
+) -> io::Result<()> {
     if chunks.len() <= MAX_FAN_IN {
-        return merge_to_columnar_direct(chunks, base_path);
+        return merge_to_columnar_direct(chunks, base_path, kind);
     }
 
     // ── Hierarchical pass: merge batches → intermediate plain chunk files ─────
@@ -449,9 +622,9 @@ pub(crate) fn merge_triple_chunks(chunks: &[PathBuf], base_path: &Path) -> io::R
 
     // ── Final pass → columnar output ──────────────────────────────────────────
     let result = if intermediates.len() <= MAX_FAN_IN {
-        merge_to_columnar_direct(&intermediates, base_path)
+        merge_to_columnar_direct(&intermediates, base_path, kind)
     } else {
-        merge_triple_chunks(&intermediates, base_path)
+        merge_triple_chunks(&intermediates, base_path, kind)
     };
 
     for p in &intermediates {
@@ -463,9 +636,14 @@ pub(crate) fn merge_triple_chunks(chunks: &[PathBuf], base_path: &Path) -> io::R
 
 /// Merge up to `MAX_FAN_IN` chunk files directly into three columnar files.
 ///
-/// Writes `base_path`-derived `.c0`, `.c1`, `.c2` column files.
+/// Writes `base_path`-derived `.c0`, `.c1`, `.c2` column files plus `.skip`.
+/// For `kind = Pos` also writes a `.pidx` predicate secondary index.
 /// Count is back-patched in each column file after the merge.
-fn merge_to_columnar_direct(chunks: &[PathBuf], base_path: &Path) -> io::Result<()> {
+fn merge_to_columnar_direct(
+    chunks: &[PathBuf],
+    base_path: &Path,
+    kind: IndexKind,
+) -> io::Result<()> {
     let cpaths = col_paths(base_path);
 
     let mut readers: Vec<TripleChunkReader> = chunks.iter()
@@ -496,15 +674,40 @@ fn merge_to_columnar_direct(chunks: &[PathBuf], base_path: &Path) -> io::Result<
         }
     }
 
-    // ── Merge with deduplication + skip anchor collection ────────────────────
+    // ── Merge with deduplication + skip + predicate-run collection ────────────
     let mut count = 0u64;
     let mut prev: Option<[u64; 3]> = None;
     let mut skip_anchors: Vec<u64> = Vec::new();
+    // For Pos: track (pred, run_start, run_end) as c0 transitions.
+    let mut pred_runs: Vec<(TermId, usize, usize)> = if kind == IndexKind::Pos {
+        Vec::new()
+    } else {
+        Vec::with_capacity(0)
+    };
+    let mut cur_pred: Option<TermId> = None;
+    let mut cur_run_start: usize = 0;
+
     while let Some(Reverse((t, i))) = heap.pop() {
         if Some(t) != prev {
-            // Record one anchor every SKIP_STRIDE deduplicated output rows.
-            if (count as usize) % SKIP_STRIDE == 0 {
+            let pos = count as usize;
+            // Record one skip anchor every SKIP_STRIDE deduplicated output rows.
+            if pos % SKIP_STRIDE == 0 {
                 skip_anchors.push(t[0]);
+            }
+            // Track predicate-run boundaries for the Pos predicate index.
+            if kind == IndexKind::Pos {
+                match cur_pred {
+                    None => {
+                        cur_pred = Some(t[0]);
+                        cur_run_start = pos;
+                    }
+                    Some(p) if p != t[0] => {
+                        pred_runs.push((p, cur_run_start, pos));
+                        cur_pred = Some(t[0]);
+                        cur_run_start = pos;
+                    }
+                    _ => {}
+                }
             }
             writers[0].write_all(&t[0].to_le_bytes())?;
             writers[1].write_all(&t[1].to_le_bytes())?;
@@ -516,6 +719,13 @@ fn merge_to_columnar_direct(chunks: &[PathBuf], base_path: &Path) -> io::Result<
             heap.push(Reverse((next, i)));
         }
     }
+    // Close the final predicate run.
+    if kind == IndexKind::Pos {
+        if let Some(p) = cur_pred {
+            pred_runs.push((p, cur_run_start, count as usize));
+        }
+    }
+
     for w in &mut writers { w.flush()?; }
     drop(writers);
 
@@ -529,6 +739,12 @@ fn merge_to_columnar_direct(chunks: &[PathBuf], base_path: &Path) -> io::Result<
     // ── Write skip index (anchors collected during merge, no extra I/O) ───────
     let skip = SkipIndex { anchors: skip_anchors, count: count as usize };
     skip.save(&skip_path_from_c0(&cpaths[0]))?;
+
+    // ── Write predicate secondary index for Pos (no extra I/O) ───────────────
+    if kind == IndexKind::Pos {
+        let pidx = PredicateIndex::build_from_runs(pred_runs);
+        pidx.save(&pidx_path_from_c0(&cpaths[0]))?;
+    }
 
     Ok(())
 }
@@ -650,6 +866,10 @@ pub struct IndexFile {
     /// I/Os to a ≤32 KB contiguous range (1–2 sequential I/Os).
     /// `None` for legacy interleaved indexes (skip not supported there).
     skip:     Option<SkipIndex>,
+    /// Dense predicate secondary index: predicate → exact [lo, hi) range in POS.
+    /// Only populated for the POS index (kind == Pos).
+    /// Turns `range_for_pattern({p=P, o=*})` from binary search → O(1) HashMap lookup.
+    pred_idx: Option<PredicateIndex>,
 }
 
 impl IndexFile {
@@ -684,7 +904,7 @@ impl IndexFile {
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 format!("index size mismatch: {} vs {}", mmap.len(), expected)));
         }
-        Ok(Self { kind, count, storage: IndexStorage::Interleaved { _file: file, mmap }, skip: None })
+        Ok(Self { kind, count, storage: IndexStorage::Interleaved { _file: file, mmap }, skip: None, pred_idx: None })
     }
 
     /// Open three columnar column files (`.c0`, `.c1`, `.c2`).
@@ -749,6 +969,39 @@ impl IndexFile {
             Some(s)
         };
 
+        // ── Load or build the predicate secondary index (Pos only) ─────────────
+        //
+        // For the POS index, each unique predicate occupies a contiguous run of
+        // entries in c0.  The predicate index maps pred → exact (lo, hi) so that
+        // range_for_pattern({p=P, o=*}) can skip the binary search entirely and
+        // jump straight to the right range with a single HashMap::get call.
+        //
+        // Build cost: one sequential c0 scan (same as SkipIndex).  Saved to
+        // `pos.pidx` so subsequent opens are instant (microseconds to read).
+        let pred_idx = if kind == IndexKind::Pos {
+            let pidx_p = pidx_path_from_c0(&paths[0]);
+            if pidx_p.exists() {
+                match PredicateIndex::load(&pidx_p) {
+                    Ok(pi) => Some(pi),
+                    Err(_) => {
+                        // Corrupt file — rebuild.
+                        eprintln!("  [Pos] Rebuilding predicate index (one-time scan of c0)…");
+                        let pi = PredicateIndex::build_from_pos_c0(&mmaps[0], count);
+                        let _ = pi.save(&pidx_p);
+                        Some(pi)
+                    }
+                }
+            } else {
+                // First open after upgrade — build and cache.
+                eprintln!("  [Pos] Building predicate index (one-time scan of c0)…");
+                let pi = PredicateIndex::build_from_pos_c0(&mmaps[0], count);
+                let _ = pi.save(&pidx_p);
+                Some(pi)
+            }
+        } else {
+            None
+        };
+
         // Convert Vec<T> into [T; 3] — safe because we pushed exactly 3 elements.
         let [f0, f1, f2]: [File; 3] = files.try_into()
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "column count != 3"))?;
@@ -763,6 +1016,7 @@ impl IndexFile {
                 mmaps:  [m0, m1, m2],
             },
             skip,
+            pred_idx,
         })
     }
 
@@ -994,6 +1248,10 @@ impl IndexFile {
     ///
     /// With columnar storage the range-end scan reads only col0 or col01,
     /// which keeps the tertiary-key pages cold until triples are emitted.
+    ///
+    /// For the POS index with k0 = predicate and k1 = None (full predicate
+    /// scan), the predicate secondary index gives the answer in O(1) with a
+    /// single HashMap lookup — no binary search, no c0 page fault.
     fn range_for_pattern(&self, raw: &[Option<u64>; 3]) -> (usize, usize) {
         match (raw[0], raw[1]) {
             (Some(k0), Some(k1)) => {
@@ -1007,6 +1265,11 @@ impl IndexFile {
                 (start, end)
             }
             (Some(k0), None) => {
+                // Fast path: predicate secondary index gives exact range in O(1).
+                if let Some(pi) = &self.pred_idx {
+                    return pi.get(k0).unwrap_or((0, 0));
+                }
+                // Fallback: binary search + forward scan (legacy / SPO / OSP).
                 let start = self.lower_bound_0(k0);
                 let mut end = start;
                 while end < self.count {
@@ -1605,6 +1868,24 @@ impl TripleIndex {
     pub fn graph_count(&self) -> usize {
         self.gspo.as_ref().map(|g| g.graphs().len()).unwrap_or(0)
     }
+
+    /// Look up the exact `[lo, hi)` range for a predicate in the POS index.
+    ///
+    /// Returns `Some((lo, hi))` when the predicate secondary index is available
+    /// (always the case for columnar-format stores built or opened with this version).
+    /// Returns `None` when the predicate is absent or the index is not loaded.
+    ///
+    /// This is a pure in-RAM operation — no disk I/O, no binary search.
+    pub fn pos_predicate_range(&self, pred: TermId) -> Option<(usize, usize)> {
+        self.pos.pred_idx.as_ref()?.get(pred)
+    }
+
+    /// Number of distinct predicates in the store (from the predicate index).
+    pub fn predicate_count(&self) -> usize {
+        self.pos.pred_idx.as_ref()
+            .map(|pi| pi.predicate_count())
+            .unwrap_or(0)
+    }
 }
 
 // ── Parallel chunk collection ─────────────────────────────────────────────────
@@ -1747,9 +2028,9 @@ impl AllBuilders {
         );
 
         // Run the three triple-index merges in parallel (each writes a different file).
-        let merge_spo = || Self::merge_or_empty(&spo_chunks, &spo_path);
-        let merge_pos = || Self::merge_or_empty(&pos_chunks, &pos_path);
-        let merge_osp = || Self::merge_or_empty(&osp_chunks, &osp_path);
+        let merge_spo = || Self::merge_or_empty(&spo_chunks, &spo_path, IndexKind::Spo);
+        let merge_pos = || Self::merge_or_empty(&pos_chunks, &pos_path, IndexKind::Pos);
+        let merge_osp = || Self::merge_or_empty(&osp_chunks, &osp_path, IndexKind::Osp);
 
         let (r_spo, (r_pos, r_osp)) = rayon::join(
             merge_spo,
@@ -1785,11 +2066,11 @@ impl AllBuilders {
     }
 
     /// Helper: merge chunks into columnar files at `path`, or write empty columns if no chunks.
-    fn merge_or_empty(chunks: &[PathBuf], path: &Path) -> io::Result<()> {
+    fn merge_or_empty(chunks: &[PathBuf], path: &Path, kind: IndexKind) -> io::Result<()> {
         if chunks.is_empty() {
-            write_columnar_from_sorted(&[], path)
+            write_columnar_from_sorted(&[], path, kind)
         } else {
-            merge_triple_chunks(chunks, path)
+            merge_triple_chunks(chunks, path, kind)
         }
     }
 
