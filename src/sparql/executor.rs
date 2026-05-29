@@ -2656,6 +2656,18 @@ fn plan_needs_outer_binding(plan: &ExecutionPlan, left_vars: &[String]) -> bool 
         ExecutionPlan::ScanBound { outer_vars, .. } => {
             outer_vars.iter().any(|(v, _)| left_vars.contains(v))
         }
+        // PathPattern uses substitute_term(s/o, outer) to inject outer bindings,
+        // so it needs bind_join whenever s or o is a left-side variable.
+        ExecutionPlan::PathPattern { s, o, .. } => {
+            let uses_left_var = |t: &Term| -> bool {
+                match t {
+                    Term::Variable(v) => left_vars.contains(v),
+                    Term::BlankNode(b) => left_vars.contains(b),
+                    _ => false,
+                }
+            };
+            uses_left_var(s) || uses_left_var(o)
+        }
         ExecutionPlan::Join(l, r)
         | ExecutionPlan::Optional(l, r)
         | ExecutionPlan::Union(l, r) => {
