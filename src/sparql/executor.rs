@@ -217,12 +217,20 @@ impl<'a> Executor<'a> {
             return bindings;
         }
 
+        // Log how many rows came out of the raw BGP before post-processing.
+        tracing::debug!(bgp_us, rows_before_post = bindings.rows.len(), "BGP done");
+
+        let t_post = Instant::now();
+
         // 3. Apply GROUP BY + aggregates if present.
         //    If GROUP BY is absent but the projection contains aggregate expressions
         //    (e.g. COUNT(*), SUM(?x)), all rows form a single implicit group — SPARQL 1.1 §11.
         if !query.group_by.is_empty() || projection_has_aggregates(query) {
+            let t = Instant::now();
             bindings = self.apply_group_by(&bindings, query);
+            tracing::debug!(groupby_us = t.elapsed().as_micros(), rows = bindings.rows.len(), "GROUP BY");
         }
+        let bgp_rows = bindings.rows.len();
 
         // 4. Apply HAVING
         for having in &query.having {
@@ -234,6 +242,7 @@ impl<'a> Executor<'a> {
 
         // 5. Apply ORDER BY
         if !query.order_by.is_empty() {
+            let t = Instant::now();
             let vars = bindings.variables.clone();
             let order = query.order_by.clone();
             bindings.rows.sort_by(|a, b| {
@@ -250,13 +259,22 @@ impl<'a> Executor<'a> {
                 }
                 std::cmp::Ordering::Equal
             });
+            tracing::debug!(orderby_us = t.elapsed().as_micros(), rows = bindings.rows.len(), "ORDER BY");
         }
 
         // 6. Apply DISTINCT before LIMIT (SPARQL 1.1 §18.2.5: DISTINCT/REDUCED are applied
         //    before slicing with OFFSET/LIMIT — doing it after would give wrong row counts).
         if query.distinct {
+            let t = Instant::now();
+            let before = bindings.rows.len();
             bindings.rows.sort_unstable();
             bindings.rows.dedup();
+            tracing::debug!(
+                distinct_us = t.elapsed().as_micros(),
+                rows_in = before,
+                rows_out = bindings.rows.len(),
+                "DISTINCT"
+            );
         }
 
         // 7. OFFSET + LIMIT
@@ -272,14 +290,15 @@ impl<'a> Executor<'a> {
         }
 
         // 8. Project output variables
-        let post_us = t_bgp.elapsed().as_micros() - bgp_us;
+        let post_us = t_post.elapsed().as_micros();
         let result = self.project(&bindings, &query.projection);
         tracing::debug!(
             plan_us,
             bgp_us,
+            bgp_rows,
             post_us,
             rows = result.rows.len(),
-            "execute_select"
+            "execute_select done"
         );
         result
     }

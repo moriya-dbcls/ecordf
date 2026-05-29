@@ -552,14 +552,16 @@ impl Store {
                 let rows = rs.rows.len();
                 let execute_us = t.elapsed().as_micros();
                 let total_us   = t_total.elapsed().as_micros();
+                // Truncate to ~400 chars for the log; full query visible at DEBUG level.
                 tracing::info!(
                     parse_us,
                     execute_us,
                     total_us,
                     rows,
-                    q = &sparql[..sparql.len().min(200)],
+                    q = &sparql[..sparql.len().min(400)],
                     "query"
                 );
+                tracing::debug!(sparql, "full query");
                 QueryResult::Select(rs)
             }
             QueryForm::Ask(ref aq) => {
