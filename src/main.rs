@@ -114,6 +114,28 @@ enum Command {
         /// For UniProt-scale stores, 4096–16384 is useful.
         #[arg(long, default_value_t = 0, value_name = "MB")]
         warmup_mb: u64,
+
+        /// rdf-config directories to load for path-cache materialisation.
+        /// Each entry is either a local directory path containing prefix.yaml + model.yaml,
+        /// or a GitHub tree URL such as:
+        ///   https://github.com/dbcls/rdf-config/tree/master/config/uniprot
+        ///
+        /// Compound property paths (multi-hop predicate chains through blank nodes)
+        /// found in the model.yaml files are pre-materialised in RAM so that SPARQL
+        /// property-path queries avoid repeated HDD scans.
+        ///
+        /// May be specified multiple times:
+        ///   --rdf-config https://github.com/dbcls/rdf-config/tree/master/config/uniprot
+        ///   --rdf-config https://github.com/dbcls/rdf-config/tree/master/config/jpostdb
+        ///
+        /// When omitted, falls back to [model] rdf_configs in ecordf.toml.
+        #[arg(long, value_name = "URL_OR_DIR", action = clap::ArgAction::Append)]
+        rdf_config: Vec<String>,
+
+        /// RAM budget (MiB) for the path cache built from rdf-config compound paths.
+        /// When 0 (default), falls back to [model] path_cache_mb in ecordf.toml.
+        #[arg(long, default_value_t = 0, value_name = "MB")]
+        path_cache_mb: u64,
     },
 
     /// Execute a SPARQL query from command line
@@ -243,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Command::Serve { dir, host, port, cors, config, warmup_mb } => {
+        Command::Serve { dir, host, port, cors, config, warmup_mb, rdf_config, path_cache_mb } => {
             let mut store = Store::open_with_config(&dir, config.as_deref())?;
             let stats = store.stats();
             eprintln!(
@@ -278,6 +300,30 @@ async fn main() -> anyhow::Result<()> {
                 store.build_pred_cache_sync(pred_cache_mb);
                 eprintln!("Predicate cache ready ({} MB used).",
                     store.pred_cache.bytes_used() / (1024 * 1024));
+            }
+            // Build path cache from rdf-config compound paths.
+            // CLI --rdf-config flags override [model] rdf_configs in ecordf.toml.
+            let effective_rdf_configs: Vec<String> = if !rdf_config.is_empty() {
+                rdf_config
+            } else {
+                store.config.model.rdf_configs.clone()
+            };
+            let effective_path_cache_mb = if path_cache_mb > 0 {
+                path_cache_mb
+            } else {
+                store.config.model.path_cache_mb
+            };
+            if !effective_rdf_configs.is_empty() && effective_path_cache_mb > 0 {
+                eprintln!(
+                    "Building path cache ({} MB) from {} rdf-config spec(s)...",
+                    effective_path_cache_mb, effective_rdf_configs.len()
+                );
+                store.build_path_cache(&effective_rdf_configs, effective_path_cache_mb);
+                eprintln!(
+                    "Path cache ready: {} path(s), {} MB used.",
+                    store.path_cache.len(),
+                    store.path_cache.bytes_used() / (1024 * 1024)
+                );
             }
             ecordf::server::serve(store, &effective_host, effective_port, effective_cors.as_deref()).await?;
         }

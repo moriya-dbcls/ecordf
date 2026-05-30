@@ -34,6 +34,15 @@
 //! # Per-predicate cap = pred_cache_mb / 2.  Default 1024 covers faldo:position
 //! # (11.8 M entries = 188 MB) on JPostDB.  Set 0 to disable.
 //! pred_cache_mb = 1024
+//!
+//! [model]
+//! # rdf-config directories (local paths or GitHub tree URLs) to load at startup.
+//! # Compound property paths found in model.yaml files are pre-materialised in RAM.
+//! # rdf_configs = [
+//! #   "https://github.com/dbcls/rdf-config/tree/master/config/uniprot",
+//! #   "https://github.com/dbcls/rdf-config/tree/master/config/jpostdb",
+//! # ]
+//! path_cache_mb = 0   # disabled by default; set to e.g. 512 to enable
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -54,6 +63,8 @@ pub struct Config {
     pub query: QueryConfig,
     /// HTTP server defaults (overridable via CLI flags).
     pub server: ServerConfig,
+    /// RDF model / schema hints for query optimisation.
+    pub model: ModelConfig,
 }
 
 impl Default for Config {
@@ -62,6 +73,7 @@ impl Default for Config {
             build: BuildConfig::default(),
             query: QueryConfig::default(),
             server: ServerConfig::default(),
+            model: ModelConfig::default(),
         }
     }
 }
@@ -343,6 +355,53 @@ impl Default for ServerConfig {
             max_concurrent_queries: 0, // unlimited by default
             warmup_mb: 0,              // disabled by default
             pred_cache_mb: 1024,       // 1024 MB heap; 50% cap = 512 MB/predicate (covers faldo)
+        }
+    }
+}
+
+// ── Model config ──────────────────────────────────────────────────────────────
+
+/// RDF model / schema hints for query optimisation.
+///
+/// EcoRDF can read rdf-config `model.yaml` + `prefix.yaml` files at startup
+/// to discover commonly-used compound property paths (multi-hop traversals
+/// through blank nodes).  These paths are pre-materialised in RAM so that
+/// SPARQL property-path evaluation avoids repeated HDD scans.
+///
+/// ## Example
+///
+/// ```toml
+/// [model]
+/// rdf_configs = [
+///   "https://github.com/dbcls/rdf-config/tree/master/config/uniprot",
+///   "https://github.com/dbcls/rdf-config/tree/master/config/jpostdb",
+///   "/local/path/to/my-rdf-config",
+/// ]
+/// path_cache_mb = 512
+/// ```
+///
+/// Each entry in `rdf_configs` is either:
+/// - A GitHub repository tree URL (`https://github.com/<owner>/<repo>/tree/<branch>/<path>`)
+/// - A local directory path containing `prefix.yaml` and `model.yaml`
+///
+/// Paths of length ≥ 2 extracted from the model are materialised up to
+/// `path_cache_mb` MiB of RAM.  Set `path_cache_mb = 0` to parse the model
+/// but skip materialisation (useful for diagnostics).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ModelConfig {
+    /// List of rdf-config directories to load (local paths or GitHub URLs).
+    pub rdf_configs: Vec<String>,
+
+    /// RAM budget (MiB) for the path cache.  Set to 0 to disable.
+    pub path_cache_mb: u64,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            rdf_configs: Vec::new(),
+            path_cache_mb: 0, // disabled unless explicitly configured
         }
     }
 }

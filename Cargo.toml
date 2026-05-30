@@ -61,6 +61,12 @@ anyhow = "1"
 # Configuration file parsing
 toml = "0.8"
 
+# YAML parsing (for rdf-config model.yaml / prefix.yaml)
+serde_yaml = "0.9"
+
+# HTTP client for fetching rdf-config from GitHub URLs (sync, lightweight)
+ureq = "2"
+
 [features]
 default = ["gzip"]
 gzip = ["dep:flate2"]

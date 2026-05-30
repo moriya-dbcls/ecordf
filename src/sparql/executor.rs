@@ -33,6 +33,7 @@ use std::time::Instant;
 use crate::config::QueryConfig;
 use crate::dict_builder::QueryDict;
 use crate::index::{GspoIndexFile, TripleIndex};
+use crate::path_cache::PathCache;
 use crate::predcache::{self, PredCache};
 use crate::stats::StoreStatistics;
 use crate::triple::{TermId, TriplePattern, UNBOUND};
@@ -175,15 +176,18 @@ pub struct Executor<'a> {
     /// In-RAM predicate cache for accelerating large predicate scans.
     /// `PredCache::empty()` when no cache is configured.
     pub pred_cache: PredCache,
+    /// In-RAM path cache for multi-hop property paths from rdf-config.
+    /// `PathCache::empty()` when no cache is configured.
+    pub path_cache: PathCache,
 }
 
 impl<'a> Executor<'a> {
     pub fn new(index: &'a TripleIndex, dict: &'a QueryDict) -> Self {
-        Self { index, dict, config: QueryConfig::default(), stats: None, pred_cache: PredCache::empty() }
+        Self { index, dict, config: QueryConfig::default(), stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty() }
     }
 
     pub fn with_config(index: &'a TripleIndex, dict: &'a QueryDict, config: QueryConfig) -> Self {
-        Self { index, dict, config, stats: None, pred_cache: PredCache::empty() }
+        Self { index, dict, config, stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty() }
     }
 
     pub fn with_config_and_stats(
@@ -192,7 +196,7 @@ impl<'a> Executor<'a> {
         config: QueryConfig,
         stats: Option<&'a StoreStatistics>,
     ) -> Self {
-        Self { index, dict, config, stats, pred_cache: PredCache::empty() }
+        Self { index, dict, config, stats, pred_cache: PredCache::empty(), path_cache: PathCache::empty() }
     }
 
     /// Builder: attach a predicate cache.
@@ -202,6 +206,16 @@ impl<'a> Executor<'a> {
     /// instead of triggering a sequential HDD scan.
     pub fn with_pred_cache(mut self, cache: PredCache) -> Self {
         self.pred_cache = cache;
+        self
+    }
+
+    /// Builder: attach a path cache.
+    ///
+    /// The cache is built at server startup from rdf-config compound paths.
+    /// Multi-hop property paths found in the cache are served from a RAM-resident
+    /// sorted array instead of stepping through the index hop-by-hop.
+    pub fn with_path_cache(mut self, cache: PathCache) -> Self {
+        self.path_cache = cache;
         self
     }
 
@@ -2382,6 +2396,52 @@ impl<'a> Executor<'a> {
             PropertyPath::Sequence(steps) if steps.is_empty() => Vec::new(),
 
             PropertyPath::Sequence(steps) => {
+                // ── Fast path: path cache lookup ──────────────────────────────
+                // If all steps are simple IRI predicates AND this exact predicate
+                // sequence was pre-materialised from rdf-config model.yaml, serve
+                // the result from RAM without any HDD traversal.
+                if !self.path_cache.is_empty() {
+                    let path_ids: Option<Vec<TermId>> = steps.iter()
+                        .map(|step| {
+                            if let PropertyPath::Iri(iri) = step {
+                                self.dict.lookup(iri)
+                            } else {
+                                None // Non-IRI steps can't be in the path cache
+                            }
+                        })
+                        .collect();
+
+                    if let Some(ids) = path_ids {
+                        if let Some(cached) = self.path_cache.get(&ids) {
+                            tracing::debug!(
+                                steps = steps.len(),
+                                cached_pairs = cached.len(),
+                                mode = "path_cache_hit",
+                                "eval_path Sequence: path cache hit"
+                            );
+                            // Apply endpoint filters on the cached (start, end) pairs
+                            return match (s, o) {
+                                (None, None) => (*cached).clone(),
+                                (Some(sid), None) => {
+                                    let lo = cached.partition_point(|&(cs, _)| cs < sid);
+                                    let hi = lo + cached[lo..].partition_point(|&(cs, _)| cs == sid);
+                                    cached[lo..hi].to_vec()
+                                }
+                                (None, Some(oid)) => {
+                                    cached.iter().filter(|&&(_, co)| co == oid).copied().collect()
+                                }
+                                (Some(sid), Some(oid)) => {
+                                    if cached.binary_search(&(sid, oid)).is_ok() {
+                                        vec![(sid, oid)]
+                                    } else {
+                                        Vec::new()
+                                    }
+                                }
+                            };
+                        }
+                    }
+                }
+
                 // Evaluate left-to-right; intermediate nodes are unbound
                 let t_seq = std::time::Instant::now();
                 let mut current: Vec<(TermId, TermId)> =

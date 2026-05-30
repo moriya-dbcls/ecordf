@@ -22,7 +22,9 @@ use crate::loader::{collect_strings_from_inputs, collect_strings_parallel,
                     load_files, load_files_with_graphs,
                     load_triples_with_readonly_dict, load_triples_parallel,
                     load_triples_streaming, InputSpec};
+use crate::path_cache::PathCache;
 use crate::predcache::PredCache;
+use crate::rdf_config;
 use crate::sparql::{parse_query, Executor, ResultSet};
 use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
 use crate::stats::StoreStatistics;
@@ -40,6 +42,9 @@ pub struct Store {
     /// In-RAM predicate cache built at startup.
     /// Empty when `server.pred_cache_mb = 0`.
     pub pred_cache: PredCache,
+    /// In-RAM path cache built from rdf-config model.yaml compound paths.
+    /// Empty when `model.path_cache_mb = 0` or no rdf_configs are specified.
+    pub path_cache: PathCache,
 }
 
 impl Store {
@@ -99,7 +104,7 @@ impl Store {
         let dict = QueryDict::from_legacy(id_to_str, str_to_id);
         let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache })
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache, path_cache: PathCache::empty() })
     }
 
     // ── internal: two-pass (external-sort dict) ───────────────────────────────
@@ -346,7 +351,7 @@ impl Store {
         let dict = QueryDict::from_mmap(ReadonlyDict::open(&store_dict_sorted)?);
         let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache })
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache, path_cache: PathCache::empty() })
     }
 
     /// Build a new store from RDF input files with optional per-file named graph assignment.
@@ -376,7 +381,7 @@ impl Store {
             let dict = QueryDict::from_legacy(id_to_str, str_to_id);
             let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
             let pred_cache = PredCache::empty();
-            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache })
+            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache, path_cache: PathCache::empty() })
         }
     }
 
@@ -407,7 +412,7 @@ impl Store {
             let dict = QueryDict::from_legacy(id_to_str, str_to_id);
             let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
             let pred_cache = PredCache::empty();
-            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache })
+            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache, path_cache: PathCache::empty() })
         }
     }
 
@@ -418,7 +423,7 @@ impl Store {
         let config = Config::resolve(None, dir).map_err(io::Error::from)?;
         let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache })
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache, path_cache: PathCache::empty() })
     }
 
     /// Reopen an existing store and apply an explicit config file (overrides
@@ -429,7 +434,7 @@ impl Store {
         let config = Config::resolve(config_path, dir).map_err(io::Error::from)?;
         let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache })
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache, path_cache: PathCache::empty() })
     }
 
     /// Replace the active configuration without reopening indexes.
@@ -539,6 +544,32 @@ impl Store {
         );
     }
 
+    /// Build the in-RAM path cache from rdf-config compound paths.
+    ///
+    /// Reads `model.yaml` and `prefix.yaml` from each spec in `rdf_config_specs`,
+    /// extracts compound paths (multi-hop predicate chains through blank nodes),
+    /// and materialises each path as a sorted `Vec<(TermId, TermId)>`.
+    ///
+    /// This is called synchronously before `serve()` so the first query is
+    /// guaranteed to hit the cache.  `budget_mb = 0` is a no-op.
+    pub fn build_path_cache(&mut self, rdf_config_specs: &[String], budget_mb: u64) {
+        if budget_mb == 0 || rdf_config_specs.is_empty() {
+            return;
+        }
+        let compound_paths = rdf_config::load_compound_paths(rdf_config_specs);
+        if compound_paths.is_empty() {
+            tracing::info!("path-cache: no compound paths found in rdf-config specs");
+            return;
+        }
+        let budget_bytes = (budget_mb as usize) * 1024 * 1024;
+        self.path_cache = PathCache::build(&compound_paths, &self.dict, &*self.index, budget_bytes);
+        tracing::info!(
+            paths_cached = self.path_cache.len(),
+            mb_used = self.path_cache.bytes_used() / (1024 * 1024),
+            "build_path_cache: complete"
+        );
+    }
+
     /// Spawn a background thread to build the in-RAM predicate cache.
     ///
     /// Returns immediately; the cache is populated predicate-by-predicate but
@@ -595,7 +626,8 @@ impl Store {
             &self.dict,
             self.config.query.clone(),
             Some(&self.stats),
-        ).with_pred_cache(self.pred_cache.clone());
+        ).with_pred_cache(self.pred_cache.clone())
+         .with_path_cache(self.path_cache.clone());
 
         // ── Phase 2: Execute (plan + BGP evaluation) ──────────────────────────
         let t = Instant::now();
