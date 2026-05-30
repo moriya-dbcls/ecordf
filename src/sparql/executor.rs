@@ -443,9 +443,20 @@ impl<'a> Executor<'a> {
                     let n = left_rs.rows.len() as u64;
                     let path_steps = path_step_count(path).max(1) as u64;
 
-                    // When all path steps are in the pred_cache, bind_join replaces cold
-                    // HDD SPO seeks with in-RAM binary searches (~2 µs vs 150 ms per hop).
-                    let all_cached = path_all_iris_cached(path, &self.dict, &self.pred_cache);
+                    // ── Cache-aware seek cost ────────────────────────────────
+                    // Priority 1: full path in path_cache
+                    //   → bind_join does a binary search per group: O(log M) ≈ 2 µs.
+                    //   → hash_join would clone the entire cached Vec (potentially
+                    //     100s of MB) then hash-probe.  Bind_join wins decisively.
+                    //
+                    // Priority 2: all individual steps in pred_cache
+                    //   → bind_join replaces cold HDD SPO seeks with RAM binary
+                    //     searches (~2 µs vs 150 ms).
+                    //
+                    // Priority 3: neither → use cold-HDD SPO seek estimate.
+                    let path_cached = path_in_path_cache(path, &self.dict, &self.path_cache);
+                    let all_cached  = path_cached
+                        || path_all_iris_cached(path, &self.dict, &self.pred_cache);
                     let seek_ns = if all_cached { CACHE_SEEK_NS } else { SPO_SEEK_NS };
                     let bind_cost_ns = n * path_steps * seek_ns;
 
@@ -463,6 +474,7 @@ impl<'a> Executor<'a> {
                             tracing::debug!(
                                 left_rows = n,
                                 path_steps,
+                                path_cached,
                                 all_cached,
                                 seek_ns,
                                 bind_cost_us = bind_cost_ns / 1000,
@@ -3632,6 +3644,40 @@ fn describe_plan(plan: &ExecutionPlan, indent: usize) -> String {
 
 /// Extract the first bare IRI leaf from a PropertyPath.
 /// Used to estimate POS scan cost for the cost-based PathPattern join decision.
+/// Return `true` if this exact property path (as a flat Sequence of IRI steps)
+/// has been pre-materialised in the `path_cache`.
+///
+/// When `true`, the cost model uses `CACHE_SEEK_NS` (2 µs) instead of
+/// `SPO_SEEK_NS` (150 ms) for the bind-join estimate, making bind-join the
+/// winner even for moderate left-side cardinalities (e.g. 508 rows × 2 steps
+/// × 2 µs = 2 ms vs hash-join cloning 11.8 M pairs = several seconds).
+fn path_in_path_cache(
+    path: &PropertyPath,
+    dict: &QueryDict,
+    path_cache: &PathCache,
+) -> bool {
+    if path_cache.is_empty() {
+        return false;
+    }
+    // Collect predicate IDs for a flat Sequence of IRI steps only.
+    // Any other shape (Inverse, Alternative, repetition) is not in path_cache.
+    let ids: Option<Vec<TermId>> = match path {
+        PropertyPath::Sequence(steps) => steps.iter().map(|s| {
+            if let PropertyPath::Iri(iri) = s {
+                dict.lookup(iri)
+            } else {
+                None
+            }
+        }).collect(),
+        PropertyPath::Iri(iri) => dict.lookup(iri).map(|id| vec![id]),
+        _ => None,
+    };
+    match ids {
+        Some(ref v) if v.len() >= 2 => path_cache.get(v).is_some(),
+        _ => false,
+    }
+}
+
 /// Returns `None` for paths that start with a repetition (unknown range).
 /// Returns true when every non-wildcard step in `path` is a simple IRI predicate
 /// whose (subject, object) pairs are already loaded in `pred_cache`.

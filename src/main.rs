@@ -318,10 +318,17 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 store.config.model.rdf_configs.clone()
             };
+            // If --rdf-config is given but --path-cache-mb is omitted, default to 512 MB.
+            // This avoids the footgun of fetching YAML but never building the cache.
+            const DEFAULT_PATH_CACHE_MB: u64 = 512;
             let effective_path_cache_mb = if path_cache_mb > 0 {
                 path_cache_mb
-            } else {
+            } else if store.config.model.path_cache_mb > 0 {
                 store.config.model.path_cache_mb
+            } else if !effective_rdf_configs.is_empty() {
+                DEFAULT_PATH_CACHE_MB // implicit default when --rdf-config is used
+            } else {
+                0
             };
             if !effective_rdf_configs.is_empty() && effective_path_cache_mb > 0 {
                 eprintln!(
