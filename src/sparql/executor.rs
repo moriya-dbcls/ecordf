@@ -384,22 +384,24 @@ impl<'a> Executor<'a> {
                 // join) based on a cost model rather than a fixed threshold.
                 //
                 // Cost model (cold cache):
-                //   bind_join cost ≈ N_groups × path_steps × 150 µs   (SPO seek)
+                //   bind_join cost ≈ N_groups × path_steps × 150 ms   (cold SSD SPO seek)
                 //   hash_join cost ≈ first_pred_range × 48 ns          (seq read)
                 //
                 // We estimate first_pred_range via pos_predicate_range().
                 // For paths whose first predicate is unknown/starred we fall back
                 // to a conservative fixed threshold of 500.
                 //
-                // Examples:
-                //   faldo (N=263, 2-hop, pred_range=300K):
-                //     bind = 263 × 2 × 150µs = 79ms
-                //     scan = 300K × 48ns = 14ms → hash_join wins
-                //   faldo (N=263, pred_range=40M uniprot:begin_position):
-                //     bind = 79ms  scan = 1920ms → bind_join wins
+                // Examples (cold SSD, 150ms/probe):
+                //   faldo (N=508, 2-hop, pred_range=11.8M jpo:faldo:begin):
+                //     bind = 508 × 2 × 150ms = 152s (observed: 161s ✓)
+                //     scan = 11.8M × 48ns = 567ms → hash_join wins by 284×
+                //   faldo (N=508, pred_range=40M uniprot:begin_position):
+                //     bind = 152s  scan = 1920ms → hash_join still wins (7.9×)
                 if let ExecutionPlan::PathPattern { path, .. } = right.as_ref() {
-                    // SPO seek cost: ~150 µs per group per hop.
-                    const SPO_SEEK_NS: u64 = 150_000;
+                    // SPO seek cost: ~150 ms per group per hop (cold SSD page fault).
+                    // Empirical: faldo N=508, 2-hop → bind_join took 161s = 317ms/probe.
+                    // With 150ms: 508 × 2 × 150ms = 152s ≈ observed. Not 150µs.
+                    const SPO_SEEK_NS: u64 = 150_000_000;
                     // Sequential POS read cost: ~48 ns per triple.
                     const POS_READ_NS: u64 = 48;
 
@@ -1078,11 +1080,12 @@ impl<'a> Executor<'a> {
 
         // ── Cost gate ─────────────────────────────────────────────────────────
         // POS sequential scan costs ~48 ns/triple (500 MB/s, 24 bytes per row).
-        // SPO SkipIndex targeted probe costs ~150 µs per group (1 page fault).
-        // Crossover: use POS scan only when pred_range < groups.len() × 3125.
-        // For small N (e.g. N=57, pred_range=16.7M): SPO ≈ 8.6ms, POS ≈ 800ms.
-        // → fall back to SPO bind_join when the predicate range is too large.
-        const CROSSOVER: usize = 3125; // (150_000 ns) / (48 ns) = 3125 triples
+        // SPO SkipIndex targeted probe costs ~150 ms per group (cold SSD seek).
+        // Crossover: use POS scan only when pred_range < groups.len() × 3_125_000.
+        // Empirical: N=263, pred=14.6M triples → SPO=121s cold, POS=701ms (172× faster).
+        // For small N with huge pred range (N=57, pred=16.7M): POS still wins (800ms).
+        // → fall back to SPO bind_join only when pred range is astronomically large.
+        const CROSSOVER: usize = 3_125_000; // (150_000_000 ns) / (48 ns) = 3,125,000 triples
         if let Some((lo, hi)) = self.index.pos_predicate_range(base.p) {
             let pred_range = hi - lo;
             if pred_range > groups.len().saturating_mul(CROSSOVER) {
