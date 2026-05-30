@@ -115,6 +115,14 @@ enum Command {
         #[arg(long, default_value_t = 0, value_name = "MB")]
         warmup_mb: u64,
 
+        /// RAM budget (MiB) for the in-RAM predicate cache.
+        /// Predicates are loaded largest-first so expensive predicates like
+        /// faldo:position (11.8 M entries = 188 MB) are cached before small ones.
+        /// When 0 (default), falls back to [server] pred_cache_mb in ecordf.toml.
+        /// Per-predicate cap = pred_cache_mb / 2.  1024 covers faldo on JPostDB.
+        #[arg(long, default_value_t = 0, value_name = "MB")]
+        pred_cache_mb: u64,
+
         /// rdf-config directories to load for path-cache materialisation.
         /// Each entry is either a local directory path containing prefix.yaml + model.yaml,
         /// or a GitHub tree URL such as:
@@ -265,7 +273,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Command::Serve { dir, host, port, cors, config, warmup_mb, rdf_config, path_cache_mb } => {
+        Command::Serve { dir, host, port, cors, config, warmup_mb, pred_cache_mb, rdf_config, path_cache_mb } => {
             let mut store = Store::open_with_config(&dir, config.as_deref())?;
             let stats = store.stats();
             eprintln!(
@@ -294,8 +302,10 @@ async fn main() -> anyhow::Result<()> {
             // Largest predicates (faldo:position, faldo:begin etc.) are loaded first
             // so the first query hits the cache.  Startup is blocked but query
             // latency is deterministic from the very first request.
-            let pred_cache_mb = store.config.server.pred_cache_mb;
-            if pred_cache_mb > 0 {
+            // CLI --pred-cache-mb takes precedence; fall back to config file value.
+            let effective_pred_cache_mb = if pred_cache_mb > 0 { pred_cache_mb } else { store.config.server.pred_cache_mb };
+            if effective_pred_cache_mb > 0 {
+                let pred_cache_mb = effective_pred_cache_mb;
                 eprintln!("Building predicate cache ({} MB)...", pred_cache_mb);
                 store.build_pred_cache_sync(pred_cache_mb);
                 eprintln!("Predicate cache ready ({} MB used).",
