@@ -421,12 +421,24 @@ impl<'a> Executor<'a> {
                     // Sequential POS read cost on HDD: ~200 ns per triple.
                     // HDD sequential ~120 MB/s, 24 bytes/triple → 24/120e6 = 200 ns.
                     const POS_READ_NS: u64 = 200;
+                    // RAM binary-search cost when pred_cache is loaded.
+                    // log2(11.8M) ≈ 23 comparisons × ~5 ns/cmp × 2 (range query) ≈ 230 ns.
+                    // Use 2000 ns (2 µs) as a conservative upper bound including overhead.
+                    const CACHE_SEEK_NS: u64 = 2_000;
 
                     let n = left_rs.rows.len() as u64;
                     let path_steps = path_step_count(path).max(1) as u64;
-                    let bind_cost_ns = n * path_steps * SPO_SEEK_NS;
+
+                    // When all path steps are in the pred_cache, bind_join replaces cold
+                    // HDD SPO seeks with in-RAM binary searches (~2 µs vs 150 ms per hop).
+                    let all_cached = path_all_iris_cached(path, &self.dict, &self.pred_cache);
+                    let seek_ns = if all_cached { CACHE_SEEK_NS } else { SPO_SEEK_NS };
+                    let bind_cost_ns = n * path_steps * seek_ns;
 
                     // Estimate scan cost using the first predicate's POS range.
+                    // With pred_cache, a full scan still needs to materialise the pairs
+                    // (either from HDD or from a cache clone), so we keep the HDD estimate;
+                    // bind_join with cache will win anyway when seek_ns is tiny.
                     let scan_cost_ns: Option<u64> = path_first_iri(path)
                         .and_then(|iri| self.dict.lookup(iri))
                         .and_then(|pred_id| self.index.pos_predicate_range(pred_id))
@@ -437,6 +449,8 @@ impl<'a> Executor<'a> {
                             tracing::debug!(
                                 left_rows = n,
                                 path_steps,
+                                all_cached,
+                                seek_ns,
                                 bind_cost_us = bind_cost_ns / 1000,
                                 scan_cost_us = scan / 1000,
                                 "Join PathPattern: cost model"
@@ -2309,6 +2323,42 @@ impl<'a> Executor<'a> {
                     Some(id) => id,
                     None => return Vec::new(),
                 };
+
+                // Fast path: serve from pred_cache when available.
+                // - (None, None)   → return clone of all cached pairs (sorted by S).
+                // - (Some, None)   → binary search for s range → O(log N) seeks.
+                // - (Some, Some)   → binary search for exact (s, o) → O(log N).
+                // - (None, Some)   → skip cache (sorted by S, not O; scan is better).
+                if let Some(cached) = self.pred_cache.get(p_id) {
+                    match (s, o) {
+                        (Some(sid), None) => {
+                            // Subject fixed: binary search for the run [sid, sid+1).
+                            let lo = cached.partition_point(|&(cs, _)| cs < sid);
+                            let hi = lo + cached[lo..].partition_point(|&(cs, _)| cs == sid);
+                            return cached[lo..hi].iter().map(|&(_, co)| (sid, co)).collect();
+                        }
+                        (Some(sid), Some(oid)) => {
+                            // Both fixed: single binary search.
+                            if cached.binary_search(&(sid, oid)).is_ok() {
+                                return vec![(sid, oid)];
+                            } else {
+                                return Vec::new();
+                            }
+                        }
+                        (None, None) => {
+                            // Full scan: clone the entire Vec.
+                            // Expensive (may be 100+ MB) but correct; hash_join will be
+                            // chosen by the cost model anyway if the left side is large.
+                            // bind_join uses the (Some, None) branch above instead.
+                            return (**cached).clone();
+                        }
+                        (None, Some(_)) => {
+                            // Object fixed, subject free: cache is sorted by S, so we
+                            // can't binary-search by O.  Fall through to index scan.
+                        }
+                    }
+                }
+
                 let pat = TriplePattern::new(s.unwrap_or(UNBOUND), p_id, o.unwrap_or(UNBOUND));
                 self.index.scan(&pat).map(|t| (t.s, t.o)).collect()
             }
@@ -2350,26 +2400,56 @@ impl<'a> Executor<'a> {
                     let step_o = if is_last { o } else { None };
                     let mut next: Vec<(TermId, TermId)> = Vec::new();
 
-                    // ── Fast path: cached predicate merge-join ────────────────
+                    // ── Fast path: cached predicate ──────────────────────────
                     // When the step is a simple IRI predicate and its (subject, object)
-                    // pairs are loaded in the pred_cache, use an O(N) linear merge
-                    // instead of a sequential HDD scan + HashMap filter.
+                    // pairs are loaded in the pred_cache, avoid the HDD scan entirely.
                     //
-                    // The POS scan at step=0 produces pairs sorted by (P,O,S) =
-                    // sorted by the `mid` value (second element of each (src,mid) pair).
-                    // The cached data is sorted by (S=mid, O=dst).
-                    // merge_join_unsorted sorts current by mid if needed, then merges.
+                    // Two strategies depending on how many intermediate nodes we have:
+                    //
+                    // LARGE current (>32 pairs, hash_join mode):
+                    //   merge_join_unsorted — O(N_current + N_cached) linear pass.
+                    //   The POS scan at step=0 gives pairs sorted by O (the mid value).
+                    //   Cached data is sorted by S (=mid). Linear merge = ~500ms for 11.8M.
+                    //
+                    // SMALL current (≤32 pairs, bind_join per-subject mode):
+                    //   Binary search per mid — O(N_current × log N_cached).
+                    //   For N_current=1-2, log₂(11.8M)=23 comps → ~0.01ms.
+                    //   Merge_join would do a full linear scan = 11.8M ops per call!
+                    //
+                    // Threshold matches BATCH_SCAN_THRESHOLD so the two code paths
+                    // are consistent.
+                    const CACHE_BSEARCH_THRESHOLD: usize = 32;
                     let used_cache = if let PropertyPath::Iri(ref iri) = *step {
                         if let Some(pred_id) = self.dict.lookup(iri) {
                             if let Some(cached) = self.pred_cache.get(pred_id) {
-                                tracing::debug!(
-                                    step = idx + 1,
-                                    current_pairs = current.len(),
-                                    cached_pairs = cached.len(),
-                                    mode = "pred_cache_merge",
-                                    "eval_path Sequence: using cached predicate merge-join"
-                                );
-                                predcache::merge_join_unsorted(&mut current, &*cached, step_o, &mut next);
+                                if current.len() > CACHE_BSEARCH_THRESHOLD {
+                                    tracing::debug!(
+                                        step = idx + 1,
+                                        current_pairs = current.len(),
+                                        cached_pairs = cached.len(),
+                                        mode = "pred_cache_merge_join",
+                                        "eval_path Sequence: using cached predicate merge-join"
+                                    );
+                                    predcache::merge_join_unsorted(&mut current, &*cached, step_o, &mut next);
+                                } else {
+                                    tracing::debug!(
+                                        step = idx + 1,
+                                        current_pairs = current.len(),
+                                        cached_pairs = cached.len(),
+                                        mode = "pred_cache_bsearch",
+                                        "eval_path Sequence: using cached predicate binary-search"
+                                    );
+                                    // Binary search per mid: O(N_current × log N_cached).
+                                    for &(src, mid) in current.iter() {
+                                        let lo = cached.partition_point(|&(cs, _)| cs < mid);
+                                        let hi = lo + cached[lo..].partition_point(|&(cs, _)| cs == mid);
+                                        for &(_, dst) in &cached[lo..hi] {
+                                            if step_o.map_or(true, |eo| eo == dst) {
+                                                next.push((src, dst));
+                                            }
+                                        }
+                                    }
+                                }
                                 true
                             } else { false }
                         } else { false }
@@ -3493,6 +3573,35 @@ fn describe_plan(plan: &ExecutionPlan, indent: usize) -> String {
 /// Extract the first bare IRI leaf from a PropertyPath.
 /// Used to estimate POS scan cost for the cost-based PathPattern join decision.
 /// Returns `None` for paths that start with a repetition (unknown range).
+/// Returns true when every non-wildcard step in `path` is a simple IRI predicate
+/// whose (subject, object) pairs are already loaded in `pred_cache`.
+///
+/// Used by the PathPattern cost model: when all steps are cached, a bind-join
+/// uses O(N_groups × log M) RAM binary searches instead of O(N_groups) cold HDD
+/// seeks, making bind-join essentially free vs hash-join's 11.8M-row materialisation.
+fn path_all_iris_cached(
+    path: &PropertyPath,
+    dict: &QueryDict,
+    pred_cache: &PredCache,
+) -> bool {
+    match path {
+        PropertyPath::Iri(iri) => dict
+            .lookup(iri)
+            .map(|id| pred_cache.get(id).is_some())
+            .unwrap_or(false),
+        PropertyPath::Sequence(steps) => steps.iter().all(|s| path_all_iris_cached(s, dict, pred_cache)),
+        // Inverse: the pred_cache is sorted by (S, O). For a bind_join step,
+        // the bind value becomes the OBJECT, so we need to search by O — which
+        // the cache can't do efficiently.  Return false so bind_join uses the
+        // real SPO_SEEK_NS cost estimate instead of the optimistic CACHE_SEEK_NS.
+        PropertyPath::Inverse(_) => false,
+        // Alternative: conservative — both branches must be cacheable.
+        PropertyPath::Alternative(alts) => alts.iter().all(|a| path_all_iris_cached(a, dict, pred_cache)),
+        // Repetitions: bind-join cannot use binary search (depth unknown); decline.
+        PropertyPath::ZeroOrMore(_) | PropertyPath::OneOrMore(_) | PropertyPath::ZeroOrOne(_) => false,
+    }
+}
+
 fn path_first_iri(path: &PropertyPath) -> Option<&str> {
     match path {
         PropertyPath::Iri(iri) => Some(iri.as_str()),

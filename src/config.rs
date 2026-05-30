@@ -29,6 +29,11 @@
 //! # Pre-populate the OS page cache on startup (0 = disabled).
 //! # For UniProt-scale stores, 4096–16384 MB is useful.
 //! warmup_mb   = 0
+//! # In-RAM predicate cache — loads small-to-medium predicates into a sorted Vec
+//! # at startup so the first query is as fast as subsequent page-cached ones.
+//! # Per-predicate cap = pred_cache_mb / 2.  Default 1024 covers faldo:position
+//! # (11.8 M entries = 188 MB) on JPostDB.  Set 0 to disable.
+//! pred_cache_mb = 1024
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -305,18 +310,25 @@ pub struct ServerConfig {
     /// making **the first query as fast as subsequent (page-cached) ones**.
     ///
     /// Predicates are selected smallest-first; no single predicate may exceed
-    /// 25% of the budget.  Building runs in a background thread so the server
+    /// 50% of the budget.  Building runs in a background thread so the server
     /// accepts queries immediately.
     ///
     /// **RAM impact**: this budget is process heap (RSS), not OS page cache.
     /// Avoid values that would squeeze out other workloads.
     ///
-    /// | Value | Typical coverage (JPostDB) |
-    /// |-------|---------------------------|
-    /// | 0     | disabled (default)         |
-    /// | 256   | faldo + small predicates   |
-    /// | 512   | faldo:position + begin/end + JPOST medium predicates |
-    /// | 1024  | most predicates < 30 M triples |
+    /// The per-predicate cap is `pred_cache_mb / 2`.  For faldo:position
+    /// (11.8 M entries × 16 B = 188 MB), the budget must be ≥ 512 MB so the
+    /// cap (256 MB) exceeds the predicate's size.  The default 1024 MB gives a
+    /// comfortable 512 MB cap and leaves room for both faldo predicates plus
+    /// the many small JPOST predicates.
+    ///
+    /// | Value | Typical coverage (JPostDB)                       |
+    /// |-------|--------------------------------------------------|
+    /// | 0     | disabled                                          |
+    /// | 512   | small predicates only (cap = 256 MB, but faldo:  |
+    /// |       |   position = 188 MB just barely fits the cap)    |
+    /// | 1024  | faldo:position + faldo:begin + JPOST predicates  |
+    /// | 2048  | most predicates < 60 M triples (cap = 1024 MB)  |
     ///
     /// Overridable with `--pred-cache-mb` on the command line.
     pub pred_cache_mb: u64,
@@ -330,7 +342,7 @@ impl Default for ServerConfig {
             cors_origins: String::new(),
             max_concurrent_queries: 0, // unlimited by default
             warmup_mb: 0,              // disabled by default
-            pred_cache_mb: 512,        // 512 MB heap for predicate cache
+            pred_cache_mb: 1024,       // 1024 MB heap; 50% cap = 512 MB/predicate (covers faldo)
         }
     }
 }

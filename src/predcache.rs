@@ -101,7 +101,12 @@ impl PredCache {
 
 fn build_cache(cache: &PredCache, index: &TripleIndex, budget_bytes: usize) {
     let t0 = Instant::now();
-    let per_pred_cap = (budget_bytes / 4).max(1); // no single predicate > 25% of budget
+    // Allow a single predicate to use up to 50% of the total budget.
+    // A 25% cap (budget/4) sounds conservative but with 512 MB it limits to 128 MB per
+    // predicate — too small for faldo:position (11.8 M entries × 16 B = 188 MB).
+    // A 50% cap allows faldo:position/begin to be cached while still preventing a
+    // single runaway predicate from consuming everything.
+    let per_pred_cap = (budget_bytes / 2).max(1); // no single predicate > 50% of budget
 
     // Predicates sorted smallest-first; skip those that won't fit.
     let sizes = index.predicate_sizes();
