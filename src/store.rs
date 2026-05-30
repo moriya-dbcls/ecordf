@@ -518,14 +518,29 @@ impl Store {
         });
     }
 
+    /// Build the in-RAM predicate cache **synchronously** in the calling thread.
+    ///
+    /// Blocks until all predicates within the budget are loaded (largest-first,
+    /// no single predicate > 50% of the budget).  Call this before `serve` so
+    /// the first query is guaranteed to hit the cache rather than falling back
+    /// to HDD scans.
+    ///
+    /// `pred_cache_mb = 0` is a no-op.
+    pub fn build_pred_cache_sync(&mut self, pred_cache_mb: u64) {
+        if pred_cache_mb == 0 { return; }
+        let budget_bytes = (pred_cache_mb as usize) * 1024 * 1024;
+        let cache = PredCache::empty();
+        self.pred_cache = cache.clone();
+        cache.build_sync(&*self.index, budget_bytes);
+    }
+
     /// Spawn a background thread to build the in-RAM predicate cache.
     ///
-    /// `pred_cache_mb = 0` disables the cache entirely.  Otherwise predicates
-    /// are loaded smallest-first until the budget is exhausted (no single
-    /// predicate may exceed 25% of the budget).
+    /// Returns immediately; the cache is populated predicate-by-predicate but
+    /// **does not guarantee the cache is ready before the first query**.
+    /// Prefer [`build_pred_cache_sync`] at startup.
     ///
-    /// Queries run normally during the build; they fall back to index scans for
-    /// predicates not yet in the cache.
+    /// `pred_cache_mb = 0` is a no-op.
     pub fn build_pred_cache(&mut self, pred_cache_mb: u64) {
         if pred_cache_mb == 0 { return; }
         let budget_bytes = (pred_cache_mb as usize) * 1024 * 1024;

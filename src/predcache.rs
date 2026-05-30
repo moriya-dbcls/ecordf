@@ -16,10 +16,11 @@
 //! ## Memory budget
 //!
 //! Controlled by `server.pred_cache_mb` in `ecordf.toml`.  Predicates are
-//! loaded smallest-first (to maximise predicate coverage) with a per-predicate
-//! cap of `budget / 4` to prevent one huge predicate from monopolising the
-//! budget.  Building happens in a background thread; queries run normally during
-//! warmup, falling back to index scans for not-yet-cached predicates.
+//! loaded **largest-first** (within the 50%-of-budget per-predicate cap) so that
+//! expensive predicates like `faldo:position` (11.8 M entries = 188 MB) are
+//! cached before tiny ones.  After large predicates are loaded, remaining budget
+//! is filled with smaller predicates.  Building is **synchronous** at startup so
+//! the first query is guaranteed to hit the cache.
 //!
 //! ## Empirical impact (JPostDB, HDD)
 //!
@@ -79,14 +80,24 @@ impl PredCache {
         self.inner.read().map(|g| g.bytes_used).unwrap_or(0)
     }
 
+    /// Build the cache synchronously in the **calling thread**.
+    ///
+    /// Blocks until all predicates within the budget are loaded.  Call this
+    /// before starting the HTTP server so the first query is guaranteed to hit
+    /// the cache rather than falling back to HDD scans.
+    pub fn build_sync(self, index: &TripleIndex, budget_bytes: usize) {
+        build_cache(&self, index, budget_bytes);
+    }
+
     /// Spawn a background thread that fills the cache up to `budget_bytes`.
     ///
     /// Takes `Arc<TripleIndex>` (not `TripleIndex`) because `TripleIndex` contains
     /// mmap'd files that don't implement Clone.  The Arc is cheaply cloned to give
     /// the background thread shared ownership without copying any index data.
     ///
-    /// Returns immediately; the cache is populated incrementally and becomes
-    /// usable predicate-by-predicate as each scan completes.
+    /// Returns immediately; the cache is populated predicate-by-predicate but
+    /// **does not guarantee the cache is ready before the first query**.
+    /// Prefer [`build_sync`] at startup unless you explicitly want async warmup.
     pub fn build_background(self, index: Arc<TripleIndex>, budget_bytes: usize) {
         std::thread::Builder::new()
             .name("pred-cache-builder".into())
@@ -108,8 +119,13 @@ fn build_cache(cache: &PredCache, index: &TripleIndex, budget_bytes: usize) {
     // single runaway predicate from consuming everything.
     let per_pred_cap = (budget_bytes / 2).max(1); // no single predicate > 50% of budget
 
-    // Predicates sorted smallest-first; skip those that won't fit.
-    let sizes = index.predicate_sizes();
+    // Load predicates largest-first (within per_pred_cap) so that expensive
+    // predicates like faldo:position (11.8 M entries = 188 MB) are cached before
+    // tiny ones.  `predicate_sizes()` returns ascending order; reverse it here.
+    // Use `continue` (not `break`) when a predicate doesn't fit in the remaining
+    // budget — smaller predicates later in the list may still fit.
+    let mut sizes = index.predicate_sizes();
+    sizes.sort_unstable_by(|a, b| b.1.cmp(&a.1)); // descending by count
     let mut total_loaded: usize = 0;
     let mut total_bytes: usize = 0;
     let mut remaining = budget_bytes;
@@ -124,9 +140,10 @@ fn build_cache(cache: &PredCache, index: &TripleIndex, budget_bytes: usize) {
         if count == 0 { continue; }
         let entry_bytes = count * 16; // 16 bytes per (u64, u64) pair
 
-        // Skip predicates that would exceed per-predicate cap or remaining budget.
+        // Skip predicates that exceed the per-predicate cap (too big to be useful).
         if entry_bytes > per_pred_cap { continue; }
-        if entry_bytes > remaining { break; }
+        // Skip predicates that no longer fit, but keep trying smaller ones.
+        if entry_bytes > remaining { continue; }
 
         let pat = TriplePattern::new(UNBOUND, pred_id, UNBOUND);
         let mut pairs: Vec<(TermId, TermId)> = index.scan(&pat)

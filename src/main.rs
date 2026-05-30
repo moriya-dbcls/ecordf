@@ -268,11 +268,16 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("Warming up {} MB of indexes in background...", effective_warmup_mb);
                 store.warmup_background(effective_warmup_mb);
             }
-            // Build predicate cache in background (avoids cold-start penalty on first query).
+            // Build predicate cache synchronously before serving queries.
+            // Largest predicates (faldo:position, faldo:begin etc.) are loaded first
+            // so the first query hits the cache.  Startup is blocked but query
+            // latency is deterministic from the very first request.
             let pred_cache_mb = store.config.server.pred_cache_mb;
             if pred_cache_mb > 0 {
-                eprintln!("Building predicate cache ({} MB) in background...", pred_cache_mb);
-                store.build_pred_cache(pred_cache_mb);
+                eprintln!("Building predicate cache ({} MB)...", pred_cache_mb);
+                store.build_pred_cache_sync(pred_cache_mb);
+                eprintln!("Predicate cache ready ({} MB used).",
+                    store.pred_cache.bytes_used() / (1024 * 1024));
             }
             ecordf::server::serve(store, &effective_host, effective_port, effective_cors.as_deref()).await?;
         }
