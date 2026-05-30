@@ -85,8 +85,10 @@ impl PredCache {
     /// Blocks until all predicates within the budget are loaded.  Call this
     /// before starting the HTTP server so the first query is guaranteed to hit
     /// the cache rather than falling back to HDD scans.
-    pub fn build_sync(self, index: &TripleIndex, budget_bytes: usize) {
-        build_cache(&self, index, budget_bytes);
+    ///
+    /// `per_pred_cap_bytes = 0` → use the default 50%-of-budget cap.
+    pub fn build_sync(self, index: &TripleIndex, budget_bytes: usize, per_pred_cap_bytes: usize) {
+        build_cache(&self, index, budget_bytes, per_pred_cap_bytes);
     }
 
     /// Spawn a background thread that fills the cache up to `budget_bytes`.
@@ -98,11 +100,13 @@ impl PredCache {
     /// Returns immediately; the cache is populated predicate-by-predicate but
     /// **does not guarantee the cache is ready before the first query**.
     /// Prefer [`build_sync`] at startup unless you explicitly want async warmup.
-    pub fn build_background(self, index: Arc<TripleIndex>, budget_bytes: usize) {
+    ///
+    /// `per_pred_cap_bytes = 0` → use the default 50%-of-budget cap.
+    pub fn build_background(self, index: Arc<TripleIndex>, budget_bytes: usize, per_pred_cap_bytes: usize) {
         std::thread::Builder::new()
             .name("pred-cache-builder".into())
             .spawn(move || {
-                build_cache(&self, &*index, budget_bytes);
+                build_cache(&self, &*index, budget_bytes, per_pred_cap_bytes);
             })
             .expect("failed to spawn pred-cache builder thread");
     }
@@ -110,14 +114,26 @@ impl PredCache {
 
 // ── Cache builder ─────────────────────────────────────────────────────────────
 
-fn build_cache(cache: &PredCache, index: &TripleIndex, budget_bytes: usize) {
+fn build_cache(cache: &PredCache, index: &TripleIndex, budget_bytes: usize, per_pred_cap_bytes: usize) {
     let t0 = Instant::now();
-    // Allow a single predicate to use up to 50% of the total budget.
-    // A 25% cap (budget/4) sounds conservative but with 512 MB it limits to 128 MB per
-    // predicate — too small for faldo:position (11.8 M entries × 16 B = 188 MB).
-    // A 50% cap allows faldo:position/begin to be cached while still preventing a
-    // single runaway predicate from consuming everything.
-    let per_pred_cap = (budget_bytes / 2).max(1); // no single predicate > 50% of budget
+    // Per-predicate size cap.
+    //
+    // When `per_pred_cap_bytes` is non-zero, it is used directly (set by
+    // `pred_cache_per_pred_cap_mb` in config or `--pred-cache-per-pred-cap-mb` on CLI).
+    //
+    // When zero, fall back to 50% of the total budget.  A 50% cap allows
+    // faldo:position/begin (≈188 MB) to be cached with a 512 MB budget while
+    // still preventing a single runaway predicate from consuming everything.
+    //
+    // Motivation for the explicit cap: if two huge predicates (e.g. 479 MB each)
+    // consume 957 MB of a 1024 MB budget, the remaining 67 MB is not enough for
+    // faldo:begin/position (178 MB each).  Setting `pred_cache_per_pred_cap_mb=200`
+    // causes those 479 MB predicates to be skipped, freeing space for faldo.
+    let per_pred_cap = if per_pred_cap_bytes > 0 {
+        per_pred_cap_bytes
+    } else {
+        (budget_bytes / 2).max(1) // default: no single predicate > 50% of budget
+    };
 
     // Load predicates largest-first (within per_pred_cap) so that expensive
     // predicates like faldo:position (11.8 M entries = 188 MB) are cached before
@@ -132,6 +148,7 @@ fn build_cache(cache: &PredCache, index: &TripleIndex, budget_bytes: usize) {
 
     tracing::info!(
         budget_mb = budget_bytes / (1024 * 1024),
+        per_pred_cap_mb = per_pred_cap / (1024 * 1024),
         predicates = sizes.len(),
         "pred-cache: starting build"
     );

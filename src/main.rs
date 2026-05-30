@@ -123,6 +123,15 @@ enum Command {
         #[arg(long, default_value_t = 0, value_name = "MB")]
         pred_cache_mb: u64,
 
+        /// Per-predicate size cap (MiB) for the predicate cache.
+        /// When 0 (default), falls back to [server] pred_cache_per_pred_cap_mb in ecordf.toml,
+        /// which itself defaults to 0 (= pred_cache_mb / 2).
+        /// Use this when two large predicates dominate the budget and crowd out smaller ones.
+        /// Example: --pred-cache-per-pred-cap-mb 200  skips predicates > 200 MB,
+        /// freeing space for faldo:begin/position (178 MB each).
+        #[arg(long, default_value_t = 0, value_name = "MB")]
+        pred_cache_per_pred_cap_mb: u64,
+
         /// rdf-config directories to load for path-cache materialisation.
         /// Each entry is either a local directory path containing prefix.yaml + model.yaml,
         /// or a GitHub tree URL such as:
@@ -273,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Command::Serve { dir, host, port, cors, config, warmup_mb, pred_cache_mb, rdf_config, path_cache_mb } => {
+        Command::Serve { dir, host, port, cors, config, warmup_mb, pred_cache_mb, pred_cache_per_pred_cap_mb, rdf_config, path_cache_mb } => {
             let mut store = Store::open_with_config(&dir, config.as_deref())?;
             let stats = store.stats();
             eprintln!(
@@ -304,10 +313,22 @@ async fn main() -> anyhow::Result<()> {
             // latency is deterministic from the very first request.
             // CLI --pred-cache-mb takes precedence; fall back to config file value.
             let effective_pred_cache_mb = if pred_cache_mb > 0 { pred_cache_mb } else { store.config.server.pred_cache_mb };
+            let effective_per_pred_cap_mb = if pred_cache_per_pred_cap_mb > 0 {
+                pred_cache_per_pred_cap_mb
+            } else {
+                store.config.server.pred_cache_per_pred_cap_mb
+            };
             if effective_pred_cache_mb > 0 {
-                let pred_cache_mb = effective_pred_cache_mb;
-                eprintln!("Building predicate cache ({} MB)...", pred_cache_mb);
-                store.build_pred_cache_sync(pred_cache_mb);
+                eprintln!(
+                    "Building predicate cache ({} MB, per-predicate cap = {} MB)...",
+                    effective_pred_cache_mb,
+                    if effective_per_pred_cap_mb > 0 {
+                        effective_per_pred_cap_mb.to_string()
+                    } else {
+                        format!("{} (default 50%)", effective_pred_cache_mb / 2)
+                    }
+                );
+                store.build_pred_cache_sync(effective_pred_cache_mb, effective_per_pred_cap_mb);
                 eprintln!("Predicate cache ready ({} MB used).",
                     store.pred_cache.bytes_used() / (1024 * 1024));
             }

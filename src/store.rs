@@ -531,12 +531,14 @@ impl Store {
     /// to HDD scans.
     ///
     /// `pred_cache_mb = 0` is a no-op.
-    pub fn build_pred_cache_sync(&mut self, pred_cache_mb: u64) {
+    /// `per_pred_cap_mb = 0` → use the default 50%-of-budget cap.
+    pub fn build_pred_cache_sync(&mut self, pred_cache_mb: u64, per_pred_cap_mb: u64) {
         if pred_cache_mb == 0 { return; }
         let budget_bytes = (pred_cache_mb as usize) * 1024 * 1024;
+        let per_pred_cap_bytes = (per_pred_cap_mb as usize) * 1024 * 1024;
         let cache = PredCache::empty();
         self.pred_cache = cache.clone();
-        cache.build_sync(&*self.index, budget_bytes);
+        cache.build_sync(&*self.index, budget_bytes, per_pred_cap_bytes);
         tracing::info!(
             bytes_used = self.pred_cache.bytes_used(),
             mb_used = self.pred_cache.bytes_used() / (1024 * 1024),
@@ -577,12 +579,14 @@ impl Store {
     /// Prefer [`build_pred_cache_sync`] at startup.
     ///
     /// `pred_cache_mb = 0` is a no-op.
-    pub fn build_pred_cache(&mut self, pred_cache_mb: u64) {
+    /// `per_pred_cap_mb = 0` → use the default 50%-of-budget cap.
+    pub fn build_pred_cache(&mut self, pred_cache_mb: u64, per_pred_cap_mb: u64) {
         if pred_cache_mb == 0 { return; }
         let budget_bytes = (pred_cache_mb as usize) * 1024 * 1024;
+        let per_pred_cap_bytes = (per_pred_cap_mb as usize) * 1024 * 1024;
         let cache = PredCache::empty();
         self.pred_cache = cache.clone();
-        cache.build_background(Arc::clone(&self.index), budget_bytes);
+        cache.build_background(Arc::clone(&self.index), budget_bytes, per_pred_cap_bytes);
         tracing::info!(
             pred_cache_mb,
             "pred-cache: background build started"

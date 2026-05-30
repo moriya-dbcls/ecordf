@@ -34,6 +34,10 @@
 //! # Per-predicate cap = pred_cache_mb / 2.  Default 1024 covers faldo:position
 //! # (11.8 M entries = 188 MB) on JPostDB.  Set 0 to disable.
 //! pred_cache_mb = 1024
+//! # Per-predicate cap (MiB).  0 = use pred_cache_mb / 2 (default behaviour).
+//! # Set to e.g. 200 to prevent two 479 MB predicates from consuming 957 MB of
+//! # a 1024 MB budget, crowding out faldo:begin/position (178 MB each).
+//! pred_cache_per_pred_cap_mb = 0
 //!
 //! [model]
 //! # rdf-config directories (local paths or GitHub tree URLs) to load at startup.
@@ -344,6 +348,31 @@ pub struct ServerConfig {
     ///
     /// Overridable with `--pred-cache-mb` on the command line.
     pub pred_cache_mb: u64,
+
+    /// Per-predicate size cap (MiB) for the predicate cache.
+    ///
+    /// Limits how large any single predicate's entry may be.  When a predicate's
+    /// (subject, object) pairs would require more than this many MiB, it is skipped
+    /// during cache build.
+    ///
+    /// **Why this matters**: the default cap is `pred_cache_mb / 2`.  If two
+    /// predicates are each close to (but under) that cap, they can together consume
+    /// almost the entire budget, leaving no room for smaller predicates that you
+    /// actually care about.
+    ///
+    /// Example: with `pred_cache_mb = 1024` (cap = 512 MB), two predicates at
+    /// 479 MB each consume 957 MB, leaving only 67 MB — not enough for
+    /// faldo:begin/position (178 MB each).  Setting `pred_cache_per_pred_cap_mb = 200`
+    /// skips the 479 MB predicates so faldo gets cached instead.
+    ///
+    /// | Value | Effect                                                        |
+    /// |-------|---------------------------------------------------------------|
+    /// | 0     | use `pred_cache_mb / 2` (default)                            |
+    /// | 200   | skip predicates > 200 MB; keeps faldo (178 MB) within budget |
+    /// | 512   | same as default with pred_cache_mb = 1024                    |
+    ///
+    /// Overridable with `--pred-cache-per-pred-cap-mb` on the command line.
+    pub pred_cache_per_pred_cap_mb: u64,
 }
 
 impl Default for ServerConfig {
@@ -354,7 +383,8 @@ impl Default for ServerConfig {
             cors_origins: String::new(),
             max_concurrent_queries: 0, // unlimited by default
             warmup_mb: 0,              // disabled by default
-            pred_cache_mb: 1024,       // 1024 MB heap; 50% cap = 512 MB/predicate (covers faldo)
+            pred_cache_mb: 1024,           // 1024 MB heap; 50% cap = 512 MB/predicate (covers faldo)
+            pred_cache_per_pred_cap_mb: 0, // 0 = use pred_cache_mb / 2 (default)
         }
     }
 }
