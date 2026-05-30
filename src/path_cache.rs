@@ -92,14 +92,32 @@ impl PathCache {
         self.entries.get(path).cloned()
     }
 
-    /// Build a PathCache by materialising all `compound_paths`.
+    /// Build a PathCache by materialising all `compound_paths` and their
+    /// contiguous sub-sequences.
     ///
-    /// - Resolves each IRI string in each path to a `TermId` via `dict`.
-    ///   Paths containing unknown IRIs are skipped (warn-logged).
-    /// - Traverses the index hop-by-hop, collecting (start, end) pairs.
-    /// - Sorts and deduplicates each path's pairs.
-    /// - Respects `budget_bytes`: stops adding new paths once the budget is
-    ///   exhausted.  Paths are processed in declaration order.
+    /// ## Sub-sequence expansion
+    ///
+    /// `rdf_config` extracts paths starting from each class's root predicate
+    /// (e.g. `[up:annotation, up:range, faldo:begin, faldo:position]`), but
+    /// SPARQL queries often traverse only a *suffix* of that chain
+    /// (e.g. `faldo:begin / faldo:position`).  This method expands every input
+    /// path into **all contiguous sub-sequences of length ≥ 2** so that
+    /// any suffix or middle segment is also cached.
+    ///
+    /// Example expansion of `[A, B, C]`:
+    /// - `[A, B]`, `[B, C]` (length 2)
+    /// - `[A, B, C]`        (length 3)
+    ///
+    /// Sub-sequences are materialised **shortest-first**: short paths tend to
+    /// be queried more often and are cheaper to store, so they get priority
+    /// when the budget is tight.
+    ///
+    /// ## Other behaviour
+    ///
+    /// - Paths containing unknown IRIs (not in the dictionary) are skipped.
+    /// - Empty materialised results are not stored.
+    /// - Budget (`budget_bytes`) is respected; materialisation stops once the
+    ///   total exceeds the limit.
     pub fn build(
         compound_paths: &[CompoundPath],
         dict: &QueryDict,
@@ -107,20 +125,23 @@ impl PathCache {
         budget_bytes: usize,
     ) -> Self {
         let t0 = Instant::now();
+
+        // Expand input paths into all contiguous sub-sequences of length ≥ 2.
+        // Sort shortest-first so short (frequently-queried) sub-paths get
+        // priority when budget is limited.
+        let expanded = expand_subseqs(compound_paths);
+
         let mut entries: HashMap<Vec<TermId>, PathPairs> = HashMap::new();
         let mut total_bytes: usize = 0;
 
         tracing::info!(
-            paths = compound_paths.len(),
+            input_paths = compound_paths.len(),
+            expanded_paths = expanded.len(),
             budget_mb = budget_bytes / (1024 * 1024),
-            "path-cache: starting build"
+            "path-cache: starting build (with sub-sequence expansion)"
         );
 
-        for path_iris in compound_paths {
-            if path_iris.len() < 2 {
-                continue; // single-hop paths handled by PredCache
-            }
-
+        for path_iris in &expanded {
             // Resolve IRI strings → TermIds
             let path_ids: Vec<TermId> = match resolve_path(path_iris, dict) {
                 Some(ids) => ids,
@@ -133,7 +154,7 @@ impl PathCache {
                 }
             };
 
-            // Already cached (could be a duplicate from multiple rdf-config sources)
+            // Already cached (duplicate sub-sequence from different parent paths)
             if entries.contains_key(&path_ids) {
                 continue;
             }
@@ -156,9 +177,9 @@ impl PathCache {
                     mb = pair_bytes / (1024 * 1024),
                     "path-cache: budget exhausted, skipping remaining paths"
                 );
-                // Unlike PredCache we stop here — paths are ordered by importance
-                // in the model.yaml (most common patterns first).
-                break;
+                // Continue scanning (don't break) — a later shorter path might
+                // still fit in the remaining budget.
+                continue;
             }
 
             tracing::debug!(
@@ -185,6 +206,38 @@ impl PathCache {
             bytes_used: total_bytes,
         }
     }
+}
+
+// ── Sub-sequence expansion ────────────────────────────────────────────────────
+
+/// Expand compound paths into every contiguous sub-sequence of length ≥ 2.
+///
+/// Given paths from rdf-config (which are already prefix-closed — every prefix
+/// of a full path is emitted), this additionally generates **internal** and
+/// **suffix** sub-sequences that don't start from the root predicate.
+///
+/// Example: `["A", "B", "C"]` →
+///   - length 2: `["A","B"]`, `["B","C"]`
+///   - length 3: `["A","B","C"]`
+///
+/// The result is sorted **shortest-first** so that short, frequently-queried
+/// paths are prioritised when the budget is limited.  Duplicates (the same
+/// sub-sequence appearing in multiple parent paths) are removed.
+fn expand_subseqs(paths: &[CompoundPath]) -> Vec<CompoundPath> {
+    let mut result: Vec<CompoundPath> = Vec::new();
+    for path in paths {
+        let n = path.len();
+        if n < 2 { continue; }
+        for start in 0..n {
+            for end in (start + 2)..=n {
+                result.push(path[start..end].to_vec());
+            }
+        }
+    }
+    // Sort shortest-first, then lexicographically for deterministic ordering.
+    result.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    result.dedup();
+    result
 }
 
 // ── Path resolution ───────────────────────────────────────────────────────────
@@ -322,6 +375,48 @@ mod tests {
         let mut result_sorted = result.clone();
         result_sorted.sort();
         assert_eq!(result_sorted, expected);
+    }
+
+    #[test]
+    fn test_expand_subseqs_basic() {
+        let paths = vec![
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+        ];
+        let expanded = expand_subseqs(&paths);
+        // Expected (length-2 first, then length-3):
+        // ["A","B"], ["B","C"], ["A","B","C"]
+        assert_eq!(expanded, vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["B".to_string(), "C".to_string()],
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+        ]);
+    }
+
+    #[test]
+    fn test_expand_subseqs_dedup() {
+        // Two paths share a suffix — ["B","C"] should appear only once.
+        let paths = vec![
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            vec!["X".to_string(), "B".to_string(), "C".to_string()],
+        ];
+        let expanded = expand_subseqs(&paths);
+        let bc_count = expanded.iter()
+            .filter(|p| p.as_slice() == ["B".to_string(), "C".to_string()])
+            .count();
+        assert_eq!(bc_count, 1, "['B','C'] should appear exactly once after dedup");
+    }
+
+    #[test]
+    fn test_expand_subseqs_four_hop() {
+        // 4-hop path → 3 length-2, 2 length-3, 1 length-4 = 6 sub-sequences
+        let paths = vec![
+            vec!["A".to_string(), "B".to_string(), "C".to_string(), "D".to_string()],
+        ];
+        let expanded = expand_subseqs(&paths);
+        assert_eq!(expanded.len(), 6);
+        // Shortest come first
+        assert!(expanded[0].len() == 2);
+        assert!(expanded[expanded.len()-1].len() == 4);
     }
 
     #[test]
