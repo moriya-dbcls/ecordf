@@ -532,6 +532,11 @@ impl Store {
         let cache = PredCache::empty();
         self.pred_cache = cache.clone();
         cache.build_sync(&*self.index, budget_bytes);
+        tracing::info!(
+            bytes_used = self.pred_cache.bytes_used(),
+            mb_used = self.pred_cache.bytes_used() / (1024 * 1024),
+            "build_pred_cache_sync: complete"
+        );
     }
 
     /// Spawn a background thread to build the in-RAM predicate cache.
@@ -578,6 +583,12 @@ impl Store {
         let t = Instant::now();
         let ast = parse_query(sparql).map_err(|e| QueryError::Parse(e.to_string()))?;
         let parse_us = t.elapsed().as_micros();
+
+        tracing::debug!(
+            pred_cache_bytes = self.pred_cache.bytes_used(),
+            pred_cache_mb = self.pred_cache.bytes_used() / (1024 * 1024),
+            "execute: pred_cache state"
+        );
 
         let executor = Executor::with_config_and_stats(
             &*self.index,
