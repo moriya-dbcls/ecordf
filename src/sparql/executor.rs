@@ -2350,7 +2350,7 @@ impl<'a> Executor<'a> {
                             // Expensive (may be 100+ MB) but correct; hash_join will be
                             // chosen by the cost model anyway if the left side is large.
                             // bind_join uses the (Some, None) branch above instead.
-                            return (**cached).clone();
+                            return (*cached).clone();
                         }
                         (None, Some(_)) => {
                             // Object fixed, subject free: cache is sorted by S, so we
