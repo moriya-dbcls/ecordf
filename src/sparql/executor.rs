@@ -379,36 +379,68 @@ impl<'a> Executor<'a> {
                     return self.hash_join(left_rs, right_rs);
                 }
 
-                // PathPattern right plans: hash_join (full sequential path scan
-                // + in-memory join) is cheaper than bind_join (N random probes)
-                // once the left side grows beyond a small threshold.
+                // PathPattern right plans: choose between bind_join (N targeted
+                // probes) and hash_join (full sequential path scan + in-memory
+                // join) based on a cost model rather than a fixed threshold.
                 //
-                // Why hash_join works for PathPattern:
-                //   - bind_join: evaluates PathPattern N times, once per unique
-                //     left-variable group.  Each evaluation does 1 cold SSD read
-                //     per path hop → O(N × hops × page_miss_latency).
-                //   - hash_join: calls execute_path_pattern with s=None, o=None
-                //     (unbound endpoints) → eval_path does a full sequential scan
-                //     of each predicate in the path → all (s, o) pairs loaded
-                //     contiguously.  Then hash_join filters to the left rows.
-                //     Cost: O(|path_triples|) sequential I/O, which is typically
-                //     orders of magnitude faster than O(N) random reads on a cold
-                //     SSD index.
+                // Cost model (cold cache):
+                //   bind_join cost ≈ N_groups × path_steps × 150 µs   (SPO seek)
+                //   hash_join cost ≈ first_pred_range × 48 ns          (seq read)
                 //
-                // Threshold is intentionally much smaller than bind_join_threshold
-                // (which is tuned for cheap ScanAst probes).
-                if matches!(right.as_ref(), ExecutionPlan::PathPattern { .. }) {
-                    const PATH_HASH_JOIN_THRESHOLD: usize = 32;
-                    if left_rs.rows.len() > PATH_HASH_JOIN_THRESHOLD {
+                // We estimate first_pred_range via pos_predicate_range().
+                // For paths whose first predicate is unknown/starred we fall back
+                // to a conservative fixed threshold of 500.
+                //
+                // Examples:
+                //   faldo (N=263, 2-hop, pred_range=300K):
+                //     bind = 263 × 2 × 150µs = 79ms
+                //     scan = 300K × 48ns = 14ms → hash_join wins
+                //   faldo (N=263, pred_range=40M uniprot:begin_position):
+                //     bind = 79ms  scan = 1920ms → bind_join wins
+                if let ExecutionPlan::PathPattern { path, .. } = right.as_ref() {
+                    // SPO seek cost: ~150 µs per group per hop.
+                    const SPO_SEEK_NS: u64 = 150_000;
+                    // Sequential POS read cost: ~48 ns per triple.
+                    const POS_READ_NS: u64 = 48;
+
+                    let n = left_rs.rows.len() as u64;
+                    let path_steps = path_step_count(path).max(1) as u64;
+                    let bind_cost_ns = n * path_steps * SPO_SEEK_NS;
+
+                    // Estimate scan cost using the first predicate's POS range.
+                    let scan_cost_ns: Option<u64> = path_first_iri(path)
+                        .and_then(|iri| self.dict.lookup(iri))
+                        .and_then(|pred_id| self.index.pos_predicate_range(pred_id))
+                        .map(|(lo, hi)| (hi - lo) as u64 * POS_READ_NS);
+
+                    let use_hash = match scan_cost_ns {
+                        Some(scan) => {
+                            tracing::debug!(
+                                left_rows = n,
+                                path_steps,
+                                bind_cost_us = bind_cost_ns / 1000,
+                                scan_cost_us = scan / 1000,
+                                "Join PathPattern: cost model"
+                            );
+                            scan < bind_cost_ns
+                        }
+                        // Unknown predicate range → fall back to conservative threshold.
+                        None => n > 500,
+                    };
+
+                    if use_hash {
                         tracing::debug!(
-                            left_rows = left_rs.rows.len(),
-                            "Join PathPattern: switching to hash_join (full path scan)"
+                            left_rows = n,
+                            "Join PathPattern: hash_join (full path scan)"
                         );
                         let right_rs = self.execute_plan_with_ctx(right, outer);
                         if right_rs.overflow { return right_rs; }
                         return self.hash_join(left_rs, right_rs);
                     }
-                    // Small left side: targeted bind_join probes are fine.
+                    tracing::debug!(
+                        left_rows = n,
+                        "Join PathPattern: bind_join (targeted probes)"
+                    );
                     return self.bind_join(left_rs, right, outer);
                 }
 
@@ -1043,6 +1075,27 @@ impl<'a> Executor<'a> {
 
         // Key position in group-key array for the outer var.
         let kp = needed.iter().position(|(_, v)| v == outer_var_name)?;
+
+        // ── Cost gate ─────────────────────────────────────────────────────────
+        // POS sequential scan costs ~48 ns/triple (500 MB/s, 24 bytes per row).
+        // SPO SkipIndex targeted probe costs ~150 µs per group (1 page fault).
+        // Crossover: use POS scan only when pred_range < groups.len() × 3125.
+        // For small N (e.g. N=57, pred_range=16.7M): SPO ≈ 8.6ms, POS ≈ 800ms.
+        // → fall back to SPO bind_join when the predicate range is too large.
+        const CROSSOVER: usize = 3125; // (150_000 ns) / (48 ns) = 3125 triples
+        if let Some((lo, hi)) = self.index.pos_predicate_range(base.p) {
+            let pred_range = hi - lo;
+            if pred_range > groups.len().saturating_mul(CROSSOVER) {
+                tracing::debug!(
+                    groups = groups.len(),
+                    pred_range,
+                    threshold = groups.len() * CROSSOVER,
+                    pred = base.p,
+                    "try_predicate_scan_join: pred range too large, falling back to SPO bind_join"
+                );
+                return None;
+            }
+        }
 
         let t0 = std::time::Instant::now();
 
@@ -3328,6 +3381,43 @@ fn describe_plan(plan: &ExecutionPlan, indent: usize) -> String {
             format!("{}Values({:?})", pad, vc.variables)
         }
         other => format!("{}{}", pad, plan_type_name(other)),
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PropertyPath cost helpers
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Extract the first bare IRI leaf from a PropertyPath.
+/// Used to estimate POS scan cost for the cost-based PathPattern join decision.
+/// Returns `None` for paths that start with a repetition (unknown range).
+fn path_first_iri(path: &PropertyPath) -> Option<&str> {
+    match path {
+        PropertyPath::Iri(iri) => Some(iri.as_str()),
+        PropertyPath::Sequence(steps) => steps.first().and_then(path_first_iri),
+        PropertyPath::Alternative(alts) => alts.first().and_then(path_first_iri),
+        PropertyPath::Inverse(inner) => path_first_iri(inner),
+        // Repetitions: depth unknown, can't estimate range reliably.
+        PropertyPath::ZeroOrMore(_)
+        | PropertyPath::OneOrMore(_)
+        | PropertyPath::ZeroOrOne(_) => None,
+    }
+}
+
+/// Count the number of sequential hops in a PropertyPath (lower bound estimate).
+/// Sequence of N steps = N hops; everything else = 1.
+fn path_step_count(path: &PropertyPath) -> usize {
+    match path {
+        PropertyPath::Sequence(steps) => steps.iter().map(path_step_count).sum(),
+        PropertyPath::Alternative(alts) => {
+            alts.iter().map(path_step_count).max().unwrap_or(1)
+        }
+        PropertyPath::Inverse(inner) => path_step_count(inner),
+        // Repetitions: treat as 1 for cost estimation (we don't know actual depth).
+        PropertyPath::ZeroOrMore(_)
+        | PropertyPath::OneOrMore(_)
+        | PropertyPath::ZeroOrOne(_) => 1,
+        PropertyPath::Iri(_) => 1,
     }
 }
 
