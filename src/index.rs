@@ -1902,6 +1902,17 @@ impl TripleIndex {
             .map(|pi| pi.predicate_count())
             .unwrap_or(0)
     }
+
+    /// Return all (predicate_id, cardinality) pairs, sorted by cardinality ascending.
+    /// Used by PredCache at startup to decide which predicates to cache.
+    pub fn predicate_sizes(&self) -> Vec<(TermId, usize)> {
+        let Some(pi) = &self.pos.pred_idx else { return Vec::new(); };
+        let mut v: Vec<(TermId, usize)> = pi.ranges.iter()
+            .map(|(&pred, &(lo, hi))| (pred, hi - lo))
+            .collect();
+        v.sort_unstable_by_key(|&(_, size)| size);
+        v
+    }
 }
 
 // ── Parallel chunk collection ─────────────────────────────────────────────────

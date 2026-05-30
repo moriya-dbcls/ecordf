@@ -34,6 +34,7 @@ pub mod dict;
 pub mod dict_builder;
 pub mod index;
 pub mod loader;
+pub mod predcache;
 pub mod server;
 pub mod sparql;
 pub mod stats;

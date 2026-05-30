@@ -244,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Command::Serve { dir, host, port, cors, config, warmup_mb } => {
-            let store = Store::open_with_config(&dir, config.as_deref())?;
+            let mut store = Store::open_with_config(&dir, config.as_deref())?;
             let stats = store.stats();
             eprintln!(
                 "Opened store: {} triples, {} terms",
@@ -267,6 +267,12 @@ async fn main() -> anyhow::Result<()> {
             if effective_warmup_mb > 0 {
                 eprintln!("Warming up {} MB of indexes in background...", effective_warmup_mb);
                 store.warmup_background(effective_warmup_mb);
+            }
+            // Build predicate cache in background (avoids cold-start penalty on first query).
+            let pred_cache_mb = store.config.server.pred_cache_mb;
+            if pred_cache_mb > 0 {
+                eprintln!("Building predicate cache ({} MB) in background...", pred_cache_mb);
+                store.build_pred_cache(pred_cache_mb);
             }
             ecordf::server::serve(store, &effective_host, effective_port, effective_cors.as_deref()).await?;
         }

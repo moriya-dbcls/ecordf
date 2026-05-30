@@ -296,6 +296,30 @@ pub struct ServerConfig {
     /// heap.  Process RSS barely changes.  The cache is evictable by the kernel
     /// under memory pressure.
     pub warmup_mb: u64,
+
+    /// MiB of process heap to use for the in-RAM predicate cache.
+    ///
+    /// At startup EcoRDF loads medium-sized predicates from the POS index into
+    /// a sorted in-RAM cache.  Cached predicates are accessed with O(log N)
+    /// binary search or O(N) linear merge instead of O(N) HDD sequential scan,
+    /// making **the first query as fast as subsequent (page-cached) ones**.
+    ///
+    /// Predicates are selected smallest-first; no single predicate may exceed
+    /// 25% of the budget.  Building runs in a background thread so the server
+    /// accepts queries immediately.
+    ///
+    /// **RAM impact**: this budget is process heap (RSS), not OS page cache.
+    /// Avoid values that would squeeze out other workloads.
+    ///
+    /// | Value | Typical coverage (JPostDB) |
+    /// |-------|---------------------------|
+    /// | 0     | disabled (default)         |
+    /// | 256   | faldo + small predicates   |
+    /// | 512   | faldo:position + begin/end + JPOST medium predicates |
+    /// | 1024  | most predicates < 30 M triples |
+    ///
+    /// Overridable with `--pred-cache-mb` on the command line.
+    pub pred_cache_mb: u64,
 }
 
 impl Default for ServerConfig {
@@ -306,6 +330,7 @@ impl Default for ServerConfig {
             cors_origins: String::new(),
             max_concurrent_queries: 0, // unlimited by default
             warmup_mb: 0,              // disabled by default
+            pred_cache_mb: 512,        // 512 MB heap for predicate cache
         }
     }
 }

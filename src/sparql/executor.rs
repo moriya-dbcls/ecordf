@@ -33,6 +33,7 @@ use std::time::Instant;
 use crate::config::QueryConfig;
 use crate::dict_builder::QueryDict;
 use crate::index::{GspoIndexFile, TripleIndex};
+use crate::predcache::{self, PredCache};
 use crate::stats::StoreStatistics;
 use crate::triple::{TermId, TriplePattern, UNBOUND};
 use super::ast::*;
@@ -171,15 +172,18 @@ pub struct Executor<'a> {
     /// Optional predicate statistics for join ordering.
     /// When `None`, the optimizer falls back to index-probe estimates only.
     pub stats: Option<&'a StoreStatistics>,
+    /// In-RAM predicate cache for accelerating large predicate scans.
+    /// `PredCache::empty()` when no cache is configured.
+    pub pred_cache: PredCache,
 }
 
 impl<'a> Executor<'a> {
     pub fn new(index: &'a TripleIndex, dict: &'a QueryDict) -> Self {
-        Self { index, dict, config: QueryConfig::default(), stats: None }
+        Self { index, dict, config: QueryConfig::default(), stats: None, pred_cache: PredCache::empty() }
     }
 
     pub fn with_config(index: &'a TripleIndex, dict: &'a QueryDict, config: QueryConfig) -> Self {
-        Self { index, dict, config, stats: None }
+        Self { index, dict, config, stats: None, pred_cache: PredCache::empty() }
     }
 
     pub fn with_config_and_stats(
@@ -188,7 +192,17 @@ impl<'a> Executor<'a> {
         config: QueryConfig,
         stats: Option<&'a StoreStatistics>,
     ) -> Self {
-        Self { index, dict, config, stats }
+        Self { index, dict, config, stats, pred_cache: PredCache::empty() }
+    }
+
+    /// Builder: attach a predicate cache.
+    ///
+    /// The cache is built at server startup in a background thread. Predicates
+    /// cached there are served from RAM (O(log N) probe or O(N) merge-join)
+    /// instead of triggering a sequential HDD scan.
+    pub fn with_pred_cache(mut self, cache: PredCache) -> Self {
+        self.pred_cache = cache;
+        self
     }
 
     /// Execute a full query and return results as a ResultSet.
@@ -1136,12 +1150,31 @@ impl<'a> Executor<'a> {
 
         // ── Filter mode: membership test (S, P, O_fixed) ─────────────────────
         if is_filter {
-            // Scan the (P, O_fixed) range in POS — typically just a handful of
-            // entries — and collect passing subject IDs.
-            let passing: HashSet<TermId> = self.index.scan(&scan_pat)
-                .filter(|t| subjects.contains(&t.s))
-                .map(|t| t.s)
-                .collect();
+            // Prefer pred_cache: binary-search each subject for (s, base.o).
+            // The cache is sorted by (S, O); searching S then O is O(|subjects| × log N).
+            // Fall back to POS subrange scan (already fast: (P,O) subrange is tiny).
+            let passing: HashSet<TermId> = if let Some(cached) = self.pred_cache.get(base.p) {
+                tracing::debug!(
+                    pred = base.p,
+                    unique_subjects = subjects.len(),
+                    cached_pairs = cached.len(),
+                    mode = "pred_cache_filter",
+                    "bind_join filter: using cached predicate"
+                );
+                let target_o = base.o;
+                subjects.iter().copied().filter(|&s| {
+                    // Binary search for (s, target_o) in sorted (S, O) cache.
+                    let key = (s, target_o);
+                    cached.binary_search(&key).is_ok()
+                }).collect()
+            } else {
+                // Scan the (P, O_fixed) range in POS — typically just a handful of
+                // entries — and collect passing subject IDs.
+                self.index.scan(&scan_pat)
+                    .filter(|t| subjects.contains(&t.s))
+                    .map(|t| t.s)
+                    .collect()
+            };
 
             let mut result = ResultSet::empty(left.variables.clone());
             for (key, row_indices) in groups {
@@ -1169,11 +1202,34 @@ impl<'a> Executor<'a> {
         // ── Join mode: S=outer → O via predicate P ────────────────────────────
         let free_var_name = &free_vars[0].0;
 
-        // One sequential POS scan: collect (S → [O]) pairs for matching subjects.
+        // Collect (S → [O]) pairs for matching subjects.
+        // Prefer pred_cache: binary search per subject → O(N×log M) RAM.
+        // Fall back to sequential POS scan → O(pred_range) HDD.
         let mut s_to_objects: HashMap<TermId, Vec<TermId>> = HashMap::new();
-        for triple in self.index.scan(&scan_pat) {
-            if subjects.contains(&triple.s) {
-                s_to_objects.entry(triple.s).or_default().push(triple.o);
+        if let Some(cached) = self.pred_cache.get(base.p) {
+            tracing::debug!(
+                pred = base.p,
+                unique_subjects = subjects.len(),
+                cached_pairs = cached.len(),
+                mode = "pred_cache_join",
+                "bind_join join: using cached predicate"
+            );
+            // The cache is sorted by (S, O). For each subject, binary-search
+            // to find the [lo, hi) range where S matches, then collect all objects.
+            for &s in &subjects {
+                let lo = cached.partition_point(|&(cs, _)| cs < s);
+                let hi = cached[lo..].partition_point(|&(cs, _)| cs == s) + lo;
+                if lo < hi {
+                    let objs: Vec<TermId> = cached[lo..hi].iter().map(|&(_, o)| o).collect();
+                    s_to_objects.insert(s, objs);
+                }
+            }
+        } else {
+            // One sequential POS scan: collect (S → [O]) pairs for matching subjects.
+            for triple in self.index.scan(&scan_pat) {
+                if subjects.contains(&triple.s) {
+                    s_to_objects.entry(triple.s).or_default().push(triple.o);
+                }
             }
         }
 
@@ -2292,49 +2348,77 @@ impl<'a> Executor<'a> {
                     let t_step = std::time::Instant::now();
                     let is_last = idx == steps.len() - 2;
                     let step_o = if is_last { o } else { None };
-                    // Group by the right-hand intermediate node
-                    let mut by_mid: HashMap<TermId, Vec<TermId>> = HashMap::new();
-                    for (a, b) in &current {
-                        by_mid.entry(*b).or_default().push(*a);
-                    }
-                    let unique_mids = by_mid.len();
                     let mut next: Vec<(TermId, TermId)> = Vec::new();
 
-                    // Batch-scan threshold: when the number of unique intermediate
-                    // nodes is large, N individual random SPO probes (one per node)
-                    // cause excessive random I/O.  Instead, do ONE sequential scan
-                    // over the predicate's entire POS/SPO range and filter in memory.
-                    // This mirrors QLever's per-predicate columnar scan approach:
-                    // sequential I/O is ~100× faster than random I/O on cold SSD.
+                    // ── Fast path: cached predicate merge-join ────────────────
+                    // When the step is a simple IRI predicate and its (subject, object)
+                    // pairs are loaded in the pred_cache, use an O(N) linear merge
+                    // instead of a sequential HDD scan + HashMap filter.
                     //
-                    // Heuristic: switch when unique_mids > BATCH_SCAN_THRESHOLD.
-                    // Tuning: lower = more scans (uses more I/O for small fan-outs);
-                    //         higher = more random probes (worse for large fan-outs).
-                    const BATCH_SCAN_THRESHOLD: usize = 32;
+                    // The POS scan at step=0 produces pairs sorted by (P,O,S) =
+                    // sorted by the `mid` value (second element of each (src,mid) pair).
+                    // The cached data is sorted by (S=mid, O=dst).
+                    // merge_join_unsorted sorts current by mid if needed, then merges.
+                    let used_cache = if let PropertyPath::Iri(ref iri) = *step {
+                        if let Some(pred_id) = self.dict.lookup(iri) {
+                            if let Some(cached) = self.pred_cache.get(pred_id) {
+                                tracing::debug!(
+                                    step = idx + 1,
+                                    current_pairs = current.len(),
+                                    cached_pairs = cached.len(),
+                                    mode = "pred_cache_merge",
+                                    "eval_path Sequence: using cached predicate merge-join"
+                                );
+                                predcache::merge_join_unsorted(&mut current, &*cached, step_o, &mut next);
+                                true
+                            } else { false }
+                        } else { false }
+                    } else { false };
 
-                    if unique_mids > BATCH_SCAN_THRESHOLD {
-                        // Full-scan mode: enumerate all (s, o) for this step with
-                        // s=None (unbound), then filter by the known intermediate set.
-                        tracing::debug!(
-                            step = idx + 1,
-                            unique_mids,
-                            mode = "batch_scan",
-                            "eval_path Sequence: switching to batch scan"
-                        );
-                        let all_pairs = self.eval_path(step, None, step_o);
-                        for (s, o) in all_pairs {
-                            if let Some(srcs) = by_mid.get(&s) {
-                                for &src in srcs {
-                                    next.push((src, o));
+                    if !used_cache {
+                        // Group by the right-hand intermediate node
+                        let mut by_mid: HashMap<TermId, Vec<TermId>> = HashMap::new();
+                        for (a, b) in &current {
+                            by_mid.entry(*b).or_default().push(*a);
+                        }
+                        let unique_mids = by_mid.len();
+
+                        // Batch-scan threshold: when the number of unique intermediate
+                        // nodes is large, N individual random SPO probes (one per node)
+                        // cause excessive random I/O.  Instead, do ONE sequential scan
+                        // over the predicate's entire POS/SPO range and filter in memory.
+                        // This mirrors QLever's per-predicate columnar scan approach:
+                        // sequential I/O is ~100× faster than random I/O on cold SSD.
+                        //
+                        // Heuristic: switch when unique_mids > BATCH_SCAN_THRESHOLD.
+                        // Tuning: lower = more scans (uses more I/O for small fan-outs);
+                        //         higher = more random probes (worse for large fan-outs).
+                        const BATCH_SCAN_THRESHOLD: usize = 32;
+
+                        if unique_mids > BATCH_SCAN_THRESHOLD {
+                            // Full-scan mode: enumerate all (s, o) for this step with
+                            // s=None (unbound), then filter by the known intermediate set.
+                            tracing::debug!(
+                                step = idx + 1,
+                                unique_mids,
+                                mode = "batch_scan",
+                                "eval_path Sequence: switching to batch scan"
+                            );
+                            let all_pairs = self.eval_path(step, None, step_o);
+                            for (s, o) in all_pairs {
+                                if let Some(srcs) = by_mid.get(&s) {
+                                    for &src in srcs {
+                                        next.push((src, o));
+                                    }
                                 }
                             }
-                        }
-                    } else {
-                        // Individual-probe mode: targeted index probe per mid.
-                        for (mid, srcs) in by_mid {
-                            for (_, dst) in self.eval_path(step, Some(mid), step_o) {
-                                for &src in &srcs {
-                                    next.push((src, dst));
+                        } else {
+                            // Individual-probe mode: targeted index probe per mid.
+                            for (mid, srcs) in by_mid {
+                                for (_, dst) in self.eval_path(step, Some(mid), step_o) {
+                                    for &src in &srcs {
+                                        next.push((src, dst));
+                                    }
                                 }
                             }
                         }
@@ -2342,7 +2426,6 @@ impl<'a> Executor<'a> {
 
                     tracing::debug!(
                         step = idx + 1,
-                        unique_mids,
                         pairs_out = next.len(),
                         elapsed_us = t_step.elapsed().as_micros(),
                         "eval_path Sequence step"

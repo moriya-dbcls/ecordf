@@ -9,6 +9,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use rayon;
@@ -21,18 +22,24 @@ use crate::loader::{collect_strings_from_inputs, collect_strings_parallel,
                     load_files, load_files_with_graphs,
                     load_triples_with_readonly_dict, load_triples_parallel,
                     load_triples_streaming, InputSpec};
+use crate::predcache::PredCache;
 use crate::sparql::{parse_query, Executor, ResultSet};
 use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
 use crate::stats::StoreStatistics;
 
 pub struct Store {
     pub dict: QueryDict,
-    pub index: TripleIndex,
+    /// Triple indexes wrapped in `Arc` so the predicate-cache background thread
+    /// can hold shared ownership without cloning mmap'd files.
+    pub index: Arc<TripleIndex>,
     pub dir: PathBuf,
     pub config: Config,
     /// Per-predicate statistics for join ordering.
     /// Loaded from `stats.bin` or built on first open.
     pub stats: StoreStatistics,
+    /// In-RAM predicate cache built at startup.
+    /// Empty when `server.pred_cache_mb = 0`.
+    pub pred_cache: PredCache,
 }
 
 impl Store {
@@ -81,7 +88,7 @@ impl Store {
             stats.triples_loaded, t0.elapsed().as_secs_f64());
 
         let t1 = Instant::now();
-        let index = builders.build(dir)?;
+        let index = Arc::new(builders.build(dir)?);
         raw_dict.save(&dir.join("dict.bin"))?;
 
         eprintln!("Indexes written in {:.1}s. Total: {:.1}s",
@@ -90,8 +97,9 @@ impl Store {
 
         let (id_to_str, str_to_id) = raw_dict.into_parts();
         let dict = QueryDict::from_legacy(id_to_str, str_to_id);
-        let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats })
+        let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
+        let pred_cache = PredCache::empty();
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache })
     }
 
     // ── internal: two-pass (external-sort dict) ───────────────────────────────
@@ -307,7 +315,7 @@ impl Store {
         );
 
         let t3 = Instant::now();
-        let index = AllBuilders::build_from_parallel_chunks(all_index_chunks, dir)?;
+        let index = Arc::new(AllBuilders::build_from_parallel_chunks(all_index_chunks, dir)?);
 
         eprintln!("Indexes written in {:.1}s.", t3.elapsed().as_secs_f64());
 
@@ -336,8 +344,9 @@ impl Store {
 
         // Open query-time dictionary from the persisted mmap file.
         let dict = QueryDict::from_mmap(ReadonlyDict::open(&store_dict_sorted)?);
-        let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats })
+        let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
+        let pred_cache = PredCache::empty();
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache })
     }
 
     /// Build a new store from RDF input files with optional per-file named graph assignment.
@@ -361,12 +370,13 @@ impl Store {
             let stats = load_files_with_graphs(inputs, &raw_dict, &mut builders)?;
             eprintln!("Parsed {} triples in {:.1}s. Writing indexes...",
                 stats.triples_loaded, t0.elapsed().as_secs_f64());
-            let index = builders.build(dir)?;
+            let index = Arc::new(builders.build(dir)?);
             raw_dict.save(&dir.join("dict.bin"))?;
             let (id_to_str, str_to_id) = raw_dict.into_parts();
             let dict = QueryDict::from_legacy(id_to_str, str_to_id);
-            let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
-            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats })
+            let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
+            let pred_cache = PredCache::empty();
+            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache })
         }
     }
 
@@ -391,32 +401,35 @@ impl Store {
             let stats = load_files_with_graphs(inputs, &raw_dict, &mut builders)?;
             eprintln!("Parsed {} triples in {:.1}s. Writing indexes...",
                 stats.triples_loaded, t0.elapsed().as_secs_f64());
-            let index = builders.build(dir)?;
+            let index = Arc::new(builders.build(dir)?);
             raw_dict.save(&dir.join("dict.bin"))?;
             let (id_to_str, str_to_id) = raw_dict.into_parts();
             let dict = QueryDict::from_legacy(id_to_str, str_to_id);
-            let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
-            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats })
+            let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
+            let pred_cache = PredCache::empty();
+            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache })
         }
     }
 
     /// Reopen an existing store from its directory.
     pub fn open(dir: &Path) -> io::Result<Self> {
         let dict = open_query_dict(dir)?;
-        let index = TripleIndex::open(dir)?;
+        let index = Arc::new(TripleIndex::open(dir)?);
         let config = Config::resolve(None, dir).map_err(io::Error::from)?;
-        let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats })
+        let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
+        let pred_cache = PredCache::empty();
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache })
     }
 
     /// Reopen an existing store and apply an explicit config file (overrides
     /// the auto-detected `<store-dir>/ecordf.toml`).
     pub fn open_with_config(dir: &Path, config_path: Option<&std::path::Path>) -> io::Result<Self> {
         let dict = open_query_dict(dir)?;
-        let index = TripleIndex::open(dir)?;
+        let index = Arc::new(TripleIndex::open(dir)?);
         let config = Config::resolve(config_path, dir).map_err(io::Error::from)?;
-        let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &index)?;
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats })
+        let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
+        let pred_cache = PredCache::empty();
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache })
     }
 
     /// Replace the active configuration without reopening indexes.
@@ -505,6 +518,26 @@ impl Store {
         });
     }
 
+    /// Spawn a background thread to build the in-RAM predicate cache.
+    ///
+    /// `pred_cache_mb = 0` disables the cache entirely.  Otherwise predicates
+    /// are loaded smallest-first until the budget is exhausted (no single
+    /// predicate may exceed 25% of the budget).
+    ///
+    /// Queries run normally during the build; they fall back to index scans for
+    /// predicates not yet in the cache.
+    pub fn build_pred_cache(&mut self, pred_cache_mb: u64) {
+        if pred_cache_mb == 0 { return; }
+        let budget_bytes = (pred_cache_mb as usize) * 1024 * 1024;
+        let cache = PredCache::empty();
+        self.pred_cache = cache.clone();
+        cache.build_background(Arc::clone(&self.index), budget_bytes);
+        tracing::info!(
+            pred_cache_mb,
+            "pred-cache: background build started"
+        );
+    }
+
     /// Execute a SPARQL query string and return the result set.
     ///
     /// Emits an `INFO` log line per query with a phase-level timing breakdown:
@@ -532,11 +565,11 @@ impl Store {
         let parse_us = t.elapsed().as_micros();
 
         let executor = Executor::with_config_and_stats(
-            &self.index,
+            &*self.index,
             &self.dict,
             self.config.query.clone(),
             Some(&self.stats),
-        );
+        ).with_pred_cache(self.pred_cache.clone());
 
         // ── Phase 2: Execute (plan + BGP evaluation) ──────────────────────────
         let t = Instant::now();
