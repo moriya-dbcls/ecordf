@@ -1088,22 +1088,31 @@ impl<'a> Executor<'a> {
         // Round to 1_000_000 for a small safety margin.
         //
         // Empirical validation (cold HDD):
-        //   step2: N=263, pred=14.6M  → threshold=263M >> 14.6M → POS scan (263×263M ≫ 14.6M ✓)
+        //   step2: N=263, pred=14.6M  → threshold=263M >> 14.6M → POS scan ✓
         //   step4: N=239, pred=15.4M  → threshold=239M >> 15.4M → POS scan ✓
-        //   step6: N=239, pred=545M   → threshold=239M <  545M  → bind_join (57.6s) ✓
-        //          (POS would cost 545M×200ns=109s > 57.6s → bind_join correctly wins)
+        //   step6: N=239, pred=545M   → threshold=239M <  545M  → bind_join ✓
+        //          (POS scan cost=545M×200ns=109s > bind_join=57.6s → correctly rejects)
+        //
+        // EXCEPTION: filter patterns (is_filter=true, P and O both fixed).
+        // The scan only covers the tiny (P,O) subrange in POS — NOT the full P range.
+        // For step7 (rdf:type filter, pred_range=545M, N=239):
+        //   bind_join: 239 × 150ms = 35.8s predicted (actual: 171s cold!)
+        //   (P,O) scan: binary search log2(545M)≈29 pages × 12ms = 348ms + tiny scan
+        //   → always bypass cost gate for filter patterns.
         const CROSSOVER: usize = 1_000_000; // (150_000_000 ns) / (200 ns/triple on HDD)
-        if let Some((lo, hi)) = self.index.pos_predicate_range(base.p) {
-            let pred_range = hi - lo;
-            if pred_range > groups.len().saturating_mul(CROSSOVER) {
-                tracing::debug!(
-                    groups = groups.len(),
-                    pred_range,
-                    threshold = groups.len() * CROSSOVER,
-                    pred = base.p,
-                    "try_predicate_scan_join: pred range too large, falling back to SPO bind_join"
-                );
-                return None;
+        if !is_filter {
+            if let Some((lo, hi)) = self.index.pos_predicate_range(base.p) {
+                let pred_range = hi - lo;
+                if pred_range > groups.len().saturating_mul(CROSSOVER) {
+                    tracing::debug!(
+                        groups = groups.len(),
+                        pred_range,
+                        threshold = groups.len() * CROSSOVER,
+                        pred = base.p,
+                        "try_predicate_scan_join: pred range too large, falling back to SPO bind_join"
+                    );
+                    return None;
+                }
             }
         }
 

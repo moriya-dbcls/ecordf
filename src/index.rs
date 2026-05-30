@@ -1255,9 +1255,25 @@ impl IndexFile {
     fn range_for_pattern(&self, raw: &[Option<u64>; 3]) -> (usize, usize) {
         match (raw[0], raw[1]) {
             (Some(k0), Some(k1)) => {
-                let start = self.lower_bound_01(k0, k1);
+                // If pred_idx is available (POS index), use it to narrow the search
+                // to the k0 range before binary-searching for k1.  This avoids
+                // scanning entries beyond the k0 boundary on cold HDD.
+                let (p_lo, p_hi) = if let Some(pi) = &self.pred_idx {
+                    pi.get(k0).unwrap_or((0, 0))
+                } else {
+                    (self.lower_bound_0(k0), self.count)
+                };
+                // Binary search within the k0 range for the first (k0, k1) entry.
+                let (mut a, mut b) = (p_lo, p_hi);
+                while a < b {
+                    let mid = a + (b - a) / 2;
+                    let (c0, c1) = self.get_col01(mid);
+                    if (c0, c1) < (k0, k1) { a = mid + 1; } else { b = mid; }
+                }
+                let start = a;
+                // Sequential scan for end (typically a tiny range for filter patterns).
                 let mut end = start;
-                while end < self.count {
+                while end < p_hi {
                     let (c0, c1) = self.get_col01(end);
                     if c0 != k0 || c1 != k1 { break; }
                     end += 1;
