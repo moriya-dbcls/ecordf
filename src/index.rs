@@ -12,13 +12,19 @@
 //!
 //! ## Index structure
 //!
-//! Three sorted indexes over integer-encoded triples:
+//! Six sorted indexes over integer-encoded triples (all permutations):
 //!
 //! ```text
-//!   SPO: sorted by (S, P, O) → efficient for patterns with S bound
-//!   POS: sorted by (P, O, S) → efficient for patterns with P bound
-//!   OSP: sorted by (O, S, P) → efficient for patterns with O bound
+//!   SPO: sorted (S,P,O) → s bound; s+p (upper_hint bounds secondary search to deg(s))
+//!   POS: sorted (P,O,S) → p bound; p+o (pred_idx: O(1) predicate range)
+//!   OSP: sorted (O,S,P) → o bound; o+s (upper_hint bounds secondary search to deg(o))
+//!   PSO: sorted (P,S,O) → p+s (pred_idx + binary for S within predicate range)
+//!   SOP: sorted (S,O,P) → s+o (skip for S, binary for O within S's range)
+//!   OPS: sorted (O,P,S) → o+p (skip for O, binary for P within O's range)
 //! ```
+//!
+//! Older 3-index stores open without PSO/SOP/OPS; queries fall back to the
+//! nearest existing index automatically.
 //!
 //! Each index is a flat binary file of packed u32 triples:
 //! `[count: u64][s0,p0,o0, s1,p1,o1, ...]` in the index's sort order.
@@ -216,6 +222,40 @@ impl SkipIndex {
             self.count
         };
         (lo, hi)
+    }
+
+    /// Return a tight **upper bound** (exclusive) for entries with c0 == `key`.
+    ///
+    /// All positions `i` with `c0[i] == key` satisfy `i < upper_hint(key)`.
+    ///
+    /// ## Why this matters: secondary-key binary search
+    ///
+    /// `range_for_pattern` with two bound keys (e.g. SPO with s=X, p=Y) needs to
+    /// binary-search for the secondary key within k0's range.  Without this hint,
+    /// the upper bound defaults to `self.count` (the whole index), causing
+    /// O(log total_count) ≈ 31 random page faults on a 500 M-triple store.
+    ///
+    /// With `upper_hint`, the binary search is bounded by the k0's actual degree
+    /// (number of triples with that subject/predicate/object):
+    ///
+    /// ```text
+    /// degree(k0) = upper_hint(k0) − lower_bound(k0)  (at most a few skip blocks)
+    /// binary-search steps = log₂(degree(k0))         (e.g. log₂(1000) = 10)
+    /// ```
+    ///
+    /// For a subject with 1000 triples and SKIP_STRIDE = 512, the hint narrows
+    /// the secondary search to ≤ 2 skip blocks (1024 entries) from 500 M.
+    #[inline]
+    pub fn upper_hint(&self, key: u64) -> usize {
+        if self.anchors.is_empty() {
+            return self.count;
+        }
+        // First slot where anchor > key (i.e. anchors[slot] > key).
+        // Because anchors are sorted and anchors[i] = c0[i * SKIP_STRIDE]:
+        //   c0[slot * SKIP_STRIDE] > key
+        // Therefore all entries with c0 == key appear before position slot * SKIP_STRIDE.
+        let slot = self.anchors.partition_point(|&a| a <= key);
+        (slot * SKIP_STRIDE).min(self.count)
     }
 }
 
@@ -461,6 +501,9 @@ impl IndexBuilder {
             IndexKind::Spo => "spo",
             IndexKind::Pos => "pos",
             IndexKind::Osp => "osp",
+            IndexKind::Pso => "pso",
+            IndexKind::Sop => "sop",
+            IndexKind::Ops => "ops",
         }
     }
 
@@ -585,7 +628,7 @@ pub(crate) fn write_columnar_from_sorted(
     let skip = SkipIndex::build_from_triples(triples);
     skip.save(&skip_path_from_c0(&paths[0]))?;
     // Build and save the predicate secondary index for POS — zero extra I/O.
-    if kind == IndexKind::Pos {
+    if kind == IndexKind::Pos || kind == IndexKind::Pso {
         let pidx = PredicateIndex::build_from_sorted(triples);
         pidx.save(&pidx_path_from_c0(&paths[0]))?;
     }
@@ -679,7 +722,7 @@ fn merge_to_columnar_direct(
     let mut prev: Option<[u64; 3]> = None;
     let mut skip_anchors: Vec<u64> = Vec::new();
     // For Pos: track (pred, run_start, run_end) as c0 transitions.
-    let mut pred_runs: Vec<(TermId, usize, usize)> = if kind == IndexKind::Pos {
+    let mut pred_runs: Vec<(TermId, usize, usize)> = if kind == IndexKind::Pos || kind == IndexKind::Pso {
         Vec::new()
     } else {
         Vec::with_capacity(0)
@@ -695,7 +738,7 @@ fn merge_to_columnar_direct(
                 skip_anchors.push(t[0]);
             }
             // Track predicate-run boundaries for the Pos predicate index.
-            if kind == IndexKind::Pos {
+            if kind == IndexKind::Pos || kind == IndexKind::Pso {
                 match cur_pred {
                     None => {
                         cur_pred = Some(t[0]);
@@ -720,7 +763,7 @@ fn merge_to_columnar_direct(
         }
     }
     // Close the final predicate run.
-    if kind == IndexKind::Pos {
+    if kind == IndexKind::Pos || kind == IndexKind::Pso {
         if let Some(p) = cur_pred {
             pred_runs.push((p, cur_run_start, count as usize));
         }
@@ -741,7 +784,7 @@ fn merge_to_columnar_direct(
     skip.save(&skip_path_from_c0(&cpaths[0]))?;
 
     // ── Write predicate secondary index for Pos (no extra I/O) ───────────────
-    if kind == IndexKind::Pos {
+    if kind == IndexKind::Pos || kind == IndexKind::Pso {
         let pidx = PredicateIndex::build_from_runs(pred_runs);
         pidx.save(&pidx_path_from_c0(&cpaths[0]))?;
     }
@@ -978,7 +1021,7 @@ impl IndexFile {
         //
         // Build cost: one sequential c0 scan (same as SkipIndex).  Saved to
         // `pos.pidx` so subsequent opens are instant (microseconds to read).
-        let pred_idx = if kind == IndexKind::Pos {
+        let pred_idx = if kind == IndexKind::Pos || kind == IndexKind::Pso {
             let pidx_p = pidx_path_from_c0(&paths[0]);
             if pidx_p.exists() {
                 match PredicateIndex::load(&pidx_p) {
@@ -1255,16 +1298,30 @@ impl IndexFile {
     fn range_for_pattern(&self, raw: &[Option<u64>; 3]) -> (usize, usize) {
         match (raw[0], raw[1]) {
             (Some(k0), Some(k1)) => {
-                // If pred_idx is available (POS index), use it to narrow the search
-                // to the k0 range before binary-searching for k1.  This avoids
-                // scanning entries beyond the k0 boundary on cold HDD.
-                let (p_lo, p_hi) = if let Some(pi) = &self.pred_idx {
+                // Determine the [lo, hi) range within which k0 entries live.
+                //
+                // Priority 1: pred_idx gives exact O(1) range for POS and PSO
+                //   (predicate is always the primary key for those indexes).
+                // Priority 2: SkipIndex.upper_hint gives a tight upper bound for
+                //   the k0 range, bounding the secondary binary search to
+                //   O(log degree(k0)) instead of O(log total_count).
+                //   Example: for SPO with s=X, the search is bounded to the
+                //   number of triples with subject X, not the entire index.
+                let (k0_lo, k0_hi) = if let Some(pi) = &self.pred_idx {
+                    // O(1) exact range (POS / PSO indexes).
                     pi.get(k0).unwrap_or((0, 0))
+                } else if let Some(ref skip) = self.skip {
+                    // SkipIndex tight bound: lower_bound uses narrow() for 1-page fault;
+                    // upper_hint() narrows from self.count down to degree(k0) entries.
+                    let lo = self.lower_bound_0(k0);
+                    let hi = skip.upper_hint(k0);
+                    (lo, hi)
                 } else {
+                    // Legacy interleaved: no skip index, fall back to full range.
                     (self.lower_bound_0(k0), self.count)
                 };
-                // Binary search within the k0 range for the first (k0, k1) entry.
-                let (mut a, mut b) = (p_lo, p_hi);
+                // Binary search within the tight k0 range for the first (k0, k1) entry.
+                let (mut a, mut b) = (k0_lo, k0_hi);
                 while a < b {
                     let mid = a + (b - a) / 2;
                     let (c0, c1) = self.get_col01(mid);
@@ -1273,7 +1330,7 @@ impl IndexFile {
                 let start = a;
                 // Sequential scan for end (typically a tiny range for filter patterns).
                 let mut end = start;
-                while end < p_hi {
+                while end < k0_hi {
                     let (c0, c1) = self.get_col01(end);
                     if c0 != k0 || c1 != k1 { break; }
                     end += 1;
@@ -1408,22 +1465,43 @@ impl<'a> Iterator for TripleScan<'a> {
 // ── Reorder helpers ───────────────────────────────────────────────────────────
 
 /// Reorder SPO triple into the index's natural sort key.
+///
+/// ```text
+///   SPO → [s, p, o]    PSO → [p, s, o]
+///   POS → [p, o, s]    SOP → [s, o, p]
+///   OSP → [o, s, p]    OPS → [o, p, s]
+/// ```
 #[inline]
 fn reorder(t: Triple, kind: IndexKind) -> [u64; 3] {
     match kind {
         IndexKind::Spo => [t.s, t.p, t.o],
         IndexKind::Pos => [t.p, t.o, t.s],
         IndexKind::Osp => [t.o, t.s, t.p],
+        IndexKind::Pso => [t.p, t.s, t.o],
+        IndexKind::Sop => [t.s, t.o, t.p],
+        IndexKind::Ops => [t.o, t.p, t.s],
     }
 }
 
 /// Convert index-ordered raw triple back to SPO.
+///
+/// Inverse of `reorder`: given raw = [c0, c1, c2] in the index's sort order,
+/// recover (s, p, o).
 #[inline]
 fn reorder_back(raw: [u64; 3], kind: IndexKind) -> Triple {
     match kind {
+        // SPO: raw=[s,p,o]         → s=raw[0], p=raw[1], o=raw[2]
         IndexKind::Spo => Triple::new(raw[0], raw[1], raw[2]),
+        // POS: raw=[p,o,s]         → s=raw[2], p=raw[0], o=raw[1]
         IndexKind::Pos => Triple::new(raw[2], raw[0], raw[1]),
+        // OSP: raw=[o,s,p]         → s=raw[1], p=raw[2], o=raw[0]
         IndexKind::Osp => Triple::new(raw[1], raw[2], raw[0]),
+        // PSO: raw=[p,s,o]         → s=raw[1], p=raw[0], o=raw[2]
+        IndexKind::Pso => Triple::new(raw[1], raw[0], raw[2]),
+        // SOP: raw=[s,o,p]         → s=raw[0], p=raw[2], o=raw[1]
+        IndexKind::Sop => Triple::new(raw[0], raw[2], raw[1]),
+        // OPS: raw=[o,p,s]         → s=raw[2], p=raw[1], o=raw[0]
+        IndexKind::Ops => Triple::new(raw[2], raw[1], raw[0]),
     }
 }
 
@@ -1434,6 +1512,9 @@ fn pattern_to_raw(pat: TriplePattern, kind: IndexKind) -> [Option<TermId>; 3] {
         IndexKind::Spo => [b(pat.s), b(pat.p), b(pat.o)],
         IndexKind::Pos => [b(pat.p), b(pat.o), b(pat.s)],
         IndexKind::Osp => [b(pat.o), b(pat.s), b(pat.p)],
+        IndexKind::Pso => [b(pat.p), b(pat.s), b(pat.o)],
+        IndexKind::Sop => [b(pat.s), b(pat.o), b(pat.p)],
+        IndexKind::Ops => [b(pat.o), b(pat.p), b(pat.s)],
     }
 }
 
@@ -1793,13 +1874,38 @@ impl<'a> Iterator for GspoScan<'a> {
 
 // ── Three-index set + optional GSPO ──────────────────────────────────────────
 
-/// Holds all three SPO/POS/OSP indexes plus an optional GSPO quad index.
+/// Holds all triple indexes.
+///
+/// Always present: SPO, POS, OSP (3-index build).
+/// Optional (6-index build): PSO, SOP, OPS — `None` for stores built before
+/// 6-index support was added.  Queries fall back to the closest 3-index when
+/// the extra indexes are absent.
 pub struct TripleIndex {
     pub spo: IndexFile,
     pub pos: IndexFile,
     pub osp: IndexFile,
+    /// PSO: sorted (P,S,O) — pred_idx for O(1) predicate range, binary search for S.
+    /// Present only in 6-index stores.
+    pub pso: Option<IndexFile>,
+    /// SOP: sorted (S,O,P) — SkipIndex for S, binary search for O within S's range.
+    /// Enables efficient (s=bound, o=bound) patterns. Present only in 6-index stores.
+    pub sop: Option<IndexFile>,
+    /// OPS: sorted (O,P,S) — SkipIndex for O, binary search for P within O's range.
+    /// Enables efficient (o=bound, p=bound) patterns. Present only in 6-index stores.
+    pub ops: Option<IndexFile>,
     /// Present only when named-graph data was loaded (.nq files).
     pub gspo: Option<GspoIndexFile>,
+}
+
+/// Try to open an optional index file (PSO / SOP / OPS).
+/// Returns `None` if neither the columnar nor legacy file exists.
+fn try_open_index(path: &Path, kind: IndexKind) -> io::Result<Option<IndexFile>> {
+    let cpaths = col_paths(path);
+    if cpaths[0].exists() || path.exists() {
+        Ok(Some(IndexFile::open(path, kind)?))
+    } else {
+        Ok(None)
+    }
 }
 
 impl TripleIndex {
@@ -1814,13 +1920,28 @@ impl TripleIndex {
             spo: IndexFile::open(&dir.join("spo.bin"), IndexKind::Spo)?,
             pos: IndexFile::open(&dir.join("pos.bin"), IndexKind::Pos)?,
             osp: IndexFile::open(&dir.join("osp.bin"), IndexKind::Osp)?,
+            pso: try_open_index(&dir.join("pso.bin"), IndexKind::Pso)?,
+            sop: try_open_index(&dir.join("sop.bin"), IndexKind::Sop)?,
+            ops: try_open_index(&dir.join("ops.bin"), IndexKind::Ops)?,
             gspo,
         })
     }
 
     /// Select the best index for a pattern and return matching triples.
+    ///
+    /// When the optimal 6-index is absent (3-index store), falls back to the
+    /// nearest existing index:
+    ///   SOP missing → SPO   (s is primary key in both)
+    ///   PSO missing → POS   (p is primary key in both)
+    ///   OPS missing → OSP   (o is primary key in both)
     pub fn scan(&self, pat: &TriplePattern) -> TripleScan {
         match pat.best_index() {
+            IndexKind::Sop => self.sop.as_ref().map(|i| i.scan(pat))
+                .unwrap_or_else(|| self.spo.scan(pat)),
+            IndexKind::Pso => self.pso.as_ref().map(|i| i.scan(pat))
+                .unwrap_or_else(|| self.pos.scan(pat)),
+            IndexKind::Ops => self.ops.as_ref().map(|i| i.scan(pat))
+                .unwrap_or_else(|| self.osp.scan(pat)),
             IndexKind::Spo => self.spo.scan(pat),
             IndexKind::Pos => self.pos.scan(pat),
             IndexKind::Osp => self.osp.scan(pat),
@@ -1830,6 +1951,12 @@ impl TripleIndex {
     /// Estimate cardinality using the best index.
     pub fn estimate(&self, pat: &TriplePattern) -> u64 {
         match pat.best_index() {
+            IndexKind::Sop => self.sop.as_ref().map(|i| i.estimate_cardinality(pat))
+                .unwrap_or_else(|| self.spo.estimate_cardinality(pat)),
+            IndexKind::Pso => self.pso.as_ref().map(|i| i.estimate_cardinality(pat))
+                .unwrap_or_else(|| self.pos.estimate_cardinality(pat)),
+            IndexKind::Ops => self.ops.as_ref().map(|i| i.estimate_cardinality(pat))
+                .unwrap_or_else(|| self.osp.estimate_cardinality(pat)),
             IndexKind::Spo => self.spo.estimate_cardinality(pat),
             IndexKind::Pos => self.pos.estimate_cardinality(pat),
             IndexKind::Osp => self.osp.estimate_cardinality(pat),
@@ -1868,12 +1995,18 @@ impl TripleIndex {
     /// for pat in patterns { index.scan(pat).collect::<Vec<_>>(); }
     /// ```
     pub fn prefetch_pattern(&self, pat: &TriplePattern) {
-        let (idx, k0) = match pat.best_index() {
-            IndexKind::Spo => (&self.spo, if pat.s != UNBOUND { Some(pat.s) } else { None }),
-            IndexKind::Pos => (&self.pos, if pat.p != UNBOUND { Some(pat.p) } else { None }),
-            IndexKind::Osp => (&self.osp, if pat.o != UNBOUND { Some(pat.o) } else { None }),
+        let (idx_opt, k0) = match pat.best_index() {
+            IndexKind::Spo => (Some(&self.spo), if pat.s != UNBOUND { Some(pat.s) } else { None }),
+            IndexKind::Pos => (Some(&self.pos), if pat.p != UNBOUND { Some(pat.p) } else { None }),
+            IndexKind::Osp => (Some(&self.osp), if pat.o != UNBOUND { Some(pat.o) } else { None }),
+            IndexKind::Pso => (self.pso.as_ref().or(Some(&self.pos)),
+                               if pat.p != UNBOUND { Some(pat.p) } else { None }),
+            IndexKind::Sop => (self.sop.as_ref().or(Some(&self.spo)),
+                               if pat.s != UNBOUND { Some(pat.s) } else { None }),
+            IndexKind::Ops => (self.ops.as_ref().or(Some(&self.osp)),
+                               if pat.o != UNBOUND { Some(pat.o) } else { None }),
         };
-        if let Some(k) = k0 {
+        if let (Some(idx), Some(k)) = (idx_opt, k0) {
             idx.prefetch_for_key(k);
         }
     }
@@ -1925,6 +2058,9 @@ pub struct ParallelChunks {
     pub spo:  Vec<PathBuf>,
     pub pos:  Vec<PathBuf>,
     pub osp:  Vec<PathBuf>,
+    pub pso:  Vec<PathBuf>,
+    pub sop:  Vec<PathBuf>,
+    pub ops:  Vec<PathBuf>,
     pub gspo: Vec<PathBuf>,
 }
 
@@ -1934,6 +2070,12 @@ pub struct AllBuilders {
     pub spo: IndexBuilder,
     pub pos: IndexBuilder,
     pub osp: IndexBuilder,
+    /// PSO: sorted (P,S,O) — enables efficient (p+s)-bound lookups.
+    pub pso: IndexBuilder,
+    /// SOP: sorted (S,O,P) — enables efficient (s+o)-bound lookups.
+    pub sop: IndexBuilder,
+    /// OPS: sorted (O,P,S) — enables efficient (o+p)-bound lookups.
+    pub ops: IndexBuilder,
     /// GSPO quad index — only built when quads are pushed.
     pub gspo: GspoBuilder,
     /// Temp directory for external-sort chunk files (`<store-dir>/_ecordf_tmp`).
@@ -1948,6 +2090,9 @@ impl AllBuilders {
             spo:     IndexBuilder::new(IndexKind::Spo),
             pos:     IndexBuilder::new(IndexKind::Pos),
             osp:     IndexBuilder::new(IndexKind::Osp),
+            pso:     IndexBuilder::new(IndexKind::Pso),
+            sop:     IndexBuilder::new(IndexKind::Sop),
+            ops:     IndexBuilder::new(IndexKind::Ops),
             gspo:    GspoBuilder::new(),
             tmp_dir: None,
         }
@@ -1982,6 +2127,9 @@ impl AllBuilders {
             spo:  IndexBuilder::new_streaming(IndexKind::Spo, cd.clone(), chunk_size),
             pos:  IndexBuilder::new_streaming(IndexKind::Pos, cd.clone(), chunk_size),
             osp:  IndexBuilder::new_streaming(IndexKind::Osp, cd.clone(), chunk_size),
+            pso:  IndexBuilder::new_streaming(IndexKind::Pso, cd.clone(), chunk_size),
+            sop:  IndexBuilder::new_streaming(IndexKind::Sop, cd.clone(), chunk_size),
+            ops:  IndexBuilder::new_streaming(IndexKind::Ops, cd.clone(), chunk_size),
             gspo: GspoBuilder::new_streaming(cd.clone(), chunk_size),
             tmp_dir: Some(cd),
         })
@@ -1992,23 +2140,30 @@ impl AllBuilders {
         self.spo.push(t)?;
         self.pos.push(t)?;
         self.osp.push(t)?;
+        self.pso.push(t)?;
+        self.sop.push(t)?;
+        self.ops.push(t)?;
         Ok(())
     }
 
     /// Push a quad (triple + named graph).
-    /// The triple is also added to SPO/POS/OSP for union-graph queries.
+    /// The triple is also added to all 6 triple indexes for union-graph queries.
     pub fn push_quad(&mut self, q: Quad) -> io::Result<()> {
-        self.spo.push(q.to_triple())?;
-        self.pos.push(q.to_triple())?;
-        self.osp.push(q.to_triple())?;
+        let t = q.to_triple();
+        self.spo.push(t)?;
+        self.pos.push(t)?;
+        self.osp.push(t)?;
+        self.pso.push(t)?;
+        self.sop.push(t)?;
+        self.ops.push(t)?;
         self.gspo.push(q)?;
         Ok(())
     }
 
     // ── parallel support ──────────────────────────────────────────────────────
 
-    /// Flush all remaining buffers and return the chunk paths for all four
-    /// indexes without doing the final merge.
+    /// Flush all remaining buffers and return the chunk paths for all indexes
+    /// without doing the final merge.
     ///
     /// Used by the parallel loader: each worker thread calls this, then the
     /// main thread gathers all [`ParallelChunks`] and passes them to
@@ -2020,6 +2175,9 @@ impl AllBuilders {
             spo:  self.spo.flush_and_return_chunks()?,
             pos:  self.pos.flush_and_return_chunks()?,
             osp:  self.osp.flush_and_return_chunks()?,
+            pso:  self.pso.flush_and_return_chunks()?,
+            sop:  self.sop.flush_and_return_chunks()?,
+            ops:  self.ops.flush_and_return_chunks()?,
             gspo: self.gspo.flush_and_return_chunks()?,
         })
     }
@@ -2042,33 +2200,53 @@ impl AllBuilders {
         let spo_chunks: Vec<PathBuf> = all.iter().flat_map(|c| c.spo.iter().cloned()).collect();
         let pos_chunks: Vec<PathBuf> = all.iter().flat_map(|c| c.pos.iter().cloned()).collect();
         let osp_chunks: Vec<PathBuf> = all.iter().flat_map(|c| c.osp.iter().cloned()).collect();
+        let pso_chunks: Vec<PathBuf> = all.iter().flat_map(|c| c.pso.iter().cloned()).collect();
+        let sop_chunks: Vec<PathBuf> = all.iter().flat_map(|c| c.sop.iter().cloned()).collect();
+        let ops_chunks: Vec<PathBuf> = all.iter().flat_map(|c| c.ops.iter().cloned()).collect();
         let gspo_chunks: Vec<PathBuf> = all.iter().flat_map(|c| c.gspo.iter().cloned()).collect();
 
         let spo_path  = dir.join("spo.bin");
         let pos_path  = dir.join("pos.bin");
         let osp_path  = dir.join("osp.bin");
+        let pso_path  = dir.join("pso.bin");
+        let sop_path  = dir.join("sop.bin");
+        let ops_path  = dir.join("ops.bin");
         let gspo_path = dir.join("gspo.bin");
 
         eprintln!(
-            "  Merging indexes in parallel: {} SPO + {} POS + {} OSP chunks",
-            spo_chunks.len(), pos_chunks.len(), osp_chunks.len()
+            "  Merging 6 indexes in parallel: {} SPO+POS+OSP+PSO+SOP+OPS chunks each",
+            spo_chunks.len()
         );
 
-        // Run the three triple-index merges in parallel (each writes a different file).
+        // Run all six triple-index merges in parallel (each writes a different file).
         let merge_spo = || Self::merge_or_empty(&spo_chunks, &spo_path, IndexKind::Spo);
         let merge_pos = || Self::merge_or_empty(&pos_chunks, &pos_path, IndexKind::Pos);
         let merge_osp = || Self::merge_or_empty(&osp_chunks, &osp_path, IndexKind::Osp);
+        let merge_pso = || Self::merge_or_empty(&pso_chunks, &pso_path, IndexKind::Pso);
+        let merge_sop = || Self::merge_or_empty(&sop_chunks, &sop_path, IndexKind::Sop);
+        let merge_ops = || Self::merge_or_empty(&ops_chunks, &ops_path, IndexKind::Ops);
 
-        let (r_spo, (r_pos, r_osp)) = rayon::join(
+        // rayon::join is binary; nest calls to run all 6 in parallel.
+        let (r_spo, (r_pos, (r_osp, (r_pso, (r_sop, r_ops))))) = rayon::join(
             merge_spo,
-            || rayon::join(merge_pos, merge_osp),
+            || rayon::join(
+                merge_pos,
+                || rayon::join(
+                    merge_osp,
+                    || rayon::join(
+                        merge_pso,
+                        || rayon::join(merge_sop, merge_ops),
+                    ),
+                ),
+            ),
         );
-        r_spo?;
-        r_pos?;
-        r_osp?;
+        r_spo?; r_pos?; r_osp?; r_pso?; r_sop?; r_ops?;
 
         // Remove chunk files (dirs cleaned up by store.rs)
-        for c in spo_chunks.iter().chain(pos_chunks.iter()).chain(osp_chunks.iter()) {
+        for c in spo_chunks.iter()
+            .chain(pos_chunks.iter()).chain(osp_chunks.iter())
+            .chain(pso_chunks.iter()).chain(sop_chunks.iter()).chain(ops_chunks.iter())
+        {
             let _ = std::fs::remove_file(c);
         }
 
@@ -2088,6 +2266,9 @@ impl AllBuilders {
             spo: IndexFile::open(&spo_path, IndexKind::Spo)?,
             pos: IndexFile::open(&pos_path, IndexKind::Pos)?,
             osp: IndexFile::open(&osp_path, IndexKind::Osp)?,
+            pso: Some(IndexFile::open(&pso_path, IndexKind::Pso)?),
+            sop: Some(IndexFile::open(&sop_path, IndexKind::Sop)?),
+            ops: Some(IndexFile::open(&ops_path, IndexKind::Ops)?),
             gspo,
         })
     }
@@ -2117,12 +2298,15 @@ impl AllBuilders {
         let spo = self.spo.build(&dir.join("spo.bin"))?;
         let pos = self.pos.build(&dir.join("pos.bin"))?;
         let osp = self.osp.build(&dir.join("osp.bin"))?;
+        let pso = self.pso.build(&dir.join("pso.bin"))?;
+        let sop = self.sop.build(&dir.join("sop.bin"))?;
+        let ops = self.ops.build(&dir.join("ops.bin"))?;
         let gspo = if !self.gspo.is_empty() {
             Some(self.gspo.build(&dir.join("gspo.bin"))?)
         } else {
             None
         };
-        Ok(TripleIndex { spo, pos, osp, gspo })
+        Ok(TripleIndex { spo, pos, osp, pso: Some(pso), sop: Some(sop), ops: Some(ops), gspo })
     }
 }
 

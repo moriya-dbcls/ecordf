@@ -521,18 +521,19 @@ async fn main() -> anyhow::Result<()> {
             println!("Directory:     {:?}", stats.dir);
             println!("Triples:       {}", stats.triple_count);
             println!("Terms:         {}", stats.term_count);
+            let six_index = store.index.sop.is_some();
+            let index_label = if six_index { "6-index (SPO+POS+OSP+PSO+SOP+OPS)" } else { "3-index (SPO+POS+OSP)" };
+            let index_mb = if six_index {
+                (6 * stats.triple_count * 12) / (1024 * 1024)
+            } else {
+                (3 * stats.triple_count * 12) / (1024 * 1024)
+            };
             if stats.graph_count > 0 {
                 println!("Named graphs:  {}", stats.graph_count);
-                println!(
-                    "Index size: ~{} MB (SPO/POS/OSP×12 + GSPO×16 bytes)",
-                    (3 * stats.triple_count * 12 + stats.triple_count * 16) / (1024 * 1024),
-                );
+                println!("Index layout:  {} + GSPO (~{} MB)", index_label,
+                    index_mb + (stats.triple_count * 16) / (1024 * 1024));
             } else {
-                println!(
-                    "Index size: ~{} MB (3 × {} triples × 12 bytes)",
-                    (3 * stats.triple_count * 12) / (1024 * 1024),
-                    stats.triple_count
-                );
+                println!("Index layout:  {} (~{} MB)", index_label, index_mb);
             }
 
             if top_predicates > 0 {
