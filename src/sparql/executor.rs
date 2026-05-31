@@ -835,30 +835,52 @@ impl<'a> Executor<'a> {
     }
 
     fn execute_scan(&self, pat: &TriplePattern, variables: &[(String, u8)]) -> ResultSet {
-        // Fast path: s is bound, p is fixed, o is free → binary search in pred_cache.
+        // Fast path: s and p are bound → binary search in pred_cache.
         //
-        // This turns every individual ScanBound probe inside a bind_join (e.g. 263
-        // faldo:location lookups × 500 ms HDD each = 131 s) into an O(log N) RAM
-        // lookup (~µs), provided the predicate is cached.
+        // Covers three sub-cases:
+        //   (s=X, p=P, o=free) → find all objects for subject X under predicate P
+        //   (s=X, p=P, o=Y)   → existence check: is (X, P, Y) in the store?
         //
-        // The pred_cache stores (subject, object) pairs sorted by (s, o), so a
-        // partition_point binary search locates all objects for the bound subject
-        // without touching the mmap'd index files.
-        if pat.s != UNBOUND && pat.p != UNBOUND && pat.o == UNBOUND {
+        // pred_cache stores (subject, object) pairs sorted by (s, o), enabling:
+        //   - subject range: partition_point binary search → O(log M)
+        //   - existence:     binary_search(&(s, o))         → O(log M)
+        //
+        // For bind_join workloads (e.g. 263 pepevi × rdf:type filter ≈ 263 × 40 ms HDD):
+        //   Without cache: 263 SPO seeks × ~40 ms = 10 s
+        //   With cache:    263 binary searches × ~1 µs = <1 ms  (if predicate is cached)
+        if pat.s != UNBOUND && pat.p != UNBOUND {
             if let Some(pairs) = self.pred_cache.get(pat.p) {
-                let var_names: Vec<String> = variables.iter().map(|(n, _)| n.clone()).collect();
-                let mut rs = ResultSet::empty(var_names);
                 let bound_s = pat.s;
                 let lo = pairs.partition_point(|&(s, _)| s < bound_s);
+
+                if pat.o != UNBOUND {
+                    // (s=X, p=P, o=Y): existence check via binary search.
+                    let bound_o = pat.o;
+                    let found = pairs[lo..].iter()
+                        .take_while(|&&(s, _)| s == bound_s)
+                        .any(|&(_, o)| o == bound_o);
+                    if !found {
+                        return ResultSet::empty(variables.iter().map(|(n, _)| n.clone()).collect());
+                    }
+                    // Return the single matching row.
+                    let var_names: Vec<String> = variables.iter().map(|(n, _)| n.clone()).collect();
+                    let mut rs = ResultSet::empty(var_names);
+                    let mut row = vec![None; variables.len()];
+                    for (i, (_, pos)) in variables.iter().enumerate() {
+                        row[i] = Some(match pos { 0 => bound_s, 1 => pat.p, _ => bound_o });
+                    }
+                    rs.rows.push(row);
+                    return rs;
+                }
+
+                // (s=X, p=P, o=free): collect all objects for this subject.
+                let var_names: Vec<String> = variables.iter().map(|(n, _)| n.clone()).collect();
+                let mut rs = ResultSet::empty(var_names);
                 for &(s, o) in &pairs[lo..] {
                     if s != bound_s { break; }
                     let mut row = vec![None; variables.len()];
                     for (i, (_, pos)) in variables.iter().enumerate() {
-                        row[i] = Some(match pos {
-                            0 => s,
-                            1 => pat.p,
-                            _ => o,
-                        });
+                        row[i] = Some(match pos { 0 => s, 1 => pat.p, _ => o });
                     }
                     rs.rows.push(row);
                 }
@@ -1533,49 +1555,74 @@ impl<'a> Executor<'a> {
             }
         }
 
-        // ── I/O Optimization 2: Batch madvise Prefetch (fallback) ────────────
+        // ── I/O Optimization 2: Sort groups by primary TermId (index locality) ─
         //
-        // For ScanBound patterns not handled by the predicate scan above, fire
-        // all N madvise(MADV_WILLNEED) hints *before* executing any group.
+        // SPO / POS / OSP indexes are sorted by TermId.  When groups are processed
+        // in ascending TermId order, successive HDD reads advance through the index
+        // monotonically — similar to a sequential scan rather than random seeks.
         //
-        // The OS pipelines the disk reads in the background (SSD queue depth
-        // ~32) while the CPU sets up the first execute call.  Converts
-        // O(N × serial_latency) → O(⌈N/32⌉ × latency) ≈ 32× speedup cold.
+        // Example: 263 pepevi blank nodes in random insertion order might span the
+        // entire SPO space (large seek distance).  Sorted, accesses cluster tightly
+        // (each blank node's triples are contiguous in SPO), so the disk arm barely
+        // moves between groups.
         //
-        // Cost: N in-RAM SkipIndex lookups + N cheap madvise syscalls (≪ 1 ms).
+        // SPARQL result sets are bags (unordered); ORDER BY is applied later at the
+        // SELECT level, so changing group evaluation order here is always safe.
+        //
+        // The sort key is the first non-None TermId in the group's binding key —
+        // for subject-bound ScanBound patterns this is the subject's TermId, which
+        // maps directly to position in the SPO index.
+        if groups.len() > 1 {
+            groups.sort_unstable_by_key(|(key, _)| {
+                key.iter().find_map(|k| *k).unwrap_or(TermId::MAX)
+            });
+            tracing::debug!(
+                groups = groups.len(),
+                "bind_join: groups sorted by TermId for index locality"
+            );
+        }
+
+        // ── I/O Optimization 3: Batch madvise Prefetch ───────────────────────
+        //
+        // Fire all madvise(MADV_WILLNEED) hints *before* starting execution,
+        // for every ScanBound node reachable from right_plan (including nested
+        // Join trees such as Join(ScanBound, ScanBound)).
+        //
+        // The OS pipelines disk reads in the background (SSD I/O queue depth
+        // ~32) while the CPU sets up the first group's evaluation, converting
+        //   O(N × serial_seek_latency)  →  O(⌈N/queue_depth⌉ × latency)
+        //
+        // For N=263 groups @ 40 ms/seek: sequential = 10.5 s,
+        // with queue_depth=32 prefetch: ~0.3 s (32× speedup on SSD).
+        //
+        // Predicates in pred_cache bypass the HDD entirely, so their patterns
+        // are skipped (collect_scanbound_patterns already checks pred_cache).
+        //
+        // The groups have already been sorted above, so prefetch hints arrive at
+        // the OS in the same order as the subsequent reads — maximising the
+        // chance that each page is warm by the time it is first accessed.
         if groups.len() > PRED_SCAN_THRESHOLD {
-            if let ExecutionPlan::ScanBound { base, outer_vars, .. } = right_plan {
-                for (key, _) in &groups {
-                    let mut pat = *base;
-                    // Fill in the group-key variables (left-side bindings).
-                    for (key_pos, (_, var_name)) in needed.iter().enumerate() {
-                        if let Some(id) = key.get(key_pos).copied().flatten() {
-                            for (ov_name, ov_pos) in outer_vars.iter() {
-                                if ov_name == var_name {
-                                    match *ov_pos {
-                                        0 => pat.s = id,
-                                        1 => pat.p = id,
-                                        _ => pat.o = id,
-                                    }
-                                    break;
-                                }
-                            }
-                        }
+            let mut total_prefetches = 0usize;
+            for (key, _) in &groups {
+                // Build the full binding for this group (outer + group-key vars).
+                let mut row_binding = outer.clone();
+                for (key_pos, (_, var_name)) in needed.iter().enumerate() {
+                    if let Some(id) = key.get(key_pos).copied().flatten() {
+                        row_binding.insert(var_name.clone(), id);
                     }
-                    // Also fill any variable already bound in the enclosing context.
-                    for (ov_name, ov_pos) in outer_vars.iter() {
-                        if let Some(&id) = outer.get(ov_name.as_str()) {
-                            match *ov_pos {
-                                0 => pat.s = id,
-                                1 => pat.p = id,
-                                _ => pat.o = id,
-                            }
-                        }
-                    }
-                    self.index.prefetch_pattern(&pat);
                 }
+                // Collect all ScanBound patterns, skipping pred_cache hits.
+                let mut patterns: Vec<TriplePattern> = Vec::new();
+                collect_scanbound_patterns(right_plan, &row_binding, &self.pred_cache, &mut patterns);
+                for pat in &patterns {
+                    self.index.prefetch_pattern(pat);
+                    total_prefetches += 1;
+                }
+            }
+            if total_prefetches > 0 {
                 tracing::debug!(
                     groups = groups.len(),
+                    prefetches = total_prefetches,
                     "bind_join: batch prefetch fired (madvise WILLNEED)"
                 );
             }
@@ -2532,29 +2579,80 @@ impl<'a> Executor<'a> {
         }
 
         // ── Step 0 ───────────────────────────────────────────────────────────────
+        //
+        // Two strategies, in preference order:
+        //
+        // A) pred_cache per-subject probe — O(|filter| × log M):
+        //    When the step-0 predicate is in pred_cache, probe once per subject
+        //    in the filter rather than cloning/scanning all M pairs.
+        //    For M=11.8M faldo:begin pairs and |filter|=263 subjects:
+        //      Full scan:  O(11.8M) reads + 11.8M filter checks ≈ 0.56 s (HDD)
+        //      Per-probe:  O(263 × log₂(11.8M)) = 263 × 23 ≈ 6000 RAM ops ≈ <1 ms
+        //
+        // B) Full scan + retain — O(M):
+        //    Fallback when step-0 predicate is not in pred_cache.  One sequential
+        //    POS read then a linear filter pass.
         let t_seq = std::time::Instant::now();
+        let step0_o = if steps.len() == 1 { o } else { None };
+
         let mut current: Vec<(TermId, TermId)> =
-            self.eval_path(&steps[0], s, if steps.len() == 1 { o } else { None });
+            if let PropertyPath::Iri(ref iri) = steps[0] {
+                if let Some(pred_id) = self.dict.lookup(iri) {
+                    if let Some(cached) = self.pred_cache.get(pred_id) {
+                        // Strategy A: probe pred_cache once per subject.
+                        //
+                        // Sort subjects so binary-search positions advance monotonically,
+                        // allowing sequential cache traversal (no random seeks in RAM).
+                        let mut sorted_subjects: Vec<TermId> =
+                            subject_filter.iter().copied().collect();
+                        sorted_subjects.sort_unstable();
 
-        tracing::debug!(
-            step = 0,
-            pairs_raw = current.len(),
-            elapsed_us = t_seq.elapsed().as_micros(),
-            "eval_seq_filtered: step 0 raw"
-        );
+                        let mut result = Vec::with_capacity(sorted_subjects.len() * 2);
+                        for sid in sorted_subjects {
+                            let lo = cached.partition_point(|&(cs, _)| cs < sid);
+                            for &(cs, co) in &cached[lo..] {
+                                if cs != sid { break; }
+                                if step0_o.map_or(true, |eo| co == eo) {
+                                    result.push((sid, co));
+                                }
+                            }
+                        }
 
-        // ── Subject filter ───────────────────────────────────────────────────────
-        // Retain only pairs whose source subject is in the left-side set.
-        // O(N_step0) with O(1) HashSet lookup per pair.
-        current.retain(|(subj, _)| subject_filter.contains(subj));
+                        tracing::debug!(
+                            step = 0,
+                            subjects_probed = subject_filter.len(),
+                            pairs_out = result.len(),
+                            cached_pairs = cached.len(),
+                            elapsed_us = t_seq.elapsed().as_micros(),
+                            "eval_seq_filtered: step 0 pred_cache probe (skipped full scan)"
+                        );
+                        result
+                    } else {
+                        // Strategy B: full scan + retain.
+                        let mut v = self.eval_path(&steps[0], s, step0_o);
+                        let pairs_raw = v.len();
+                        v.retain(|(subj, _)| subject_filter.contains(subj));
+                        tracing::debug!(
+                            step = 0,
+                            pairs_raw,
+                            pairs_after_filter = v.len(),
+                            elapsed_us = t_seq.elapsed().as_micros(),
+                            "eval_seq_filtered: step 0 raw (no pred_cache)"
+                        );
+                        v
+                    }
+                } else {
+                    // IRI not in dictionary → no matching triples.
+                    Vec::new()
+                }
+            } else {
+                // Non-IRI step (Inverse / Alternative / etc.): full eval + retain.
+                let mut v = self.eval_path(&steps[0], s, step0_o);
+                v.retain(|(subj, _)| subject_filter.contains(subj));
+                v
+            };
 
-        tracing::debug!(
-            step = 0,
-            pairs_after_filter = current.len(),
-            filter_size = subject_filter.len(),
-            elapsed_us = t_seq.elapsed().as_micros(),
-            "eval_seq_filtered: after subject filter"
-        );
+        // Logging is embedded in each strategy branch above.
 
         // ── Steps 1+ ─────────────────────────────────────────────────────────────
         // Identical to eval_path Sequence; current is now tiny (e.g. 508 pairs).
@@ -3704,6 +3802,53 @@ fn plan_needs_outer_binding(plan: &ExecutionPlan, left_vars: &[String]) -> bool 
 /// context (via `execute_plan_with_ctx`).  Used by `bind_join` to group left
 /// rows by the subset of bindings that actually affect the right plan, so each
 /// unique binding is executed only once rather than once per left row.
+/// Recursively collect TriplePatterns from all `ScanBound` nodes reachable
+/// from `plan` through `Join` edges, substituting variables from `binding`.
+///
+/// Used by `bind_join` to fire a batch of madvise(MADV_WILLNEED) prefetch hints
+/// *before* starting execution, so the OS can pipeline disk reads in the
+/// background while the CPU sets up the first group's evaluation.
+///
+/// Only traverses `Join` children — other plan types (PathPattern, Subquery, …)
+/// manage their own I/O and are skipped here.
+///
+/// Predicates that are already in `pred_cache` do not touch the HDD, so their
+/// patterns are omitted (no point issuing a prefetch for a RAM-resident key).
+fn collect_scanbound_patterns(
+    plan: &ExecutionPlan,
+    binding: &Binding,
+    pred_cache: &PredCache,
+    out: &mut Vec<TriplePattern>,
+) {
+    match plan {
+        ExecutionPlan::ScanBound { base, outer_vars, .. } => {
+            // Fill fixed components from the current binding.
+            let mut pat = *base;
+            for (ov_name, ov_pos) in outer_vars.iter() {
+                if let Some(&id) = binding.get(ov_name.as_str()) {
+                    match *ov_pos {
+                        0 => pat.s = id,
+                        1 => pat.p = id,
+                        _ => pat.o = id,
+                    }
+                }
+            }
+            // Skip if the predicate is cached in RAM — no HDD I/O needed.
+            if pat.p != UNBOUND && pred_cache.get(pat.p).is_some() {
+                return;
+            }
+            out.push(pat);
+        }
+        // Recurse into both sides of a Join.
+        ExecutionPlan::Join(left, right) => {
+            collect_scanbound_patterns(left,  binding, pred_cache, out);
+            collect_scanbound_patterns(right, binding, pred_cache, out);
+        }
+        // All other plan types have their own I/O management; skip.
+        _ => {}
+    }
+}
+
 fn plan_referenced_vars(plan: &ExecutionPlan) -> HashSet<String> {
     let mut vars = HashSet::new();
     collect_referenced_vars(plan, &mut vars);
