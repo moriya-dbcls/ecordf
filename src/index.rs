@@ -1908,6 +1908,34 @@ fn try_open_index(path: &Path, kind: IndexKind) -> io::Result<Option<IndexFile>>
     }
 }
 
+/// Predicate cardinality threshold for OPS routing.
+///
+/// When `(s=free, p=bound, o=bound)` and the predicate has more than this many
+/// triples, the OPS index is used instead of POS.
+///
+/// ## Why this works
+///
+/// POS searches within a predicate's range: O(log |pred|) page faults.
+/// OPS starts from the object (SkipIndex: 1 page fault) then binary-searches
+/// for the predicate within the object's degree: O(log deg(o)).
+///
+/// When |pred| >> deg(o) — common for hub predicates like rdf:type, rdfs:label,
+/// owl:sameAs — OPS is dramatically faster.  The crossover at 1 M triples
+/// covers almost all biological "class membership" and "annotation" predicates.
+///
+/// | Predicate        | |pred|  | deg(o) typical | Winner |
+/// |------------------|---------|----------------|--------|
+/// | rdf:type         | 500 M   | 10 – 10 000    | OPS    |
+/// | rdfs:label       | 100 M   | 1 – 100        | OPS    |
+/// | up:sequence      |  10 M   | 1              | OPS    |
+/// | faldo:position   |  11 M   | 1              | OPS    |
+/// | up:organism      |   5 M   | 1 000 – 100 000| OPS    |
+/// | jpo:hasPeptide   |   263   | 10 – 1 000     | POS    |
+///
+/// The threshold is a constant here but could be exposed in `ecordf.toml`
+/// under `[query]` if fine-tuning becomes necessary.
+const OPS_ROUTING_THRESHOLD: usize = 1_000_000;
+
 impl TripleIndex {
     pub fn open(dir: &Path) -> io::Result<Self> {
         let gspo_path = dir.join("gspo.bin");
@@ -1927,7 +1955,50 @@ impl TripleIndex {
         })
     }
 
+    /// Choose the optimal `IndexKind` for `pat`, incorporating predicate-size
+    /// statistics that `TriplePattern::best_index()` cannot access.
+    ///
+    /// ## Statistics-aware rule: (p+o bound) → OPS
+    ///
+    /// `TriplePattern::best_index()` always returns `Pos` for `(s=free, p=bound,
+    /// o=bound)`.  This is correct for small predicates, but wrong for large ones:
+    ///
+    /// - **POS** binary-searches for `o` within the predicate's range →
+    ///   O(log |pred|) page faults, e.g. log₂(500 M) ≈ 29 for `rdf:type`.
+    /// - **OPS** starts from `o` (SkipIndex: 1 page fault) then binary-searches
+    ///   for `p` within the object's degree → O(log deg(o)), typically ≪ 29.
+    ///
+    /// We switch to OPS when the predicate's row count exceeds
+    /// `OPS_ROUTING_THRESHOLD` (1 M) and the OPS index is present.
+    ///
+    /// All other patterns delegate to `TriplePattern::best_index()`.
+    pub fn best_kind(&self, pat: &TriplePattern) -> IndexKind {
+        // (p+o bound, s=free): candidate for OPS routing.
+        if pat.s == UNBOUND && pat.p != UNBOUND && pat.o != UNBOUND
+            && self.ops.is_some()
+        {
+            let pred_size = self.pos.pred_idx.as_ref()
+                .and_then(|pi| pi.get(pat.p))
+                .map(|(lo, hi)| hi - lo)
+                .unwrap_or(0);
+            if pred_size > OPS_ROUTING_THRESHOLD {
+                tracing::trace!(
+                    pred = pat.p,
+                    pred_size,
+                    threshold = OPS_ROUTING_THRESHOLD,
+                    "index routing: (p+o bound) → OPS (large predicate)"
+                );
+                return IndexKind::Ops;
+            }
+        }
+        pat.best_index()
+    }
+
     /// Select the best index for a pattern and return matching triples.
+    ///
+    /// Uses `best_kind()` (statistics-aware) rather than `pat.best_index()`
+    /// (statistics-free), so large predicates in `(p+o)` patterns are routed
+    /// to OPS instead of POS.
     ///
     /// When the optimal 6-index is absent (3-index store), falls back to the
     /// nearest existing index:
@@ -1935,7 +2006,7 @@ impl TripleIndex {
     ///   PSO missing → POS   (p is primary key in both)
     ///   OPS missing → OSP   (o is primary key in both)
     pub fn scan(&self, pat: &TriplePattern) -> TripleScan {
-        match pat.best_index() {
+        match self.best_kind(pat) {
             IndexKind::Sop => self.sop.as_ref().map(|i| i.scan(pat))
                 .unwrap_or_else(|| self.spo.scan(pat)),
             IndexKind::Pso => self.pso.as_ref().map(|i| i.scan(pat))
@@ -1948,9 +2019,9 @@ impl TripleIndex {
         }
     }
 
-    /// Estimate cardinality using the best index.
+    /// Estimate cardinality using the statistics-aware best index.
     pub fn estimate(&self, pat: &TriplePattern) -> u64 {
-        match pat.best_index() {
+        match self.best_kind(pat) {
             IndexKind::Sop => self.sop.as_ref().map(|i| i.estimate_cardinality(pat))
                 .unwrap_or_else(|| self.spo.estimate_cardinality(pat)),
             IndexKind::Pso => self.pso.as_ref().map(|i| i.estimate_cardinality(pat))
@@ -1995,7 +2066,9 @@ impl TripleIndex {
     /// for pat in patterns { index.scan(pat).collect::<Vec<_>>(); }
     /// ```
     pub fn prefetch_pattern(&self, pat: &TriplePattern) {
-        let (idx_opt, k0) = match pat.best_index() {
+        // Use best_kind() so large (p+o)-bound patterns prefetch OPS pages,
+        // not POS pages — matching the index that scan() will actually use.
+        let (idx_opt, k0) = match self.best_kind(pat) {
             IndexKind::Spo => (Some(&self.spo), if pat.s != UNBOUND { Some(pat.s) } else { None }),
             IndexKind::Pos => (Some(&self.pos), if pat.p != UNBOUND { Some(pat.p) } else { None }),
             IndexKind::Osp => (Some(&self.osp), if pat.o != UNBOUND { Some(pat.o) } else { None }),
