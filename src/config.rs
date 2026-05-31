@@ -373,6 +373,7 @@ pub struct ServerConfig {
     ///
     /// Overridable with `--pred-cache-per-pred-cap-mb` on the command line.
     pub pred_cache_per_pred_cap_mb: u64,
+
 }
 
 impl Default for ServerConfig {
@@ -381,8 +382,8 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 7878,
             cors_origins: String::new(),
-            max_concurrent_queries: 0, // unlimited by default
-            warmup_mb: 0,              // disabled by default
+            max_concurrent_queries: 0,     // unlimited by default
+            warmup_mb: 0,                  // disabled by default
             pred_cache_mb: 1024,           // 1024 MB heap; 50% cap = 512 MB/predicate (covers faldo)
             pred_cache_per_pred_cap_mb: 0, // 0 = use pred_cache_mb / 2 (default)
         }

@@ -307,10 +307,45 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("Warming up {} MB of indexes in background...", effective_warmup_mb);
                 store.warmup_background(effective_warmup_mb);
             }
+            // Resolve rdf-config specs first — needed both for the pred_cache
+            // priority pass and for the path_cache build later.
+            // CLI --rdf-config flags override [model] rdf_configs in ecordf.toml.
+            let effective_rdf_configs: Vec<String> = if !rdf_config.is_empty() {
+                rdf_config
+            } else {
+                store.config.model.rdf_configs.clone()
+            };
+
+            // Load compound paths once — used for both pred_cache priority and
+            // path_cache materialisation below.  Network I/O (GitHub fetches)
+            // happens here; skipped if no rdf_configs are configured.
+            let compound_paths: Vec<Vec<String>> = if !effective_rdf_configs.is_empty() {
+                eprintln!("Loading rdf-config from {} spec(s)...", effective_rdf_configs.len());
+                let paths = ecordf::rdf_config::load_compound_paths(&effective_rdf_configs);
+                eprintln!("  {} compound path(s) found.", paths.len());
+                paths
+            } else {
+                Vec::new()
+            };
+
+            // Collect all unique predicate IRIs appearing in any compound path.
+            // These are the predicates that drive property-path SPARQL queries, so
+            // caching them first avoids "budget exhausted by non-query predicates"
+            // without requiring any explicit user configuration.
+            let priority_iris: Vec<String> = {
+                let mut seen = std::collections::HashSet::new();
+                let mut iris = Vec::new();
+                for path in &compound_paths {
+                    for iri in path {
+                        if seen.insert(iri.as_str()) {
+                            iris.push(iri.clone());
+                        }
+                    }
+                }
+                iris
+            };
+
             // Build predicate cache synchronously before serving queries.
-            // Largest predicates (faldo:position, faldo:begin etc.) are loaded first
-            // so the first query hits the cache.  Startup is blocked but query
-            // latency is deterministic from the very first request.
             // CLI --pred-cache-mb takes precedence; fall back to config file value.
             let effective_pred_cache_mb = if pred_cache_mb > 0 { pred_cache_mb } else { store.config.server.pred_cache_mb };
             let effective_per_pred_cap_mb = if pred_cache_per_pred_cap_mb > 0 {
@@ -320,27 +355,26 @@ async fn main() -> anyhow::Result<()> {
             };
             if effective_pred_cache_mb > 0 {
                 eprintln!(
-                    "Building predicate cache ({} MB, per-predicate cap = {} MB)...",
+                    "Building predicate cache ({} MB, per-predicate cap = {} MB{})...",
                     effective_pred_cache_mb,
                     if effective_per_pred_cap_mb > 0 {
                         effective_per_pred_cap_mb.to_string()
                     } else {
                         format!("{} (default 50%)", effective_pred_cache_mb / 2)
-                    }
+                    },
+                    if !priority_iris.is_empty() {
+                        format!(", {} rdf-config predicate(s) prioritised", priority_iris.len())
+                    } else {
+                        String::new()
+                    },
                 );
-                store.build_pred_cache_sync(effective_pred_cache_mb, effective_per_pred_cap_mb);
+                store.build_pred_cache_sync(effective_pred_cache_mb, effective_per_pred_cap_mb, &priority_iris);
                 eprintln!("Predicate cache ready ({} MB used).",
                     store.pred_cache.bytes_used() / (1024 * 1024));
             }
-            // Build path cache from rdf-config compound paths.
-            // CLI --rdf-config flags override [model] rdf_configs in ecordf.toml.
-            let effective_rdf_configs: Vec<String> = if !rdf_config.is_empty() {
-                rdf_config
-            } else {
-                store.config.model.rdf_configs.clone()
-            };
+
+            // Build path cache from the already-loaded compound paths (no second YAML fetch).
             // If --rdf-config is given but --path-cache-mb is omitted, default to 512 MB.
-            // This avoids the footgun of fetching YAML but never building the cache.
             const DEFAULT_PATH_CACHE_MB: u64 = 512;
             let effective_path_cache_mb = if path_cache_mb > 0 {
                 path_cache_mb
@@ -351,12 +385,12 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 0
             };
-            if !effective_rdf_configs.is_empty() && effective_path_cache_mb > 0 {
+            if !compound_paths.is_empty() && effective_path_cache_mb > 0 {
                 eprintln!(
-                    "Building path cache ({} MB) from {} rdf-config spec(s)...",
-                    effective_path_cache_mb, effective_rdf_configs.len()
+                    "Building path cache ({} MB) from {} compound path(s)...",
+                    effective_path_cache_mb, compound_paths.len()
                 );
-                store.build_path_cache(&effective_rdf_configs, effective_path_cache_mb);
+                store.build_path_cache_from_compounds(&compound_paths, effective_path_cache_mb);
                 eprintln!(
                     "Path cache ready: {} path(s), {} MB used.",
                     store.path_cache.len(),

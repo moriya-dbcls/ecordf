@@ -32,7 +32,7 @@
 //! The gain comes from replacing an 11.8 M-entry POS scan + HashMap lookup
 //! with a linear merge over a RAM-resident sorted Vec.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -87,8 +87,16 @@ impl PredCache {
     /// the cache rather than falling back to HDD scans.
     ///
     /// `per_pred_cap_bytes = 0` → use the default 50%-of-budget cap.
-    pub fn build_sync(self, index: &TripleIndex, budget_bytes: usize, per_pred_cap_bytes: usize) {
-        build_cache(&self, index, budget_bytes, per_pred_cap_bytes);
+    /// `priority_ids` — `TermId`s loaded first regardless of size ordering.
+    ///   Resolve IRI strings via `dict.lookup(iri)` before calling this.
+    pub fn build_sync(
+        self,
+        index: &TripleIndex,
+        budget_bytes: usize,
+        per_pred_cap_bytes: usize,
+        priority_ids: &[TermId],
+    ) {
+        build_cache(&self, index, budget_bytes, per_pred_cap_bytes, priority_ids);
     }
 
     /// Spawn a background thread that fills the cache up to `budget_bytes`.
@@ -102,11 +110,19 @@ impl PredCache {
     /// Prefer [`build_sync`] at startup unless you explicitly want async warmup.
     ///
     /// `per_pred_cap_bytes = 0` → use the default 50%-of-budget cap.
-    pub fn build_background(self, index: Arc<TripleIndex>, budget_bytes: usize, per_pred_cap_bytes: usize) {
+    /// `priority_ids` — `TermId`s loaded first regardless of size ordering.
+    ///   Resolve IRI strings via `dict.lookup(iri)` before calling this.
+    pub fn build_background(
+        self,
+        index: Arc<TripleIndex>,
+        budget_bytes: usize,
+        per_pred_cap_bytes: usize,
+        priority_ids: Vec<TermId>,
+    ) {
         std::thread::Builder::new()
             .name("pred-cache-builder".into())
             .spawn(move || {
-                build_cache(&self, &*index, budget_bytes, per_pred_cap_bytes);
+                build_cache(&self, &*index, budget_bytes, per_pred_cap_bytes, &priority_ids);
             })
             .expect("failed to spawn pred-cache builder thread");
     }
@@ -114,7 +130,13 @@ impl PredCache {
 
 // ── Cache builder ─────────────────────────────────────────────────────────────
 
-fn build_cache(cache: &PredCache, index: &TripleIndex, budget_bytes: usize, per_pred_cap_bytes: usize) {
+fn build_cache(
+    cache: &PredCache,
+    index: &TripleIndex,
+    budget_bytes: usize,
+    per_pred_cap_bytes: usize,
+    priority_ids: &[TermId],
+) {
     let t0 = Instant::now();
     // Per-predicate size cap.
     //
@@ -135,13 +157,11 @@ fn build_cache(cache: &PredCache, index: &TripleIndex, budget_bytes: usize, per_
         (budget_bytes / 2).max(1) // default: no single predicate > 50% of budget
     };
 
-    // Load predicates largest-first (within per_pred_cap) so that expensive
-    // predicates like faldo:position (11.8 M entries = 188 MB) are cached before
-    // tiny ones.  `predicate_sizes()` returns ascending order; reverse it here.
-    // Use `continue` (not `break`) when a predicate doesn't fit in the remaining
-    // budget — smaller predicates later in the list may still fit.
+    // Build size map: pred_id → triple count (from index).
     let mut sizes = index.predicate_sizes();
-    sizes.sort_unstable_by(|a, b| b.1.cmp(&a.1)); // descending by count
+    sizes.sort_unstable_by(|a, b| b.1.cmp(&a.1)); // descending by count (largest-first)
+    let size_map: HashMap<TermId, usize> = sizes.iter().cloned().collect();
+
     let mut total_loaded: usize = 0;
     let mut total_bytes: usize = 0;
     let mut remaining = budget_bytes;
@@ -150,26 +170,99 @@ fn build_cache(cache: &PredCache, index: &TripleIndex, budget_bytes: usize, per_
         budget_mb = budget_bytes / (1024 * 1024),
         per_pred_cap_mb = per_pred_cap / (1024 * 1024),
         predicates = sizes.len(),
+        priority_count = priority_ids.len(),
         "pred-cache: starting build"
     );
 
-    for (pred_id, count) in sizes {
+    // ── Priority pass: load specified predicates first ────────────────────────
+    //
+    // Priority predicates (pre-resolved TermIds) are guaranteed to be cached
+    // before the size-ordered pass, as long as they fit under the per-predicate
+    // cap and within the remaining budget.
+    let mut priority_loaded: HashSet<TermId> = HashSet::new();
+
+    for &pred_id in priority_ids {
+        let count = size_map.get(&pred_id).copied().unwrap_or(0);
+        if count == 0 {
+            tracing::debug!(pred = pred_id, "pred-cache: priority predicate has 0 triples, skipping");
+            continue;
+        }
+        let entry_bytes = count * 16;
+        if entry_bytes > per_pred_cap {
+            tracing::info!(
+                pred = pred_id,
+                mb = entry_bytes / (1024 * 1024),
+                cap_mb = per_pred_cap / (1024 * 1024),
+                "pred-cache: priority predicate exceeds per-pred cap, skipping"
+            );
+            continue;
+        }
+        if entry_bytes > remaining {
+            tracing::info!(
+                pred = pred_id,
+                mb = entry_bytes / (1024 * 1024),
+                remaining_mb = remaining / (1024 * 1024),
+                "pred-cache: priority predicate does not fit in remaining budget, skipping"
+            );
+            continue;
+        }
+
+        let pairs = load_pairs(index, pred_id);
+        let actual_bytes = pairs.len() * 16;
+        remaining = remaining.saturating_sub(actual_bytes);
+        total_bytes += actual_bytes;
+        total_loaded += 1;
+        priority_loaded.insert(pred_id);
+
+        if let Ok(mut guard) = cache.inner.write() {
+            guard.bytes_used += actual_bytes;
+            guard.entries.insert(pred_id, Arc::new(pairs));
+        }
+
+        tracing::info!(
+            pred = pred_id,
+            triples = count,
+            mb = actual_bytes / (1024 * 1024),
+            total_mb = total_bytes / (1024 * 1024),
+            remaining_mb = remaining / (1024 * 1024),
+            "pred-cache: priority predicate cached"
+        );
+    }
+
+    // ── Size-ordered pass: fill remaining budget largest-first ────────────────
+    //
+    // Use `continue` (not `break`) when a predicate doesn't fit — smaller
+    // predicates later in the sorted list may still fit.
+    for (pred_id, count) in &sizes {
+        let (pred_id, count) = (*pred_id, *count);
         if count == 0 { continue; }
+        // Skip predicates already loaded in the priority pass.
+        if priority_loaded.contains(&pred_id) { continue; }
+
         let entry_bytes = count * 16; // 16 bytes per (u64, u64) pair
 
         // Skip predicates that exceed the per-predicate cap (too big to be useful).
-        if entry_bytes > per_pred_cap { continue; }
+        if entry_bytes > per_pred_cap {
+            tracing::debug!(
+                pred = pred_id,
+                mb = entry_bytes / (1024 * 1024),
+                cap_mb = per_pred_cap / (1024 * 1024),
+                "pred-cache: skipped (exceeds per-pred cap)"
+            );
+            continue;
+        }
         // Skip predicates that no longer fit, but keep trying smaller ones.
-        if entry_bytes > remaining { continue; }
+        if entry_bytes > remaining {
+            tracing::debug!(
+                pred = pred_id,
+                mb = entry_bytes / (1024 * 1024),
+                remaining_mb = remaining / (1024 * 1024),
+                "pred-cache: skipped (budget exhausted for this size)"
+            );
+            continue;
+        }
 
-        let pat = TriplePattern::new(UNBOUND, pred_id, UNBOUND);
-        let mut pairs: Vec<(TermId, TermId)> = index.scan(&pat)
-            .map(|t| (t.s, t.o))
-            .collect();
-
-        // Sort by (subject, object) for binary-search and merge-join access.
-        pairs.sort_unstable();
-
+        let pairs = load_pairs(index, pred_id);
         let actual_bytes = pairs.len() * 16;
         remaining = remaining.saturating_sub(actual_bytes);
         total_bytes += actual_bytes;
@@ -181,11 +274,12 @@ fn build_cache(cache: &PredCache, index: &TripleIndex, budget_bytes: usize, per_
             guard.entries.insert(pred_id, Arc::new(pairs));
         }
 
-        tracing::debug!(
+        tracing::info!(
             pred = pred_id,
             triples = count,
             mb = actual_bytes / (1024 * 1024),
             total_mb = total_bytes / (1024 * 1024),
+            remaining_mb = remaining / (1024 * 1024),
             "pred-cache: cached predicate"
         );
     }
@@ -196,6 +290,17 @@ fn build_cache(cache: &PredCache, index: &TripleIndex, budget_bytes: usize, per_
         elapsed_ms = t0.elapsed().as_millis(),
         "pred-cache: build complete"
     );
+}
+
+/// Load all (subject, object) pairs for `pred_id` from the POS index,
+/// sorted by (subject, object) for binary-search and merge-join access.
+fn load_pairs(index: &TripleIndex, pred_id: TermId) -> Vec<(TermId, TermId)> {
+    let pat = TriplePattern::new(UNBOUND, pred_id, UNBOUND);
+    let mut pairs: Vec<(TermId, TermId)> = index.scan(&pat)
+        .map(|t| (t.s, t.o))
+        .collect();
+    pairs.sort_unstable();
+    pairs
 }
 
 // ── Merge-join helpers ────────────────────────────────────────────────────────

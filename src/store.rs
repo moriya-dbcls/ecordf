@@ -530,20 +530,36 @@ impl Store {
 
     /// Build the in-RAM predicate cache **synchronously** in the calling thread.
     ///
-    /// Blocks until all predicates within the budget are loaded (largest-first,
-    /// no single predicate > 50% of the budget).  Call this before `serve` so
-    /// the first query is guaranteed to hit the cache rather than falling back
-    /// to HDD scans.
+    /// Blocks until all predicates within the budget are loaded (priority
+    /// predicates first, then largest-first within the per-predicate cap).
+    /// Call this before `serve` so the first query is guaranteed to hit the
+    /// cache rather than falling back to HDD scans.
     ///
     /// `pred_cache_mb = 0` is a no-op.
     /// `per_pred_cap_mb = 0` → use the default 50%-of-budget cap.
-    pub fn build_pred_cache_sync(&mut self, pred_cache_mb: u64, per_pred_cap_mb: u64) {
+    /// `priority_iris` — IRIs loaded before the size-ordered pass (may be empty).
+    pub fn build_pred_cache_sync(
+        &mut self,
+        pred_cache_mb: u64,
+        per_pred_cap_mb: u64,
+        priority_iris: &[String],
+    ) {
         if pred_cache_mb == 0 { return; }
         let budget_bytes = (pred_cache_mb as usize) * 1024 * 1024;
         let per_pred_cap_bytes = (per_pred_cap_mb as usize) * 1024 * 1024;
+        // Resolve priority IRIs to TermIds in the calling thread.
+        let priority_ids: Vec<u64> = priority_iris.iter()
+            .filter_map(|iri| {
+                let id = self.dict.lookup(iri);
+                if id.is_none() {
+                    tracing::debug!(iri, "pred-cache: priority IRI not in dictionary, ignoring");
+                }
+                id
+            })
+            .collect();
         let cache = PredCache::empty();
         self.pred_cache = cache.clone();
-        cache.build_sync(&*self.index, budget_bytes, per_pred_cap_bytes);
+        cache.build_sync(&*self.index, budget_bytes, per_pred_cap_bytes, &priority_ids);
         tracing::info!(
             bytes_used = self.pred_cache.bytes_used(),
             mb_used = self.pred_cache.bytes_used() / (1024 * 1024),
@@ -559,17 +575,37 @@ impl Store {
     ///
     /// This is called synchronously before `serve()` so the first query is
     /// guaranteed to hit the cache.  `budget_mb = 0` is a no-op.
+    ///
+    /// Prefer [`build_path_cache_from_compounds`] when the compound paths are
+    /// already loaded (avoids fetching the YAML a second time).
     pub fn build_path_cache(&mut self, rdf_config_specs: &[String], budget_mb: u64) {
         if budget_mb == 0 || rdf_config_specs.is_empty() {
             return;
         }
         let compound_paths = rdf_config::load_compound_paths(rdf_config_specs);
-        if compound_paths.is_empty() {
-            tracing::info!("path-cache: no compound paths found in rdf-config specs");
+        self.build_path_cache_from_compounds(&compound_paths, budget_mb);
+    }
+
+    /// Build the in-RAM path cache from already-loaded compound paths.
+    ///
+    /// Materialises each path as a sorted `Vec<(TermId, TermId)>` up to
+    /// `budget_mb` MiB.  Use this when compound paths were already fetched
+    /// (e.g. for pred_cache priority extraction) to avoid a second YAML load.
+    ///
+    /// `budget_mb = 0` or empty `compound_paths` is a no-op.
+    pub fn build_path_cache_from_compounds(
+        &mut self,
+        compound_paths: &[Vec<String>],
+        budget_mb: u64,
+    ) {
+        if budget_mb == 0 || compound_paths.is_empty() {
+            if compound_paths.is_empty() {
+                tracing::info!("path-cache: no compound paths found in rdf-config specs");
+            }
             return;
         }
         let budget_bytes = (budget_mb as usize) * 1024 * 1024;
-        self.path_cache = PathCache::build(&compound_paths, &self.dict, &*self.index, budget_bytes);
+        self.path_cache = PathCache::build(compound_paths, &self.dict, &*self.index, budget_bytes);
         tracing::info!(
             paths_cached = self.path_cache.len(),
             mb_used = self.path_cache.bytes_used() / (1024 * 1024),
@@ -585,13 +621,23 @@ impl Store {
     ///
     /// `pred_cache_mb = 0` is a no-op.
     /// `per_pred_cap_mb = 0` → use the default 50%-of-budget cap.
-    pub fn build_pred_cache(&mut self, pred_cache_mb: u64, per_pred_cap_mb: u64) {
+    /// `priority_iris` — IRIs loaded before the size-ordered pass (may be empty).
+    pub fn build_pred_cache(
+        &mut self,
+        pred_cache_mb: u64,
+        per_pred_cap_mb: u64,
+        priority_iris: &[String],
+    ) {
         if pred_cache_mb == 0 { return; }
         let budget_bytes = (pred_cache_mb as usize) * 1024 * 1024;
         let per_pred_cap_bytes = (per_pred_cap_mb as usize) * 1024 * 1024;
+        // Resolve priority IRIs to TermIds in the calling thread before spawning.
+        let priority_ids: Vec<u64> = priority_iris.iter()
+            .filter_map(|iri| self.dict.lookup(iri))
+            .collect();
         let cache = PredCache::empty();
         self.pred_cache = cache.clone();
-        cache.build_background(Arc::clone(&self.index), budget_bytes, per_pred_cap_bytes);
+        cache.build_background(Arc::clone(&self.index), budget_bytes, per_pred_cap_bytes, priority_ids);
         tracing::info!(
             pred_cache_mb,
             "pred-cache: background build started"

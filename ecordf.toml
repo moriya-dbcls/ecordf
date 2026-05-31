@@ -257,6 +257,7 @@ pred_cache_mb = 1024
 # Overridable with --pred-cache-per-pred-cap-mb on the command line.
 pred_cache_per_pred_cap_mb = 0
 
+
 # ── RDF model / schema hints ──────────────────────────────────────────────────
 
 [model]
