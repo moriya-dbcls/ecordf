@@ -6,7 +6,9 @@
 # All keys are optional. Missing keys fall back to the built-in defaults
 # shown in the comments below.
 #
-# Command-line flags (--host, --port, --cors) override the [server] section.
+# Command-line flags (--host, --port, --cors, --warmup-mb, --pred-cache-mb,
+# --pred-cache-per-pred-cap-mb, --rdf-config, --path-cache-mb) override
+# the corresponding [server] / [model] values.
 
 # ── Index build tunables ─────────────────────────────────────────────────────
 
@@ -196,3 +198,119 @@ cors_origins = ""
 #
 # Overridable with --warmup-mb on the command line (CLI value wins when > 0).
 warmup_mb = 0
+
+# RAM budget (MiB) for the in-memory predicate cache built at startup.
+#
+# At startup, EcoRDF loads the (subject, object) pairs for each predicate from
+# the POS index into a sorted Vec<(TermId, TermId)> in RAM.  During query
+# execution, instead of triggering HDD page faults for a full POS scan, the
+# executor finds the predicate in the cache and performs a linear merge or
+# binary search — pure RAM access.
+#
+# Predicates are loaded largest-first (most pairs first) so that the most
+# expensive predicates (e.g. faldo:position, faldo:begin at 11.8 M entries each
+# = 188 MB each on JPostDB) are guaranteed to be cached before smaller ones.
+#
+# The build is synchronous: the server does not accept queries until the cache
+# is fully populated, so the very first query benefits from the cache.
+#
+# Memory layout: each cached pair is 16 bytes (two u64 IDs).
+#   11.8 M pairs × 16 B = 188 MB  (e.g. faldo:position on JPostDB)
+#
+# Recommended values:
+#   0      — disabled; all POS scans hit the HDD (default for minimal RAM usage)
+#   1024   — covers faldo:begin + faldo:position on JPostDB (376 MB each with 50% cap)
+#   2048   — leaves room for more predicates while staying within typical server RAM
+#
+# See also: pred_cache_per_pred_cap_mb below.
+#
+# Overridable with --pred-cache-mb on the command line (CLI value wins when > 0).
+pred_cache_mb = 1024
+
+# Per-predicate size cap (MiB) for the predicate cache.
+#
+# By default the per-predicate cap is pred_cache_mb / 2.  This works well in
+# most cases, but can fail when two or more huge predicates each consume half the
+# budget and leave no room for smaller predicates.
+#
+# Example (JPostDB, pred_cache_mb = 1024, default cap = 512 MB):
+#   jpo:someHugePred  → 479 MB → fits under 512 MB cap → cached  ✓
+#   jpo:anotherHuge   → 479 MB → fits under 512 MB cap → cached  ✓
+#   (budget exhausted: 958 MB used of 1024 MB)
+#   faldo:begin       → 188 MB → no room → NOT cached  ✗
+#   faldo:position    → 188 MB → no room → NOT cached  ✗
+#
+# Setting pred_cache_per_pred_cap_mb = 200 changes the picture:
+#   jpo:someHugePred  → 479 MB → exceeds 200 MB cap → SKIPPED
+#   jpo:anotherHuge   → 479 MB → exceeds 200 MB cap → SKIPPED
+#   faldo:begin       → 188 MB → fits → cached  ✓
+#   faldo:position    → 188 MB → fits → cached  ✓
+#   (budget used: 376 MB of 1024 MB; remaining budget fills smaller predicates)
+#
+# Rule of thumb: set to slightly above the size of your largest "useful"
+# predicate (i.e. one that actually appears in your SPARQL queries).
+#
+#   0    — use pred_cache_mb / 2 (default behaviour)
+#   200  — skip predicates larger than 200 MB; good starting point for JPostDB
+#   500  — allow up to 500 MB per predicate
+#
+# Overridable with --pred-cache-per-pred-cap-mb on the command line.
+pred_cache_per_pred_cap_mb = 0
+
+# ── RDF model / schema hints ──────────────────────────────────────────────────
+
+[model]
+
+# List of rdf-config directories to load at startup for path-cache
+# materialisation.
+#
+# Each entry is one of:
+#   - A local directory path containing prefix.yaml and model.yaml
+#   - A GitHub tree URL:  https://github.com/dbcls/rdf-config/tree/master/config/uniprot
+#   - A GitHub blob URL:  https://github.com/dbcls/rdf-config/blob/master/config/uniprot
+#
+# EcoRDF reads prefix.yaml and model.yaml from each spec, extracts compound
+# property paths (multi-hop predicate chains through blank nodes), and
+# pre-materialises them in RAM so that SPARQL property-path queries can answer
+# with a single RAM lookup instead of a multi-step HDD traversal.
+#
+# Example paths extracted from JPostDB model.yaml:
+#   [faldo:begin, faldo:position]
+#   [up:annotation, up:range, faldo:begin, faldo:position]
+#
+# Errors (network failures, missing files, parse errors) are logged at WARN
+# level and skipped — the server starts regardless.
+#
+# Leave empty (default) to disable rdf-config loading.
+# Overridable with --rdf-config on the command line (CLI list replaces this list).
+#
+# rdf_configs = [
+#   "https://github.com/dbcls/rdf-config/tree/master/config/jpostdb",
+#   "https://github.com/dbcls/rdf-config/tree/master/config/uniprot",
+#   "/data/local-rdf-config/mydb",
+# ]
+rdf_configs = []
+
+# RAM budget (MiB) for the path cache built from rdf_configs above.
+#
+# Each compound path is materialised as a sorted Vec<(TermId, TermId)> of all
+# (start, end) pairs reachable through the full predicate chain.  Memory use
+# depends on the number of reachable pairs:
+#
+#   pairs × 16 bytes = memory
+#   11.8 M pairs     = 188 MB  (e.g. faldo:begin/faldo:position on JPostDB)
+#
+# When a path is in the cache, the executor uses bind_join with a binary search
+# per left-side row — O(log M) RAM access — instead of a multi-step HDD scan.
+# For a 508-entry left side, this reduces query time from ~5 s to ~50 µs.
+#
+# Set to 0 (default) to disable path materialisation even when rdf_configs is
+# non-empty (useful if you want rdf-config parsing for other purposes later).
+#
+# Recommended values:
+#   0    — disabled (default)
+#   512  — covers one or two faldo-style paths on JPostDB
+#   2048 — covers many paths for a large multi-dataset store
+#
+# Overridable with --path-cache-mb on the command line (CLI value wins when > 0).
+path_cache_mb = 0

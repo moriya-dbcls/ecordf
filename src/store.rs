@@ -429,9 +429,14 @@ impl Store {
     /// Reopen an existing store and apply an explicit config file (overrides
     /// the auto-detected `<store-dir>/ecordf.toml`).
     pub fn open_with_config(dir: &Path, config_path: Option<&std::path::Path>) -> io::Result<Self> {
+        let t0 = std::time::Instant::now();
+        eprintln!("Opening dictionary...");
         let dict = open_query_dict(dir)?;
+        eprintln!("Opening indexes...");
         let index = Arc::new(TripleIndex::open(dir)?);
+        eprintln!("  indexes opened in {:.2}s", t0.elapsed().as_secs_f64());
         let config = Config::resolve(config_path, dir).map_err(io::Error::from)?;
+        eprintln!("Loading statistics...");
         let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
         Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache, path_cache: PathCache::empty() })
