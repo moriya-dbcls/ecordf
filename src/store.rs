@@ -548,9 +548,13 @@ impl Store {
         let budget_bytes = (pred_cache_mb as usize) * 1024 * 1024;
         let per_pred_cap_bytes = (per_pred_cap_mb as usize) * 1024 * 1024;
         // Resolve priority IRIs to TermIds in the calling thread.
+        //
+        // IRIs from rdf_config come as `<http://…>` (with angle brackets).
+        // Strip them before lookup — the dictionary stores bare IRI strings.
         let priority_ids: Vec<u64> = priority_iris.iter()
             .filter_map(|iri| {
-                let id = self.dict.lookup(iri);
+                let key = iri.trim_matches(|c| c == '<' || c == '>');
+                let id = self.dict.lookup(key);
                 if id.is_none() {
                     tracing::debug!(iri, "pred-cache: priority IRI not in dictionary, ignoring");
                 }
@@ -632,8 +636,13 @@ impl Store {
         let budget_bytes = (pred_cache_mb as usize) * 1024 * 1024;
         let per_pred_cap_bytes = (per_pred_cap_mb as usize) * 1024 * 1024;
         // Resolve priority IRIs to TermIds in the calling thread before spawning.
+        // Strip angle brackets — rdf_config IRIs arrive as `<http://…>` but the
+        // dictionary stores bare IRI strings.
         let priority_ids: Vec<u64> = priority_iris.iter()
-            .filter_map(|iri| self.dict.lookup(iri))
+            .filter_map(|iri| {
+                let key = iri.trim_matches(|c| c == '<' || c == '>');
+                self.dict.lookup(key)
+            })
             .collect();
         let cache = PredCache::empty();
         self.pred_cache = cache.clone();

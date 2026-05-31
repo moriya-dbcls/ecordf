@@ -835,6 +835,37 @@ impl<'a> Executor<'a> {
     }
 
     fn execute_scan(&self, pat: &TriplePattern, variables: &[(String, u8)]) -> ResultSet {
+        // Fast path: s is bound, p is fixed, o is free → binary search in pred_cache.
+        //
+        // This turns every individual ScanBound probe inside a bind_join (e.g. 263
+        // faldo:location lookups × 500 ms HDD each = 131 s) into an O(log N) RAM
+        // lookup (~µs), provided the predicate is cached.
+        //
+        // The pred_cache stores (subject, object) pairs sorted by (s, o), so a
+        // partition_point binary search locates all objects for the bound subject
+        // without touching the mmap'd index files.
+        if pat.s != UNBOUND && pat.p != UNBOUND && pat.o == UNBOUND {
+            if let Some(pairs) = self.pred_cache.get(pat.p) {
+                let var_names: Vec<String> = variables.iter().map(|(n, _)| n.clone()).collect();
+                let mut rs = ResultSet::empty(var_names);
+                let bound_s = pat.s;
+                let lo = pairs.partition_point(|&(s, _)| s < bound_s);
+                for &(s, o) in &pairs[lo..] {
+                    if s != bound_s { break; }
+                    let mut row = vec![None; variables.len()];
+                    for (i, (_, pos)) in variables.iter().enumerate() {
+                        row[i] = Some(match pos {
+                            0 => s,
+                            1 => pat.p,
+                            _ => o,
+                        });
+                    }
+                    rs.rows.push(row);
+                }
+                return rs;
+            }
+        }
+
         let var_names: Vec<String> = variables.iter().map(|(n, _)| n.clone()).collect();
         let mut rs = ResultSet::empty(var_names);
 
