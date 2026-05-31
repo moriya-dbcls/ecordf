@@ -165,6 +165,8 @@ fn build_cache(
     let mut total_loaded: usize = 0;
     let mut total_bytes: usize = 0;
     let mut remaining = budget_bytes;
+    let mut skipped_cap: usize = 0;
+    let mut skipped_budget: usize = 0;
 
     tracing::info!(
         budget_mb = budget_bytes / (1024 * 1024),
@@ -243,6 +245,7 @@ fn build_cache(
 
         // Skip predicates that exceed the per-predicate cap (too big to be useful).
         if entry_bytes > per_pred_cap {
+            skipped_cap += 1;
             tracing::debug!(
                 pred = pred_id,
                 mb = entry_bytes / (1024 * 1024),
@@ -253,6 +256,7 @@ fn build_cache(
         }
         // Skip predicates that no longer fit, but keep trying smaller ones.
         if entry_bytes > remaining {
+            skipped_budget += 1;
             tracing::debug!(
                 pred = pred_id,
                 mb = entry_bytes / (1024 * 1024),
@@ -286,7 +290,10 @@ fn build_cache(
 
     tracing::info!(
         predicates_cached = total_loaded,
+        predicates_skipped_cap = skipped_cap,
+        predicates_skipped_budget = skipped_budget,
         total_mb = total_bytes / (1024 * 1024),
+        remaining_mb = remaining / (1024 * 1024),
         elapsed_ms = t0.elapsed().as_millis(),
         "pred-cache: build complete"
     );

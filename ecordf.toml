@@ -230,28 +230,39 @@ pred_cache_mb = 1024
 # Per-predicate size cap (MiB) for the predicate cache.
 #
 # By default the per-predicate cap is pred_cache_mb / 2.  This works well in
-# most cases, but can fail when two or more huge predicates each consume half the
-# budget and leave no room for smaller predicates.
+# most cases, but can fail when large predicates consume the whole budget and
+# leave no room for the predicates that actually matter to your queries.
 #
-# Example (JPostDB, pred_cache_mb = 1024, default cap = 512 MB):
-#   jpo:someHugePred  → 479 MB → fits under 512 MB cap → cached  ✓
-#   jpo:anotherHuge   → 479 MB → fits under 512 MB cap → cached  ✓
-#   (budget exhausted: 958 MB used of 1024 MB)
-#   faldo:begin       → 188 MB → no room → NOT cached  ✗
-#   faldo:position    → 188 MB → no room → NOT cached  ✗
+# Example (JPostDB, pred_cache_mb = 2048, default cap = 1024 MB):
+#   hugePred_A  → 478 MB → fits under 1024 MB cap → cached  ✓  (478 MB used)
+#   hugePred_B  → 350 MB → fits → cached  ✓  (828 MB used)
+#   ... more predicates loaded until budget is nearly full ...
+#   (remaining = 222 MB)
+#   faldo:location  → 223 MB → 223 > 222 remaining → NOT cached  ✗
+#   faldo:begin     → 178 MB → fits → cached  ✓
+#   faldo:position  → 178 MB → fits → cached  ✓
 #
-# Setting pred_cache_per_pred_cap_mb = 200 changes the picture:
-#   jpo:someHugePred  → 479 MB → exceeds 200 MB cap → SKIPPED
-#   jpo:anotherHuge   → 479 MB → exceeds 200 MB cap → SKIPPED
-#   faldo:begin       → 188 MB → fits → cached  ✓
-#   faldo:position    → 188 MB → fits → cached  ✓
-#   (budget used: 376 MB of 1024 MB; remaining budget fills smaller predicates)
+# Setting pred_cache_per_pred_cap_mb = 250 changes the picture:
+#   hugePred_A  → 478 MB → exceeds 250 MB cap → SKIPPED
+#   hugePred_B  → 350 MB → exceeds 250 MB cap → SKIPPED
+#   faldo:location  → 223 MB → fits → cached  ✓
+#   faldo:begin     → 178 MB → fits → cached  ✓
+#   faldo:position  → 178 MB → fits → cached  ✓
+#   ... remaining budget fills smaller predicates ...
 #
-# Rule of thumb: set to slightly above the size of your largest "useful"
-# predicate (i.e. one that actually appears in your SPARQL queries).
+# How to choose the right value:
+#   1. Run: ecordf stats --top-predicates 30
+#      This shows every predicate's triple count and estimated cache size.
+#   2. Identify the largest predicate your SPARQL queries actually use.
+#   3. Set pred_cache_per_pred_cap_mb to slightly above that size.
+#   4. Predicates larger than the cap are skipped; others are loaded largest-first.
+#
+# Priority predicates from rdf-config compound paths are loaded BEFORE the
+# size-ordered pass and are exempt from the cap.  Configure rdf_configs below
+# to activate the priority pass.
 #
 #   0    — use pred_cache_mb / 2 (default behaviour)
-#   200  — skip predicates larger than 200 MB; good starting point for JPostDB
+#   250  — good starting point for JPostDB (caches faldo:location at ~223 MB)
 #   500  — allow up to 500 MB per predicate
 #
 # Overridable with --pred-cache-per-pred-cap-mb on the command line.

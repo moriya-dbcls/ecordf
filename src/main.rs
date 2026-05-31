@@ -174,6 +174,22 @@ enum Command {
     Stats {
         #[arg(short, long, default_value = "./ecordf-data")]
         dir: PathBuf,
+
+        /// Show the top N predicates by triple count, with estimated pred-cache size in MB.
+        ///
+        /// Use this to choose the right pred_cache_per_pred_cap_mb value:
+        ///
+        ///   ecordf stats --top-predicates 30
+        ///
+        /// Then set pred_cache_per_pred_cap_mb to just above the size of the
+        /// largest predicate you actually want cached, so that larger predicates
+        /// that are never queried by property paths do not consume the budget.
+        ///
+        /// Example (JPostDB): if faldo:location is 223 MB and a large unused
+        /// predicate is 478 MB, set pred_cache_per_pred_cap_mb = 250 to skip
+        /// the 478 MB predicate and guarantee faldo:location is cached.
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        top_predicates: usize,
     },
 }
 
@@ -354,20 +370,31 @@ async fn main() -> anyhow::Result<()> {
                 store.config.server.pred_cache_per_pred_cap_mb
             };
             if effective_pred_cache_mb > 0 {
-                eprintln!(
-                    "Building predicate cache ({} MB, per-predicate cap = {} MB{})...",
-                    effective_pred_cache_mb,
-                    if effective_per_pred_cap_mb > 0 {
-                        effective_per_pred_cap_mb.to_string()
-                    } else {
-                        format!("{} (default 50%)", effective_pred_cache_mb / 2)
-                    },
-                    if !priority_iris.is_empty() {
-                        format!(", {} rdf-config predicate(s) prioritised", priority_iris.len())
-                    } else {
-                        String::new()
-                    },
-                );
+                let cap_desc = if effective_per_pred_cap_mb > 0 {
+                    format!("{} MB", effective_per_pred_cap_mb)
+                } else {
+                    format!("{} MB (default 50%)", effective_pred_cache_mb / 2)
+                };
+                if priority_iris.is_empty() {
+                    eprintln!(
+                        "Building predicate cache ({} MB, per-predicate cap = {})...",
+                        effective_pred_cache_mb, cap_desc,
+                    );
+                    if effective_rdf_configs.is_empty() {
+                        eprintln!(
+                            "  Note: no rdf-config specs configured — priority-predicate pass disabled.\n  \
+                             To enable, set [model] rdf_configs in ecordf.toml or use --rdf-config.\n  \
+                             Predicates will be cached in size-descending order (largest first).\n  \
+                             Tip: run `ecordf stats --top-predicates 30` to see predicate sizes and\n  \
+                             choose an appropriate pred_cache_per_pred_cap_mb."
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "Building predicate cache ({} MB, per-predicate cap = {}, {} rdf-config predicate(s) prioritised)...",
+                        effective_pred_cache_mb, cap_desc, priority_iris.len(),
+                    );
+                }
                 store.build_pred_cache_sync(effective_pred_cache_mb, effective_per_pred_cap_mb, &priority_iris);
                 eprintln!("Predicate cache ready ({} MB used).",
                     store.pred_cache.bytes_used() / (1024 * 1024));
@@ -488,7 +515,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Command::Stats { dir } => {
+        Command::Stats { dir, top_predicates } => {
             let store = Store::open(&dir)?;
             let stats = store.stats();
             println!("Directory:     {:?}", stats.dir);
@@ -506,6 +533,47 @@ async fn main() -> anyhow::Result<()> {
                     (3 * stats.triple_count * 12) / (1024 * 1024),
                     stats.triple_count
                 );
+            }
+
+            if top_predicates > 0 {
+                let mut sizes = store.index.predicate_sizes();
+                sizes.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                let total_pred_cache_mb: usize =
+                    sizes.iter().map(|(_, c)| (c * 16 + (1024 * 1024 - 1)) / (1024 * 1024)).sum();
+                println!();
+                println!("Top {} predicates by triple count:", top_predicates.min(sizes.len()));
+                println!(
+                    "  {:>6}  {:>12}  {:>8}  {}",
+                    "Rank", "Triples", "~MB", "Predicate IRI"
+                );
+                println!("  {}+{}+{}+{}", "-".repeat(6), "-".repeat(14), "-".repeat(10), "-".repeat(60));
+                for (rank, (pred_id, count)) in sizes.iter().take(top_predicates).enumerate() {
+                    let iri = store.dict.decode(*pred_id);
+                    let mb = (count * 16) / (1024 * 1024);
+                    let display = if iri.len() > 90 {
+                        format!("{}…", &iri[..89])
+                    } else {
+                        iri
+                    };
+                    println!("  {:>6}  {:>12}  {:>8}  {}", rank + 1, count, mb, display);
+                }
+                println!();
+                println!(
+                    "  Total pred-cache requirement for all {} predicates: ~{} MB",
+                    sizes.len(), total_pred_cache_mb
+                );
+                println!();
+                println!("  Tuning tips:");
+                println!("    pred_cache_mb              — total RAM budget for the cache");
+                println!("    pred_cache_per_pred_cap_mb — skip predicates larger than this");
+                println!();
+                println!("  Set pred_cache_per_pred_cap_mb just above the size of the largest");
+                println!("  predicate you actually query, so that huge low-query predicates");
+                println!("  don't crowd out the ones you care about.");
+                if let Some((_, largest_count)) = sizes.first() {
+                    let largest_mb = (largest_count * 16) / (1024 * 1024);
+                    println!("  Largest predicate: ~{} MB — this is the minimum cap to cache it.", largest_mb);
+                }
             }
         }
     }
