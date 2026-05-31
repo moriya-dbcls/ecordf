@@ -184,26 +184,67 @@ iter3 (疾患関連あり):  [P00533, P01116, P04637, ...]
 
 ## インデックス構成
 
+SPO/POS/OSP の3インデックスを採用。各インデックスは**列指向フォーマット**（3カラム分離ファイル）に加え、スパースな in-memory SkipIndex と、POS 専用の PredicateIndex を持ちます。
+
 ```
-SPO索引 (spo.bin):  主語でソート → 特定エンティティの全述語・目的語を高速取得
-POS索引 (pos.bin):  述語でソート → 生命科学クエリの大半（型・関係の絞り込み）
-OSP索引 (osp.bin):  目的語でソート → 値や概念からの逆引き
+SPO索引:  主語でソート → 特定エンティティの全述語・目的語を高速取得
+  spo.c0  (Subject列:   u64 × N)
+  spo.c1  (Predicate列: u64 × N)
+  spo.c2  (Object列:    u64 × N)
+  spo.skip (SkipIndex: 8B × ⌈N/512⌉)
+
+POS索引:  述語でソート → 生命科学クエリの大半（型・関係の絞り込み）
+  pos.c0, pos.c1, pos.c2, pos.skip
+  pos.pidx (PredicateIndex: 24B × 述語数)
+
+OSP索引:  目的語でソート → 値や概念からの逆引き
+  osp.c0, osp.c1, osp.c2, osp.skip
+
 GSPO索引 (gspo.bin): グラフ+SPO → Named Graphs / N-Quads 対応（存在する場合のみ）
 ```
 
-各エントリは `[s: u64, p: u64, o: u64]` の 24 バイト（GSPO は先頭に `g: u64` を加えた 32 バイト）。  
-全インデックスは `TripleIndex::open` がメモリマップで開き、クエリ時は `scan()` / `scan_graph()` で範囲走査します。
+各カラムは `u64` 配列を memmap2 でマップし、クエリ時は `scan()` / `scan_graph()` で範囲走査します（GSPO は先頭に `g: u64` を加えた 4カラム）。
 
-インデックスファイルのマジックバイト: `ECOI0002`（SPO/POS/OSP）、`ECOG0002`（GSPO）。  
-旧フォーマット（`ECOI0001`、u32 × 3 = 12 バイト）は非互換 — 再ビルドが必要です。
+### SkipIndex — スパース1次キャッシュ
+
+`SKIP_STRIDE = 512` おきに c0 の値を in-memory 配列（`anchors`）に保持します。
+
+```
+anchors[i] = c0[i × 512]  (各8バイト)
+```
+
+バイナリサーチ時：
+1. `anchors` に対して上位バイナリサーチ → O(log(N/512)) の in-memory 比較
+2. 絞り込み後の範囲は **最大 512 エントリ = 4 KB = 1 OS ページ**
+3. `prefetch_c0` で MADV_WILLNEED ヒントを出し、実際の c0 ページフォルトは最小1回
+
+| 規模 | c0 ファイルサイズ | anchors サイズ |
+|------|-----------------|--------------|
+| 1,000万トリプル | ~80 MB | ~156 KB |
+| 11.8M (JPostDB) | ~94 MB | ~184 KB |
+| 3,000万トリプル | ~240 MB | ~469 KB |
+
+SkipIndex は `.skip` ファイルに永続化し、次回起動は `read_to_end` で即座にロードします（最初のビルド時のみ c0 の全スキャンが走りますが、ログにメッセージが出ます）。
+
+### PredicateIndex (.pidx) — POS 述語→範囲マップ
+
+POS インデックスの各述語について `[lo, hi)` のエントリ範囲を in-memory HashMap に保持します。
+
+```
+ファイルフォーマット: magic(8B) + pred_count(8B) + entries[(pred:u64, lo:u64, hi:u64) × pred_count]
+エントリサイズ: 24 バイト × 述語数
+例: JPostDB 数百述語 → ~数十 KB
+```
+
+POS スキャン時に述語が定数であれば、PredicateIndex を参照して **c0 全体を走査せずに** 正確な `[lo, hi)` 範囲を取得できます（SkipIndex の upper-bound ではなく exact range）。
 
 **ディスク使用量の概算:**
 
-| トリプル数 | SPO+POS+OSP | GSPO付き | 辞書込み目安 |
-|-----------|-------------|---------|------------|
-| 1,000万   | 720 MB      | 1.0 GB  | ～800 MB   |
-| 1億       | 7.2 GB      | 10.4 GB | ～9 GB     |
-| 10億      | 72 GB       | 104 GB  | ～90 GB    |
+| トリプル数 | SPO+POS+OSP（c0〜c2×3）| GSPO付き | 辞書込み目安 |
+|-----------|----------------------|---------|------------|
+| 1,000万   | 720 MB               | 1.0 GB  | ～800 MB   |
+| 1億       | 7.2 GB               | 10.4 GB | ～9 GB     |
+| 10億      | 72 GB                | 104 GB  | ～90 GB    |
 
 ---
 
@@ -235,6 +276,102 @@ pub fn encode(&self, s: &str) -> u64 { ... }
 ```
 
 クエリ時の追加エントリはメモリ上にのみ存在し、`dict.bin` には保存されません。
+
+---
+
+## 起動時キャッシュ — PredCache と PathCache
+
+HDD ランダム I/O のコストが高い環境では、頻用述語の全ペアをあらかじめ RAM に読み込んでおくことでクエリ時の POS スキャンを完全に回避できます。EcoRDF は2種類の起動時キャッシュを提供します。
+
+### PredCache — 単述語ペアキャッシュ (`predcache.rs`)
+
+指定した RAM 予算の範囲で、POS インデックスから各述語の `(subject, object)` ペア全件を `Vec<(TermId, TermId)>`（ソート済み）として読み込みます。
+
+**ロード戦略**: 述語を「ペア数 × 16 バイト」の大きい順に並べ、per-predicate cap を超えない範囲で予算を消費します。
+
+```
+budget = pred_cache_mb × 1 MiB
+per-pred cap = pred_cache_per_pred_cap_mb (0 のとき pred_cache_mb / 2)
+
+例: JPostDB, pred_cache_mb=2048, per_pred_cap_mb=200
+  → faldo:begin    (11.8M × 16B = 188MB) ✓ キャッシュ
+  → faldo:position (11.8M × 16B = 188MB) ✓ キャッシュ
+  → jpo:someHugePred (479MB) → cap 超過のためスキップ
+  → その他小述語   … 予算の残りで順次キャッシュ
+```
+
+**クエリ時の利用**:
+- `executor.rs` が `PredCache::get(pred)` でヒットを確認。
+- ヒットした場合: POS スキャン（HDD）を行わず、RAM 上のソート済み Vec に対して **線形マージ**（multi-hop の中間バッファとのマージ）または **バイナリサーチ**（単一プローブ）で答えを得る。
+- ミスの場合: 通常の POS スキャン（mmap + ページフォルト）にフォールバック。
+
+| フェーズ | HDD スキャン（キャッシュなし） | RAM マージ（キャッシュあり） |
+|---------|------------------------------|--------------------------|
+| faldo:position 1 step cold | ~13 s | ~0.4 s |
+| faldo:position 1 step warm | ~6 s  | ~0.4 s |
+
+設定: `server.pred_cache_mb` / `server.pred_cache_per_pred_cap_mb`（ecordf.toml）または `--pred-cache-mb` / `--pred-cache-per-pred-cap-mb`（CLI）。ビルドは起動時に**同期的**に行い、最初のクエリが必ずキャッシュ済み状態で処理されます。
+
+### PathCache — 多ホップパス事前実体化 (`path_cache.rs`)
+
+rdf-config の `model.yaml` から抽出した**複合プロパティパス**（ブランクノードを経由する述語チェーン）を、起動時に `Vec<(TermId, TermId)>`（ソート済み）として実体化します。
+
+```
+例: faldo パス [faldo:begin, faldo:position] を実体化
+  手順:
+  1. POS で faldo:begin 全件 → (s, m) ペア 11.8M 件
+  2. POS で faldo:position 全件 → (m, o) ペア 11.8M 件
+  3. 結合 (s, o) を Vec に格納・ソート
+  消費メモリ ≈ 11.8M × 16B = 188MB
+
+SPARQL クエリ時:
+  ?protein faldo:begin/faldo:position ?pos
+  → PathCache::get([begin_id, position_id]) でヒット
+  → HDD スキャン一切なし。bind_join で各 ?protein に対して binary search → O(log M)
+```
+
+**rdf-config 統合** (`rdf_config.rs`): `prefix.yaml` + `model.yaml` を読み込み、ブランクノードを経由するパスを抽出。ローカルパスまたは GitHub ツリー URL を指定可能。
+
+設定: `model.rdf_configs` / `model.path_cache_mb`（ecordf.toml）または `--rdf-config` / `--path-cache-mb`（CLI）。
+
+### 3層のコスト選択ロジック
+
+`executor.rs` の JOIN 選択は、キャッシュ状態を踏まえて3層に分岐します：
+
+```
+path_cached = PathCache にパス全体がある？
+all_cached  = path_cached || (全ステップが PredCache にある？)
+
+seek_ns = all_cached ? 2,000 ns (RAM binary search)
+                     : 150,000,000 ns (HDD SPO ランダムシーク)
+
+bind_join_cost = N_groups × path_steps × seek_ns
+hash_join_cost = first_pred_range × 200 ns  (HDD seq read 120 MB/s)
+
+use_hash = (scan_cost < bind_cost) && !path_cached
+```
+
+さらに `use_hash` かつ右辺が 2-hop 以上の Sequence パスの場合、**フィルタリング hash join** を適用します（次節）。
+
+### フィルタリング hash join (`eval_sequence_with_subject_filter`)
+
+通常の hash join は Sequence パスのステップ 0 を全件スキャン（例: faldo:begin 11.8M 件）し、ステップ 1 の HashMap が 11.8M エントリになります。左辺の JOIN 変数の主語集合が既知の場合、ステップ 0 の直後にフィルタリングして中間結果を大幅に削減できます。
+
+```
+通常の hash_join（Sequence [faldo:begin, faldo:position]）:
+  step 0: POS(faldo:begin)  → 11.8M (s, m) ペア
+  step 1: batch_scan        → 11.8M エントリの HashMap を構築 → ~18s
+
+フィルタリング hash_join（左辺の主語集合が既知: N=508 タンパク質）:
+  step 0: POS(faldo:begin)  → 11.8M (s, m) ペア
+  retain: subject_filter で s ∉ {508 IDs} を除去 → 508 (s, m) ペア
+  step 1: batch_scan        → 508 エントリの HashMap を構築 → ~5s
+
+削減比: 11.8M → 508 = 約 23,000 倍
+```
+
+実装: `eval_sequence_with_subject_filter(steps, s, o, subject_filter: &HashSet<TermId>)`。  
+`FILTER_SUBJECT_CAP = 100_000`：主語集合がこれを超える場合はフィルタリングのオーバーヘッドが無視できないため通常の hash join にフォールバックします。
 
 ---
 
@@ -405,11 +542,13 @@ ecordf/
 ├── src/
 │   ├── lib.rs         クレートエントリポイント
 │   │                    モジュール宣言 / 公開 API (Config, InputSpec, Store, StoreStatistics)
-│   ├── config.rs      設定: Config / BuildConfig / QueryConfig / ServerConfig
+│   ├── config.rs      設定: Config / BuildConfig / QueryConfig / ServerConfig / ModelConfig
 │   │                    ecordf.toml を serde+toml でデシリアライズ
 │   │                    ファイル探索順: --config > <store-dir>/ecordf.toml > デフォルト値
-│   │                    BuildConfig: chunk_size / dict_chunk_mb / parallel_threads
-│   │                    ServerConfig: host / port / cors_origins / max_concurrent_queries / warmup_mb
+│   │                    BuildConfig:  chunk_size / dict_chunk_mb / parallel_threads
+│   │                    ServerConfig: host / port / cors_origins / max_concurrent_queries
+│   │                                  warmup_mb / pred_cache_mb / pred_cache_per_pred_cap_mb
+│   │                    ModelConfig:  rdf_configs (Vec<String>) / path_cache_mb
 │   ├── dict.rs        辞書 (レガシー・1パス用): 文字列 ↔ u64 ID
 │   │                    RwLock による interior mutability
 │   │                    19プレフィックスの名前空間圧縮
@@ -424,7 +563,13 @@ ecordf/
 │   │                                         各レベルのバッチを Rayon で並列実行
 │   │                    dict_sorted.bin フォーマット: ESRT0001 magic
 │   ├── triple.rs      TermId = u64 / Triple (24B) / Quad (32B)、UNBOUND = u64::MAX
-│   ├── index.rs       memmap2ベースのソート済み整数配列
+│   ├── index.rs       memmap2ベースの列指向ソート済み整数配列
+│   │                    ─ 列指向フォーマット (c0/c1/c2): 各列が独立した mmap ファイル
+│   │                    ─ SkipIndex: SKIP_STRIDE=512 のスパース anchor 配列
+│   │                        `.skip` ファイルに永続化; 初回ビルドは c0 全スキャン
+│   │                        バイナリサーチ後の絞り込み範囲 ≤ 512 エントリ (1 OS ページ)
+│   │                    ─ PredicateIndex: POS 専用の pred→(lo,hi) HashMap
+│   │                        `.pidx` ファイルに永続化; POS スキャン時に exact range を提供
 │   │                    IndexBuilder / IndexFile (SPO・POS・OSP)
 │   │                    GspoBuilder / GspoIndexFile (Named Graphs)
 │   │                    AllBuilders (ビルドフェーズの統合API; 並列対応)
@@ -433,12 +578,26 @@ ecordf/
 │   │                    build_from_index (2パスO(N)スキャン)
 │   │                    save / load / load_or_build
 │   │                    estimate (SP/PO/P/SPO ファンアウト推定)
+│   ├── predcache.rs   述語キャッシュ: PredCache / PredPairs
+│   │                    build_sync  — 起動時同期ビルド (largest-first, per-pred cap)
+│   │                    build_background — バックグラウンドビルド (非推奨)
+│   │                    get(pred) → Option<PredPairs> — クエリ時プローブ
+│   │                    bytes_used() — 使用メモリ量
+│   ├── path_cache.rs  多ホップパスキャッシュ: PathCache / PathPairs
+│   │                    build(compound_paths, dict, index, budget) — 起動時実体化
+│   │                    get(pred_ids: &[TermId]) → Option<PathPairs>
+│   │                    bytes_used() / len()
+│   ├── rdf_config.rs  rdf-config 統合: CompoundPath 抽出
+│   │                    load_compound_paths(specs) — ローカルパスまたは GitHub URL を受け付ける
+│   │                    prefix.yaml + model.yaml を解析してブランクノード経由パスを返す
 │   ├── store.rs       ストアファサード: load / open / open_with_config / query
 │   │                    dict フィールドが QueryDict (ReadonlyDict or Dictionary)
 │   │                    load_with_graphs — Named Graph 対応の2パスロード
 │   │                    load_with_graphs_resume_phase2 — 中断再開
-│   │                    Config / StoreStatistics を保持
-│   │                    Executor に QueryConfig + StoreStatistics を渡す
+│   │                    build_pred_cache_sync  — 同期述語キャッシュビルド
+│   │                    build_path_cache       — rdf-config パスキャッシュビルド
+│   │                    warmup_background      — OS ページキャッシュウォームアップ
+│   │                    open_with_config: 起動ログ付き (dict→index→stats の各ステップを eprintln!)
 │   ├── loader.rs      N-Triples / N-Quads ストリーミングパーサー (.nt/.nq/.gz デフォルト対応)
 │   │                    InputSpec — ファイルパス + オプショナル Named Graph IRI
 │   │                    collect_strings_from_inputs — Phase 1 (シングルスレッド)
@@ -459,6 +618,9 @@ ecordf/
 │   │                    QueryConfig (max_intermediate_rows / bind_join_threshold)
 │   │                    optimize_bgp / estimate_pattern_cardinality
 │   │                    2段階カーディナリティ推定 (index probe + stats)
+│   │                    3層コスト選択: path_cached / all_cached / use_hash
+│   │                    eval_sequence_with_subject_filter — フィルタリング hash join
+│   │                      (FILTER_SUBJECT_CAP=100,000; step 0 後に subject 集合で絞り込み)
 │   │                    Property Path BFS (ZeroOrMore / OneOrMore)
 │   │                    Named Graph スキャン (execute_named_graph)
 │   │                    FILTER / BIND / STR の正確な評価
@@ -470,7 +632,9 @@ ecordf/
 │   │                    CORS オプション対応
 │   └── main.rs        CLI: build / serve / query / stats
 │                        build: --resume-phase2 (中断再開)
-│                        serve: --host / --port / --cors / --config
+│                        serve: --host / --port / --cors / --config / --warmup-mb
+│                               --pred-cache-mb / --pred-cache-per-pred-cap-mb
+│                               --rdf-config / --path-cache-mb
 │                        query: --config / "-" (stdin読み込み)
 ├── ecordf.toml        設定ファイルのサンプル（全パラメータ・説明付き）
 ├── DESIGN.md          本ドキュメント
@@ -606,27 +770,47 @@ $EDITOR ./uniprot-store/ecordf.toml
 | `server.port` | `7878` | TCPポート |
 | `server.cors_origins` | `""` | CORS設定（`"*"` or カンマ区切りオリジン） |
 | `server.max_concurrent_queries` | `0` | 同時クエリ数上限（0=無制限） |
-| `server.warmup_mb` | `0` | 起動直後にバックグラウンドでページキャッシュへ読み込む MB 数（0=無効）。`--warmup-mb` CLI フラグで上書き可 |
+| `server.warmup_mb` | `0` | 起動直後にバックグラウンドでページキャッシュへ読み込む MB 数（0=無効）。`--warmup-mb` で上書き可 |
+| `server.pred_cache_mb` | `1024` | 述語キャッシュの RAM 予算（MiB）。0=無効。`--pred-cache-mb` で上書き可 |
+| `server.pred_cache_per_pred_cap_mb` | `0` | 述語ごとの上限（MiB）。0=`pred_cache_mb/2`。巨大述語が予算を占拠するのを防ぐ。`--pred-cache-per-pred-cap-mb` で上書き可 |
+| `model.rdf_configs` | `[]` | rdf-config ディレクトリまたは GitHub URL のリスト。PathCache の材料。`--rdf-config` で上書き可 |
+| `model.path_cache_mb` | `0` | パスキャッシュの RAM 予算（MiB）。0=無効。`--path-cache-mb` で上書き可 |
 
 ### HTTPサーバー
 
 ```bash
 # ローカル起動（設定はecordf.tomlまたはデフォルト値）
-./target/release/ecordf serve --dir ./uniprot-store
+./target/release/ecordf serve --dir ./jpostdb-store
 
 # CLIフラグはconfigファイルより優先
-./target/release/ecordf serve --dir ./uniprot-store --host 0.0.0.0 --port 8080
+./target/release/ecordf serve --dir ./jpostdb-store --host 0.0.0.0 --port 8080
 
 # CORS許可（全オリジン）
-./target/release/ecordf serve --dir ./uniprot-store --cors '*'
-
-# CORS許可（特定オリジン）
-./target/release/ecordf serve --dir ./uniprot-store \
-  --cors 'https://app.example.com,https://sparql.example.com'
+./target/release/ecordf serve --dir ./jpostdb-store --cors '*'
 
 # コールドスタート対策: 起動直後に 8 GB 分のインデックスをページキャッシュへ読み込む
-# （CLIフラグで指定; ecordf.toml の server.warmup_mb でデフォルト化も可能）
 ./target/release/ecordf serve --dir ./uniprot-store --warmup-mb 8192
+
+# 述語キャッシュ: faldo:begin/position (各 188 MB) をキャッシュ、巨大述語は除外
+# --pred-cache-per-pred-cap-mb 200 により 479 MB 超の述語をスキップ
+./target/release/ecordf serve --dir ./jpostdb-store \
+  --pred-cache-mb 2048 \
+  --pred-cache-per-pred-cap-mb 200
+
+# rdf-config パスキャッシュ: faldo パスを 512 MB 予算で事前実体化
+./target/release/ecordf serve --dir ./jpostdb-store \
+  --pred-cache-mb 2048 --pred-cache-per-pred-cap-mb 200 \
+  --rdf-config https://github.com/dbcls/rdf-config/tree/master/config/jpostdb \
+  --path-cache-mb 512
+
+# 起動ログ例:
+#   Opening dictionary...
+#   Opening indexes...
+#     indexes opened in 2.31s
+#   Loading statistics...
+#   Opened store: 11,823,456 triples, 3,201,847 terms
+#   Building predicate cache (2048 MB, per-predicate cap = 200 MB)...
+#   Predicate cache ready (1842 MB used).
 ```
 
 ### SPARQL 1.1 Protocol
@@ -652,7 +836,8 @@ POST http://localhost:7878/sparql
 
 | 特性 | EcoRDF の動作 |
 |------|-------------|
-| 起動時間 | mmap のため即時（インデックスファイルを開くだけ）。`server.warmup_mb` または `--warmup-mb` でバックグラウンドウォームアップを有効化するとコールドスタート後の初回クエリが速くなる |
+| 起動時間 | mmap のため index オープン自体は即時。ただし `open_with_config` 内でディスクから `.skip`/`.pidx`/`stats.bin` を読み込むため、コールドキャッシュ時は数秒かかる（ログで各ステップを可視化）。`--warmup-mb` でバックグラウンドウォームアップを有効化するとコールドスタート後の初回クエリが速くなる |
+| 起動時 RAM | PredCache: `pred_cache_mb` MiB（同期ビルド）。PathCache: `path_cache_mb` MiB（同期ビルド）。設定 0 の場合ゼロ |
 | クエリ時 RAM | ワーキングセット依存（OS ページキャッシュで管理） |
 | ビルド時ピーク RAM | 2パス外部ソートにより定数。Phase 1: `dict_chunk_mb × スレッド数` MB。Phase 2A: `chunk_size × 72B`。Phase 2B (Streaming): Phase 1 と同予算（`dict_chunk_mb × スレッド数`）|
 | 並列クエリ処理 | 対応（tokio blocking pool） |
@@ -691,3 +876,5 @@ Semaphore (max_concurrent_queries): アプリ層の同時数キャップ
 8. **HyperLogLog** — subject_count / object_count の近似カウント（現在は2パス全スキャン）
 9. **BOUND_VAR_FACTOR の自動調整** — 述語の distinctiveness から動的に推定倍率を計算
 10. **ReadonlyDict のキャッシュ戦略改善** — ホットキャッシュを LRU 化して偏りのあるアクセスパターンに対応
+11. **PathCache の自動 TermId 解決** — 現状は起動後に rdf_config を解析して IRI→TermId を引くが、辞書ミス時の fallback をより堅牢に
+12. **フィルタリング hash join の対象拡大** — 現状は 2-hop Sequence のみ。3-hop 以上や Alternative パスにも適用を検討
