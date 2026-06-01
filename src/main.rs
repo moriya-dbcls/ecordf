@@ -424,6 +424,15 @@ async fn main() -> anyhow::Result<()> {
                     store.path_cache.bytes_used() / (1024 * 1024)
                 );
             }
+            tracing::info!(
+                host = %effective_host,
+                port = effective_port,
+                triples = stats.triple_count,
+                terms   = stats.term_count,
+                pred_cache_mb = store.pred_cache.bytes_used() / (1024 * 1024),
+                path_cache_paths = store.path_cache.len(),
+                "Server ready"
+            );
             ecordf::server::serve(store, &effective_host, effective_port, effective_cors.as_deref()).await?;
         }
 
