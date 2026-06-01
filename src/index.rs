@@ -47,6 +47,9 @@ use std::path::{Path, PathBuf};
 // rayon::join is used in build_from_parallel_chunks to merge 3 indexes in parallel.
 use rayon;
 
+#[cfg(unix)]
+extern crate libc;
+
 use crate::col_delta::{delta_path, DeltaColFile};
 use crate::triple::{IndexKind, Quad, TermId, Triple, TriplePattern, UNBOUND};
 
@@ -1165,8 +1168,14 @@ impl IndexFile {
         if let IndexStorage::Columnar { mmaps, .. } = &self.storage {
             let bytes = self.count * COL_VALUE_BYTES;
             for mmap in mmaps.iter() {
-                // MADV_DONTNEED on the data region (after the 16-byte header).
-                let _ = mmap.advise_range(Advice::DontNeed, HEADER_SIZE, bytes);
+                // memmap2 0.9 does not expose MADV_DONTNEED in its Advice enum,
+                // so we call libc::madvise directly.
+                #[cfg(unix)]
+                unsafe {
+                    let ptr = mmap.as_ptr().add(HEADER_SIZE) as *mut libc::c_void;
+                    libc::madvise(ptr, bytes, libc::MADV_DONTNEED);
+                }
+                let _ = mmap; // suppress unused warning on non-unix
             }
             bytes * 3
         } else {
