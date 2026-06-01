@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Query as AxumQuery, State},
@@ -208,9 +209,12 @@ async fn handle_post(
 ///
 /// If `state.semaphore` is set, at most N queries are admitted simultaneously;
 /// excess requests wait until a slot is released.
+///
+/// If `store.config.server.query_timeout_secs > 0`, a cancellation flag is
+/// set after the timeout and the executor's inner loops abort at the next
+/// checkpoint.  The HTTP response is 408 with a JSON error body.
 async fn run_query(state: AppState, query: String, format: String) -> Response {
     // Acquire a concurrency slot if a limit is configured.
-    // The permit is held for the lifetime of the query and released on drop.
     let _permit = if let Some(ref sem) = state.semaphore {
         match sem.clone().acquire_owned().await {
             Ok(p) => Some(p),
@@ -220,13 +224,33 @@ async fn run_query(state: AppState, query: String, format: String) -> Response {
         None
     };
 
+    let timeout_secs = state.store.config.server.query_timeout_secs;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_for_task = Arc::clone(&cancel);
+
     let store = Arc::clone(&state.store);
-    match tokio::task::spawn_blocking(move || execute_query(&store, &query, &format)).await {
-        Ok(response) => response,
-        Err(_) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "query execution panicked",
-        ),
+    let cancel_for_exec = Arc::clone(&cancel);
+    let task = tokio::task::spawn_blocking(move || {
+        execute_query_with_cancel(&store, &query, &format, cancel_for_exec)
+    });
+
+    if timeout_secs > 0 {
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), task).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "query execution panicked"),
+            Err(_) => {
+                // Timeout elapsed: signal the blocking thread to abort.
+                cancel_for_task.store(true, Ordering::Relaxed);
+                tracing::warn!(timeout_secs, "query timed out");
+                error_response(StatusCode::REQUEST_TIMEOUT,
+                    &format!("query exceeded {}s timeout", timeout_secs))
+            }
+        }
+    } else {
+        match task.await {
+            Ok(response) => response,
+            Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "query execution panicked"),
+        }
     }
 }
 
@@ -242,6 +266,22 @@ async fn run_query(state: AppState, query: String, format: String) -> Response {
 ///   - `decode_us`    — TermId → string (ReadonlyDict lookups)
 ///   - `serialize_us` — JSON / XML / TSV formatting
 ///   - `total_us`     — decode + serialize combined (this function)
+fn execute_query_with_cancel(
+    store: &Store,
+    query: &str,
+    format: &str,
+    cancel: Arc<AtomicBool>,
+) -> Response {
+    let t_req = Instant::now();
+
+    let result = match store.query_with_cancel(query, cancel) {
+        Ok(r)  => r,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
+
+    build_query_response(store, result, format, t_req)
+}
+
 fn execute_query(store: &Store, query: &str, format: &str) -> Response {
     let t_req = Instant::now();
 
@@ -249,6 +289,11 @@ fn execute_query(store: &Store, query: &str, format: &str) -> Response {
         Ok(r)  => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+
+    build_query_response(store, result, format, t_req)
+}
+
+fn build_query_response(store: &Store, result: QueryResult, format: &str, t_req: Instant) -> Response {
 
     match &result {
         QueryResult::Select(rs) => {

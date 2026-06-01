@@ -374,6 +374,42 @@ pub struct ServerConfig {
     /// Overridable with `--pred-cache-per-pred-cap-mb` on the command line.
     pub pred_cache_per_pred_cap_mb: u64,
 
+    /// RAM budget for the TypeCache (MiB).  0 = disabled.
+    ///
+    /// Builds a per-class `HashSet<subject_id>` from `rdf:type` at startup,
+    /// turning `?x a SomeClass` filter steps from O(|pred_range|) POS scans
+    /// into O(log |class|) binary searches.
+    ///
+    /// Recommended: 256–512 MB covers all classes in most bio RDF stores.
+    pub type_cache_mb: u64,
+
+    /// Per-query wall-clock timeout in seconds.  0 = no timeout (default).
+    ///
+    /// When a query exceeds this limit:
+    ///   1. A cancellation flag is set — the executor detects it at its next
+    ///      inner-loop checkpoint and returns an error result immediately.
+    ///   2. The HTTP response is 408 Request Timeout with a JSON error body.
+    ///
+    /// Recommended: 30–300 seconds depending on expected workload.
+    /// Set lower values (e.g. 60) when EcoRDF shares a server with other
+    /// services to prevent runaway queries from consuming the page cache.
+    pub query_timeout_secs: u64,
+
+    /// Advise the OS to release index pages from page cache after large
+    /// sequential scans (MADV_DONTNEED).  0 = disabled (default).
+    ///
+    /// When enabled, any sequential POS/SPO/OSP scan that reads more than
+    /// `scan_dontneed_mb` MB will call `madvise(MADV_DONTNEED)` on the
+    /// consumed range after the scan completes, releasing those pages back
+    /// to the OS page cache pool.
+    ///
+    /// Effect: prevents EcoRDF from monopolising the page cache after large
+    /// scans, reducing impact on co-located services.
+    /// Trade-off: subsequent identical scans will page-fault again (cold).
+    /// Recommended: 512–2048 MB threshold.  Disable (0) if EcoRDF is the
+    /// only significant service on the host.
+    pub scan_dontneed_mb: u64,
+
 }
 
 impl Default for ServerConfig {
@@ -386,6 +422,9 @@ impl Default for ServerConfig {
             warmup_mb: 0,                  // disabled by default
             pred_cache_mb: 1024,           // 1024 MB heap; 50% cap = 512 MB/predicate (covers faldo)
             pred_cache_per_pred_cap_mb: 0, // 0 = use pred_cache_mb / 2 (default)
+            type_cache_mb: 256,            // 256 MB covers all rdf:type classes in bio RDF
+            query_timeout_secs: 0,         // no timeout by default
+            scan_dontneed_mb: 0,           // disabled by default (enable when sharing server)
         }
     }
 }

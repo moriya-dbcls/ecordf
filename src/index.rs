@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 // rayon::join is used in build_from_parallel_chunks to merge 3 indexes in parallel.
 use rayon;
 
+use crate::col_delta::{delta_path, DeltaColFile};
 use crate::triple::{IndexKind, Quad, TermId, Triple, TriplePattern, UNBOUND};
 
 /// Index file format version 2: term IDs are u64 (8 bytes each).
@@ -134,6 +135,16 @@ impl SkipIndex {
             .map(|i: usize| i * SKIP_STRIDE)
             .take_while(|&pos| pos < count)
             .map(|pos| triples[pos][0])
+            .collect();
+        SkipIndex { anchors, count }
+    }
+
+    /// Build from a delta-encoded column file.
+    fn build_from_delta(col: &crate::col_delta::DeltaColFile, count: usize) -> Self {
+        let anchors = (0..)
+            .map(|i: usize| i * SKIP_STRIDE)
+            .take_while(|&pos| pos < count)
+            .map(|pos| col.get(pos))
             .collect();
         SkipIndex { anchors, count }
     }
@@ -897,6 +908,14 @@ enum IndexStorage {
         /// Memory-mapped views of `.c0`, `.c1`, `.c2`.
         mmaps:  [Mmap; 3],
     },
+    /// Delta-encoded columnar format (ECOCOL02).
+    ///
+    /// Column files are `<name>.c0.dz`, `<name>.c1.dz`, `<name>.c2.dz`.
+    /// The block index for each column is loaded into RAM; compressed data
+    /// stays mmap'd and decompressed lazily per block.
+    DeltaColumnar {
+        cols: [DeltaColFile; 3],
+    },
 }
 
 /// A read-only sorted index, backed by either the legacy interleaved file or
@@ -918,15 +937,71 @@ pub struct IndexFile {
 impl IndexFile {
     // ── Construction ──────────────────────────────────────────────────────────
 
-    /// Open an index, preferring the columnar format if the `.c0` file exists,
-    /// falling back to the legacy interleaved `.bin` file otherwise.
+    /// Open an index, auto-detecting the format:
+    /// 1. Delta-encoded `.c0.dz` / `.c1.dz` / `.c2.dz` (ECOCOL02) — preferred.
+    /// 2. Uncompressed columnar `.c0` / `.c1` / `.c2` (ECOCOL01).
+    /// 3. Legacy interleaved `.bin` (ECOI0002) — fallback.
     pub fn open(path: &Path, kind: IndexKind) -> io::Result<Self> {
         let cpaths = col_paths(path);
-        if cpaths[0].exists() {
+        let dzpaths: [PathBuf; 3] = [
+            delta_path(&cpaths[0]),
+            delta_path(&cpaths[1]),
+            delta_path(&cpaths[2]),
+        ];
+        if dzpaths[0].exists() && dzpaths[1].exists() && dzpaths[2].exists() {
+            Self::open_delta(&dzpaths, kind)
+        } else if cpaths[0].exists() {
             Self::open_columnar(&cpaths, kind)
         } else {
             Self::open_interleaved(path, kind)
         }
+    }
+
+    /// Open three delta-encoded column files (`.c0.dz`, `.c1.dz`, `.c2.dz`).
+    fn open_delta(paths: &[PathBuf; 3], kind: IndexKind) -> io::Result<Self> {
+        let col0 = DeltaColFile::open(&paths[0])?;
+        let col1 = DeltaColFile::open(&paths[1])?;
+        let col2 = DeltaColFile::open(&paths[2])?;
+
+        if col0.count != col1.count || col0.count != col2.count {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "delta col count mismatch"));
+        }
+        let count = col0.count;
+
+        // Build SkipIndex and PredicateIndex from the delta col (sequential c0 scan).
+        let skip_p = skip_path_from_c0(&paths[0]);
+        let skip = if skip_p.exists() {
+            SkipIndex::load(&skip_p).ok().filter(|s| s.count == count)
+        } else {
+            None
+        };
+        // Build SkipIndex from the delta column if not cached.
+        let skip = skip.unwrap_or_else(|| {
+            eprintln!("  [{:?}] Building skip index from delta column…", kind);
+            let s = SkipIndex::build_from_delta(&col0, count);
+            let _ = s.save(&skip_p);
+            s
+        });
+
+        // Build PredicateIndex for POS/PSO.
+        let pred_idx = if kind == IndexKind::Pos || kind == IndexKind::Pso {
+            let pidx_p = pidx_path_from_c0(&paths[0]);
+            if pidx_p.exists() {
+                PredicateIndex::load(&pidx_p).ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(Self {
+            kind,
+            count,
+            storage: IndexStorage::DeltaColumnar { cols: [col0, col1, col2] },
+            skip: Some(skip),
+            pred_idx,
+        })
     }
 
     /// Open a legacy interleaved index file.
@@ -1068,6 +1143,37 @@ impl IndexFile {
     pub fn len(&self) -> usize { self.count }
     pub fn is_empty(&self) -> bool { self.count == 0 }
 
+    // ── Page-cache release ────────────────────────────────────────────────────
+
+    /// Advise the OS to release page-cache pages for all three column files
+    /// (`madvise(MADV_DONTNEED)`).
+    ///
+    /// Called after large sequential scans to prevent EcoRDF from monopolising
+    /// the OS page cache when sharing a host with other services.  The kernel
+    /// may ignore the hint or delay acting on it; subsequent accesses will
+    /// page-fault again (cold cache).
+    ///
+    /// Only effective for `Columnar` storage (mmap-backed).  `Interleaved` and
+    /// `DeltaColumnar` variants are no-ops because:
+    ///   - Interleaved: less common; MADV_DONTNEED still works but offers less
+    ///     benefit (data is interleaved, freeing partial ranges is harder).
+    ///   - DeltaColumnar: decompressed data lives on the heap (Vec), not mmap;
+    ///     the OS cannot reclaim heap pages via madvise.
+    ///
+    /// Returns approximate bytes released.
+    pub fn advise_dontneed(&self) -> usize {
+        if let IndexStorage::Columnar { mmaps, .. } = &self.storage {
+            let bytes = self.count * COL_VALUE_BYTES;
+            for mmap in mmaps.iter() {
+                // MADV_DONTNEED on the data region (after the 16-byte header).
+                let _ = mmap.advise_range(Advice::DontNeed, HEADER_SIZE, bytes);
+            }
+            bytes * 3
+        } else {
+            0
+        }
+    }
+
     // ── Async prefetch ────────────────────────────────────────────────────────
 
     /// Non-blocking hint to the OS to prefetch the c0 pages covering entry
@@ -1169,6 +1275,7 @@ impl IndexFile {
                 let off = HEADER_SIZE + pos * COL_VALUE_BYTES;
                 u64::from_le_bytes(mmaps[0][off..off + 8].try_into().unwrap())
             }
+            IndexStorage::DeltaColumnar { cols } => cols[0].get(pos),
         }
     }
 
@@ -1191,6 +1298,7 @@ impl IndexFile {
                     u64::from_le_bytes(mmaps[1][off..off + 8].try_into().unwrap()),
                 )
             }
+            IndexStorage::DeltaColumnar { cols } => (cols[0].get(pos), cols[1].get(pos)),
         }
     }
 
@@ -1214,6 +1322,9 @@ impl IndexFile {
                     u64::from_le_bytes(mmaps[1][off..off + 8].try_into().unwrap()),
                     u64::from_le_bytes(mmaps[2][off..off + 8].try_into().unwrap()),
                 ]
+            }
+            IndexStorage::DeltaColumnar { cols } => {
+                [cols[0].get(pos), cols[1].get(pos), cols[2].get(pos)]
             }
         }
     }
@@ -2140,6 +2251,111 @@ impl TripleIndex {
             .collect();
         v.sort_unstable_by_key(|&(_, size)| size);
         v
+    }
+
+    /// Advise the OS to release page-cache pages for the given index after a
+    /// large sequential scan, preventing EcoRDF from monopolising the page cache
+    /// when sharing a host with other services.
+    ///
+    /// Calls `madvise(MADV_DONTNEED)` on all three column files of `kind`.
+    /// Only effective for `Columnar` (mmap) storage; no-op for interleaved or
+    /// delta-encoded columns (they decompress into heap-allocated Vecs).
+    ///
+    /// Returns the number of bytes released (approximate; actual kernel behaviour
+    /// may differ) so the caller can log it.
+    pub fn advise_dontneed(&self, kind: IndexKind) -> usize {
+        let idx = match kind {
+            IndexKind::Spo => Some(&self.spo),
+            IndexKind::Pos => Some(&self.pos),
+            IndexKind::Osp => Some(&self.osp),
+            IndexKind::Pso => self.pso.as_ref(),
+            IndexKind::Sop => self.sop.as_ref(),
+            IndexKind::Ops => self.ops.as_ref(),
+        };
+        let Some(idx) = idx else { return 0 };
+        idx.advise_dontneed()
+    }
+
+    /// Compress all column files under `store_dir` into delta-encoded `.dz` files.
+    ///
+    /// For each `*.c0` / `*.c1` / `*.c2` file under `store_dir`, reads the raw
+    /// u64 values and writes a compressed `*.c0.dz` / `*.c1.dz` / `*.c2.dz`
+    /// file next to it.
+    ///
+    /// - `force = false`: skip columns whose `.dz` already exists.
+    /// - `force = true`:  overwrite existing `.dz` files.
+    ///
+    /// Returns the number of column files compressed.
+    pub fn compress_columns(store_dir: &std::path::Path, force: bool) -> io::Result<usize> {
+        use crate::col_delta::encode_column;
+
+        let mut compressed = 0usize;
+        for entry in std::fs::read_dir(store_dir)?.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            // Match *.c0, *.c1, *.c2 (but not *.c0.dz, etc.)
+            if !( (name.ends_with(".c0") || name.ends_with(".c1") || name.ends_with(".c2"))
+                  && !name.ends_with(".dz") )
+            {
+                continue;
+            }
+
+            let dz_path = delta_path(&path);
+            if !force && dz_path.exists() {
+                tracing::debug!(?dz_path, "compress-cols: already exists, skipping");
+                continue;
+            }
+
+            // Read the raw column.
+            let mmap_file = File::open(&path)?;
+            let mmap = unsafe { Mmap::map(&mmap_file)? };
+
+            if mmap.len() < 16 {
+                tracing::warn!(?path, "compress-cols: file too small, skipping");
+                continue;
+            }
+            if &mmap[0..8] != COL_MAGIC {
+                tracing::debug!(?path, "compress-cols: not a ECOCOL01 file, skipping");
+                continue;
+            }
+            let count = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
+            let expected = 16 + count * 8;
+            if mmap.len() != expected {
+                tracing::warn!(?path, count, "compress-cols: size mismatch, skipping");
+                continue;
+            }
+
+            // Decode raw u64 values.
+            let values: Vec<u64> = (0..count)
+                .map(|i| {
+                    let off = 16 + i * 8;
+                    u64::from_le_bytes(mmap[off..off+8].try_into().unwrap())
+                })
+                .collect();
+
+            let t = std::time::Instant::now();
+            encode_column(&values, &dz_path)?;
+            let orig_mb = mmap.len() as f64 / (1024.0 * 1024.0);
+            let dz_size = std::fs::metadata(&dz_path)?.len();
+            let dz_mb   = dz_size as f64 / (1024.0 * 1024.0);
+            let ratio   = orig_mb / dz_mb;
+            tracing::info!(
+                col = name,
+                orig_mb = format!("{:.1}", orig_mb),
+                dz_mb   = format!("{:.1}", dz_mb),
+                ratio   = format!("{:.1}×", ratio),
+                elapsed_ms = t.elapsed().as_millis(),
+                "compress-cols: compressed"
+            );
+            eprintln!(
+                "  {} → {:.1} MB → {:.1} MB ({:.1}×) in {}ms",
+                name, orig_mb, dz_mb, ratio, t.elapsed().as_millis()
+            );
+            compressed += 1;
+        }
+
+        tracing::info!(compressed, ?store_dir, "compress-cols: done");
+        Ok(compressed)
     }
 }
 

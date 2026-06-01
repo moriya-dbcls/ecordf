@@ -29,12 +29,14 @@
 //!   [Dictionary] ── string ↔ u32 with namespace compression
 //! ```
 
+pub mod col_delta;
 pub mod config;
 pub mod dict;
 pub mod dict_builder;
 pub mod index;
 pub mod loader;
 pub mod path_cache;
+pub mod pred_partition;
 pub mod predcache;
 pub mod rdf_config;
 pub mod server;
@@ -42,6 +44,7 @@ pub mod sparql;
 pub mod stats;
 pub mod store;
 pub mod triple;
+pub mod type_cache;
 
 pub use config::Config;
 pub use loader::InputSpec;

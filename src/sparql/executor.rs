@@ -28,15 +28,19 @@
 //! This runs in O(output × k × log(n_i)) per variable.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::config::QueryConfig;
 use crate::dict_builder::QueryDict;
 use crate::index::{GspoIndexFile, TripleIndex};
 use crate::path_cache::PathCache;
+use crate::pred_partition::PredPartitions;
 use crate::predcache::{self, PredCache};
 use crate::stats::StoreStatistics;
 use crate::triple::{TermId, TriplePattern, UNBOUND};
+use crate::type_cache::TypeCache;
 use super::ast::*;
 use super::plan::ExecutionPlan;
 
@@ -179,6 +183,21 @@ pub struct Executor<'a> {
     /// In-RAM path cache for multi-hop property paths from rdf-config.
     /// `PathCache::empty()` when no cache is configured.
     pub path_cache: PathCache,
+    /// Per-class subject membership cache for `?x a SomeClass` filter patterns.
+    pub type_cache: TypeCache,
+    /// On-disk per-predicate sorted (S,O) partition files.
+    pub pred_partitions: PredPartitions,
+    /// Cancellation flag set by the query-timeout task.
+    ///
+    /// Checked at each bind_join inner-loop iteration.  When `true`, execution
+    /// stops immediately and returns a timeout error result.
+    /// Wrapped in `Arc` so the tokio timeout task can set it from async context
+    /// while the blocking executor thread checks it.
+    pub cancel: Arc<AtomicBool>,
+    /// Threshold in bytes above which a sequential index scan triggers
+    /// `madvise(MADV_DONTNEED)` after completion.  0 = disabled.
+    /// Set from `server.scan_dontneed_mb`.
+    pub scan_dontneed_bytes: usize,
     /// LIMIT pushdown budget: BGP execution stops once this many rows are
     /// accumulated, avoiding full-dataset scans for queries with small LIMITs.
     ///
@@ -193,11 +212,11 @@ pub struct Executor<'a> {
 
 impl<'a> Executor<'a> {
     pub fn new(index: &'a TripleIndex, dict: &'a QueryDict) -> Self {
-        Self { index, dict, config: QueryConfig::default(), stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), pushdown_limit: std::cell::Cell::new(None) }
+        Self { index, dict, config: QueryConfig::default(), stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: std::cell::Cell::new(None) }
     }
 
     pub fn with_config(index: &'a TripleIndex, dict: &'a QueryDict, config: QueryConfig) -> Self {
-        Self { index, dict, config, stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), pushdown_limit: std::cell::Cell::new(None) }
+        Self { index, dict, config, stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: std::cell::Cell::new(None) }
     }
 
     pub fn with_config_and_stats(
@@ -206,7 +225,40 @@ impl<'a> Executor<'a> {
         config: QueryConfig,
         stats: Option<&'a StoreStatistics>,
     ) -> Self {
-        Self { index, dict, config, stats, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), pushdown_limit: std::cell::Cell::new(None) }
+        Self { index, dict, config, stats, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: std::cell::Cell::new(None) }
+    }
+
+    /// Builder: attach a TypeCache.
+    pub fn with_type_cache(mut self, cache: TypeCache) -> Self {
+        self.type_cache = cache;
+        self
+    }
+
+    /// Builder: attach PredPartitions.
+    pub fn with_pred_partitions(mut self, parts: PredPartitions) -> Self {
+        self.pred_partitions = parts;
+        self
+    }
+
+    /// Builder: attach a shared cancellation flag.
+    ///
+    /// The timeout task sets this to `true`; the executor checks it at each
+    /// bind_join iteration and aborts immediately when it fires.
+    pub fn with_cancel(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Builder: set the sequential scan DONTNEED threshold (bytes).
+    pub fn with_scan_dontneed_bytes(mut self, bytes: usize) -> Self {
+        self.scan_dontneed_bytes = bytes;
+        self
+    }
+
+    /// Returns `true` if the query has been cancelled (timeout fired).
+    #[inline]
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 
     /// Returns `true` if the current BGP row count has reached the pushdown limit.
@@ -1401,10 +1453,30 @@ impl<'a> Executor<'a> {
 
         // ── Filter mode: membership test (S, P, O_fixed) ─────────────────────
         if is_filter {
-            // Prefer pred_cache: binary-search each subject for (s, base.o).
-            // The cache is sorted by (S, O); searching S then O is O(|subjects| × log N).
-            // Fall back to POS subrange scan (already fast: (P,O) subrange is tiny).
-            let passing: HashSet<TermId> = if let Some(cached) = self.pred_cache.get(base.p) {
+            // Priority 1: TypeCache — O(log |class|) binary search per subject.
+            // Covers `?x a SomeClass` patterns (P=rdf:type, O=class_id).
+            // Avoids the full rdf:type POS/OPS scan entirely.
+            //
+            // Priority 2: pred_cache — sorted (S,O) Vec in RAM.
+            // Priority 3: pred_partitions — sorted (S,O) mmap file on disk.
+            // Priority 4: POS/OPS index scan (fallback).
+            let passing: HashSet<TermId> = if let Some(class_subjects) =
+                self.type_cache.rdf_type_id()
+                    .filter(|&rdf_type| base.p == rdf_type)
+                    .and_then(|_| self.type_cache.get_class(base.o))
+            {
+                tracing::debug!(
+                    pred = base.p,
+                    class = base.o,
+                    unique_subjects = subjects.len(),
+                    class_size = class_subjects.len(),
+                    mode = "type_cache_filter",
+                    "bind_join filter: using type cache"
+                );
+                subjects.iter().copied().filter(|&s| {
+                    class_subjects.binary_search(&s).is_ok()
+                }).collect()
+            } else if let Some(cached) = self.pred_cache.get(base.p) {
                 tracing::debug!(
                     pred = base.p,
                     unique_subjects = subjects.len(),
@@ -1414,12 +1486,22 @@ impl<'a> Executor<'a> {
                 );
                 let target_o = base.o;
                 subjects.iter().copied().filter(|&s| {
-                    // Binary search for (s, target_o) in sorted (S, O) cache.
-                    let key = (s, target_o);
-                    cached.binary_search(&key).is_ok()
+                    cached.binary_search(&(s, target_o)).is_ok()
+                }).collect()
+            } else if let Some(part) = self.pred_partitions.get(base.p) {
+                tracing::debug!(
+                    pred = base.p,
+                    unique_subjects = subjects.len(),
+                    part_pairs = part.len(),
+                    mode = "pred_partition_filter",
+                    "bind_join filter: using pred partition"
+                );
+                let target_o = base.o;
+                subjects.iter().copied().filter(|&s| {
+                    part.contains(s, target_o)
                 }).collect()
             } else {
-                // Scan the (P, O_fixed) range in POS — typically just a handful of
+                // Scan the (P, O_fixed) range in POS/OPS — typically just a handful of
                 // entries — and collect passing subject IDs.
                 self.index.scan(&scan_pat)
                     .filter(|t| subjects.contains(&t.s))
@@ -1429,6 +1511,10 @@ impl<'a> Executor<'a> {
 
             let mut result = ResultSet::empty(left.variables.clone());
             for (key, row_indices) in groups {
+                if self.is_cancelled() {
+                    result.overflow = true;
+                    return Some(result);
+                }
                 if let Some(s_id) = key.get(kp).copied().flatten() {
                     if passing.contains(&s_id) {
                         for &ri in row_indices {
@@ -1460,6 +1546,8 @@ impl<'a> Executor<'a> {
         // Collect (S → [O]) pairs for matching subjects.
         // Prefer pred_cache: binary search per subject → O(N×log M) RAM.
         // Fall back to sequential POS scan → O(pred_range) HDD.
+        // Build (S → [O]) mapping from the best available source:
+        // pred_cache (RAM) → pred_partitions (mmap) → index scan (HDD).
         let mut s_to_objects: HashMap<TermId, Vec<TermId>> = HashMap::new();
         if let Some(cached) = self.pred_cache.get(base.p) {
             tracing::debug!(
@@ -1469,8 +1557,6 @@ impl<'a> Executor<'a> {
                 mode = "pred_cache_join",
                 "bind_join join: using cached predicate"
             );
-            // The cache is sorted by (S, O). For each subject, binary-search
-            // to find the [lo, hi) range where S matches, then collect all objects.
             for &s in &subjects {
                 let lo = cached.partition_point(|&(cs, _)| cs < s);
                 let hi = cached[lo..].partition_point(|&(cs, _)| cs == s) + lo;
@@ -1479,11 +1565,38 @@ impl<'a> Executor<'a> {
                     s_to_objects.insert(s, objs);
                 }
             }
+        } else if let Some(part) = self.pred_partitions.get(base.p) {
+            tracing::debug!(
+                pred = base.p,
+                unique_subjects = subjects.len(),
+                part_pairs = part.len(),
+                mode = "pred_partition_join",
+                "bind_join join: using pred partition"
+            );
+            for &s in &subjects {
+                let pairs = part.get_objects(s);
+                if !pairs.is_empty() {
+                    let objs: Vec<TermId> = pairs.iter().map(|&(_, o)| o).collect();
+                    s_to_objects.insert(s, objs);
+                }
+            }
         } else {
-            // One sequential POS scan: collect (S → [O]) pairs for matching subjects.
+            // One sequential POS/OPS scan: collect (S → [O]) pairs for matching subjects.
             for triple in self.index.scan(&scan_pat) {
                 if subjects.contains(&triple.s) {
                     s_to_objects.entry(triple.s).or_default().push(triple.o);
+                }
+            }
+            // Release page cache after large sequential scans to avoid monopolising RAM.
+            if self.scan_dontneed_bytes > 0 {
+                let kind = scan_pat.best_index();
+                let released = self.index.advise_dontneed(kind);
+                if released >= self.scan_dontneed_bytes {
+                    tracing::debug!(
+                        released_mb = released / (1024 * 1024),
+                        kind = ?kind,
+                        "predicate scan: MADV_DONTNEED released page cache"
+                    );
                 }
             }
         }
@@ -1509,6 +1622,10 @@ impl<'a> Executor<'a> {
 
         // Expand: for each (S, O) pair, cross with all left rows sharing that S.
         'expand: for (s_id, objects) in &s_to_objects {
+            if self.is_cancelled() {
+                result.overflow = true;
+                break 'expand;
+            }
             let Some(row_indices) = s_to_rows.get(s_id) else { continue; };
             for &o_id in objects {
                 for &row_idx in *row_indices {
@@ -1712,6 +1829,13 @@ impl<'a> Executor<'a> {
         }
 
         for (key, row_indices) in &groups {
+            // Check cancellation flag (set by query timeout) at each group boundary.
+            if self.is_cancelled() {
+                result.overflow = true;
+                tracing::debug!("bind_join: query cancelled (timeout)");
+                return result;
+            }
+
             // Build binding: outer context + the needed left variables for this group.
             let mut row_binding = outer.clone();
             for (key_pos, (left_idx, var_name)) in needed.iter().enumerate() {

@@ -23,8 +23,10 @@ use crate::loader::{collect_strings_from_inputs, collect_strings_parallel,
                     load_triples_with_readonly_dict, load_triples_parallel,
                     load_triples_streaming, InputSpec};
 use crate::path_cache::PathCache;
+use crate::pred_partition::{pred_parts_dir, PredPartitions};
 use crate::predcache::PredCache;
 use crate::rdf_config;
+use crate::type_cache::TypeCache;
 use crate::sparql::{parse_query, Executor, ResultSet};
 use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
 use crate::stats::StoreStatistics;
@@ -45,6 +47,12 @@ pub struct Store {
     /// In-RAM path cache built from rdf-config model.yaml compound paths.
     /// Empty when `model.path_cache_mb = 0` or no rdf_configs are specified.
     pub path_cache: PathCache,
+    /// Per-class subject membership cache for `?x a SomeClass` patterns.
+    /// Empty when `server.type_cache_mb = 0`.
+    pub type_cache: TypeCache,
+    /// On-disk per-predicate sorted (S,O) partition files.
+    /// Empty when `{store_dir}/pred_parts/` directory is absent.
+    pub pred_partitions: PredPartitions,
 }
 
 impl Store {
@@ -104,7 +112,7 @@ impl Store {
         let dict = QueryDict::from_legacy(id_to_str, str_to_id);
         let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache, path_cache: PathCache::empty() })
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty() })
     }
 
     // ── internal: two-pass (external-sort dict) ───────────────────────────────
@@ -351,7 +359,7 @@ impl Store {
         let dict = QueryDict::from_mmap(ReadonlyDict::open(&store_dict_sorted)?);
         let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache, path_cache: PathCache::empty() })
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty() })
     }
 
     /// Build a new store from RDF input files with optional per-file named graph assignment.
@@ -381,7 +389,7 @@ impl Store {
             let dict = QueryDict::from_legacy(id_to_str, str_to_id);
             let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
             let pred_cache = PredCache::empty();
-            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache, path_cache: PathCache::empty() })
+            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty() })
         }
     }
 
@@ -412,7 +420,7 @@ impl Store {
             let dict = QueryDict::from_legacy(id_to_str, str_to_id);
             let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
             let pred_cache = PredCache::empty();
-            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache, path_cache: PathCache::empty() })
+            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty() })
         }
     }
 
@@ -423,7 +431,7 @@ impl Store {
         let config = Config::resolve(None, dir).map_err(io::Error::from)?;
         let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache, path_cache: PathCache::empty() })
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty() })
     }
 
     /// Reopen an existing store and apply an explicit config file (overrides
@@ -439,7 +447,32 @@ impl Store {
         eprintln!("Loading statistics...");
         let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache, path_cache: PathCache::empty() })
+        // Open per-predicate partition files if the pred_parts directory exists.
+        let pred_partitions = PredPartitions::open(&pred_parts_dir(dir));
+        if !pred_partitions.is_empty() {
+            eprintln!("  pred_partitions: {} file(s) loaded", pred_partitions.len());
+        }
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions })
+    }
+
+    /// Build and attach a TypeCache from `rdf:type`.
+    ///
+    /// Called during `ecordf serve` after the store is opened.
+    /// `budget_mb = 0` is a no-op.
+    pub fn build_type_cache(&mut self, budget_mb: u64) {
+        if budget_mb == 0 { return; }
+        let budget = (budget_mb as usize) * 1024 * 1024;
+        self.type_cache = TypeCache::build(&*self.index, &self.dict, budget);
+        tracing::info!(
+            classes = self.type_cache.len(),
+            mb_used = self.type_cache.bytes_used() / (1024 * 1024),
+            "type-cache: ready"
+        );
+        eprintln!(
+            "Type cache ready: {} class(es), {} MB used.",
+            self.type_cache.len(),
+            self.type_cache.bytes_used() / (1024 * 1024),
+        );
     }
 
     /// Replace the active configuration without reopening indexes.
@@ -688,7 +721,29 @@ impl Store {
     /// Serialisation / decode time is measured in `server::execute_query`.
     /// Enable `RUST_LOG=ecordf=debug` to also see the physical execution plan
     /// (optimizer output) and per-phase breakdown from the executor.
+    /// Execute a SPARQL query.
+    ///
+    /// `cancel`: shared flag; when set to `true` (e.g. by a timeout task) the
+    /// executor aborts at its next inner-loop checkpoint and returns an error.
+    /// Pass `Arc::new(AtomicBool::new(false))` when no timeout is needed.
+    pub fn query_with_cancel(
+        &self,
+        sparql: &str,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<QueryResult, QueryError> {
+        self.query_impl(sparql, cancel)
+    }
+
+    /// Execute a SPARQL query without a timeout/cancellation flag.
     pub fn query(&self, sparql: &str) -> Result<QueryResult, QueryError> {
+        self.query_impl(sparql, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+
+    fn query_impl(
+        &self,
+        sparql: &str,
+        cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<QueryResult, QueryError> {
         let t_total = Instant::now();
 
         // ── Phase 1: Parse ────────────────────────────────────────────────────
@@ -699,7 +754,9 @@ impl Store {
         tracing::debug!(
             pred_cache_bytes = self.pred_cache.bytes_used(),
             pred_cache_mb = self.pred_cache.bytes_used() / (1024 * 1024),
-            "execute: pred_cache state"
+            type_cache_classes = self.type_cache.len(),
+            pred_partitions = self.pred_partitions.len(),
+            "execute: cache state"
         );
 
         let executor = Executor::with_config_and_stats(
@@ -708,7 +765,13 @@ impl Store {
             self.config.query.clone(),
             Some(&self.stats),
         ).with_pred_cache(self.pred_cache.clone())
-         .with_path_cache(self.path_cache.clone());
+         .with_path_cache(self.path_cache.clone())
+         .with_type_cache(self.type_cache.clone())
+         .with_pred_partitions(self.pred_partitions.clone())
+         .with_cancel(cancel_flag.clone())
+         .with_scan_dontneed_bytes(
+             (self.config.server.scan_dontneed_mb as usize) * 1024 * 1024
+         );
 
         // ── Phase 2: Execute (plan + BGP evaluation) ──────────────────────────
         let t = Instant::now();

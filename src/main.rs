@@ -153,6 +153,65 @@ enum Command {
         /// When 0 (default), falls back to [model] path_cache_mb in ecordf.toml.
         #[arg(long, default_value_t = 0, value_name = "MB")]
         path_cache_mb: u64,
+
+        /// RAM budget (MiB) for the TypeCache (`?x a SomeClass` membership lookups).
+        /// Builds a per-class sorted subject list from rdf:type at startup.
+        /// When 0, falls back to [server] type_cache_mb in ecordf.toml.
+        #[arg(long, default_value_t = 0, value_name = "MB")]
+        type_cache_mb: u64,
+
+        /// Per-query wall-clock timeout in seconds.  0 = no timeout (default).
+        /// When exceeded, the executor is cancelled and the client receives 408.
+        /// When 0, falls back to [server] query_timeout_secs in ecordf.toml.
+        #[arg(long, default_value_t = 0, value_name = "SECS")]
+        query_timeout_secs: u64,
+
+        /// Release index pages from page cache after sequential scans larger
+        /// than this threshold (MiB).  0 = disabled (default).
+        /// Reduces impact on co-located services.
+        /// When 0, falls back to [server] scan_dontneed_mb in ecordf.toml.
+        #[arg(long, default_value_t = 0, value_name = "MB")]
+        scan_dontneed_mb: u64,
+    },
+
+    /// Build per-predicate (S,O) partition files for fast predicate access.
+    ///
+    /// Scans the POS index and writes one `pred_parts/pp_<id>.bin` file per
+    /// predicate.  These files are automatically loaded at `ecordf serve` time
+    /// and supplement (then replace) the pred_cache for uncached predicates.
+    ///
+    /// Run once after `ecordf build`:
+    ///
+    ///   ecordf build-pred-parts --dir ./store
+    ///
+    /// Re-run with --force to overwrite existing partition files.
+    BuildPredParts {
+        #[arg(short, long, default_value = "./ecordf-data")]
+        dir: PathBuf,
+        /// Overwrite existing partition files.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
+    /// Compress column files with delta encoding (ECOCOL02).
+    ///
+    /// For each `*.c0`, `*.c1`, `*.c2` column file under the store directory,
+    /// writes a compressed `*.c0.dz`, `*.c1.dz`, `*.c2.dz` file.
+    ///
+    /// The server automatically detects and uses `.dz` files when present.
+    ///
+    ///   ecordf compress-cols --dir ./store
+    ///
+    /// Expected compression ratios (JPostDB):
+    ///   pos.c0 (6 GB) → ~30 MB (200×)  — predicate IDs repeat extensively
+    ///   spo.c0 (6 GB) → ~750 MB (8×)   — ascending subject IDs, small deltas
+    ///   pos.c1 (6 GB) → ~1.5 GB (4×)   — object IDs sorted within predicates
+    CompressCols {
+        #[arg(short, long, default_value = "./ecordf-data")]
+        dir: PathBuf,
+        /// Overwrite existing .dz files.
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 
     /// Execute a SPARQL query from command line
@@ -298,7 +357,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Command::Serve { dir, host, port, cors, config, warmup_mb, pred_cache_mb, pred_cache_per_pred_cap_mb, rdf_config, path_cache_mb } => {
+        Command::Serve { dir, host, port, cors, config, warmup_mb, pred_cache_mb, pred_cache_per_pred_cap_mb, rdf_config, path_cache_mb, type_cache_mb, query_timeout_secs, scan_dontneed_mb } => {
             let mut store = Store::open_with_config(&dir, config.as_deref())?;
             let stats = store.stats();
             eprintln!(
@@ -424,6 +483,27 @@ async fn main() -> anyhow::Result<()> {
                     store.path_cache.bytes_used() / (1024 * 1024)
                 );
             }
+            // Apply CLI overrides for timeout and MADV_DONTNEED threshold.
+            if query_timeout_secs > 0 {
+                store.config.server.query_timeout_secs = query_timeout_secs;
+            }
+            if scan_dontneed_mb > 0 {
+                store.config.server.scan_dontneed_mb = scan_dontneed_mb;
+            }
+            if store.config.server.query_timeout_secs > 0 {
+                eprintln!("Query timeout: {}s", store.config.server.query_timeout_secs);
+            }
+            if store.config.server.scan_dontneed_mb > 0 {
+                eprintln!("Scan MADV_DONTNEED threshold: {} MB", store.config.server.scan_dontneed_mb);
+            }
+
+            // Build TypeCache (rdf:type membership lookups).
+            let effective_type_cache_mb = if type_cache_mb > 0 { type_cache_mb } else { store.config.server.type_cache_mb };
+            if effective_type_cache_mb > 0 {
+                eprintln!("Building type cache ({} MB)...", effective_type_cache_mb);
+                store.build_type_cache(effective_type_cache_mb);
+            }
+
             tracing::info!(
                 host = %effective_host,
                 port = effective_port,
@@ -431,6 +511,8 @@ async fn main() -> anyhow::Result<()> {
                 terms   = stats.term_count,
                 pred_cache_mb = store.pred_cache.bytes_used() / (1024 * 1024),
                 path_cache_paths = store.path_cache.len(),
+                type_cache_classes = store.type_cache.len(),
+                pred_partitions = store.pred_partitions.len(),
                 "Server ready"
             );
             ecordf::server::serve(store, &effective_host, effective_port, effective_cors.as_deref()).await?;
@@ -585,6 +667,19 @@ async fn main() -> anyhow::Result<()> {
                     println!("  Largest predicate: ~{} MB — this is the minimum cap to cache it.", largest_mb);
                 }
             }
+        }
+
+        Command::BuildPredParts { dir, force } => {
+            let store = Store::open(&dir)?;
+            eprintln!("Building predicate partition files for {:?}...", dir);
+            let n = ecordf::pred_partition::build_pred_partitions(&dir, &*store.index, force)?;
+            eprintln!("Done: {} partition file(s) written.", n);
+        }
+
+        Command::CompressCols { dir, force } => {
+            eprintln!("Compressing column files in {:?}...", dir);
+            let n = ecordf::index::TripleIndex::compress_columns(&dir, force)?;
+            eprintln!("Done: {} column file(s) compressed.", n);
         }
     }
 
