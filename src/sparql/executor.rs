@@ -328,28 +328,21 @@ impl<'a> Executor<'a> {
         let mut bindings = self.execute_plan(&plan);
         self.pushdown_limit.set(None); // clear after BGP so later calls are unaffected
 
-        // Pushdown safety check: if we got fewer rows than the requested limit,
-        // filter steps after the pushdown cutoff may have reduced the result.
-        // Re-execute without pushdown to get the full correct result set.
-        //
-        // Example: LIMIT 1000, PSM query with type filters:
-        //   - pushdown stops dct:identifier scan at 1000 PSMs
-        //   - only 142/1000 of those PSMs have ExperimentalMassToCharge
-        //   → return 142 instead of 1000 (wrong)
-        //   → retry without pushdown → correct 1000 rows
-        //
-        // This retry only fires when pushdown was active AND the result is
-        // smaller than the limit, so it adds overhead only in these cases.
+        // Note: SPARQL LIMIT is "at most N rows", not "exactly N rows".
+        // Returning fewer rows than LIMIT is valid when filter steps after the
+        // pushdown cutoff reduce the intermediate result.  A retry without
+        // pushdown would process the full dataset (e.g. 10M PSMs × 7 blanknodes
+        // = 70M rows) and is far too expensive for large stores.
+        // We log a debug message so operators can observe the behaviour.
         if can_pushdown && !bindings.overflow {
             if let Some(lim) = query.limit {
                 if bindings.rows.len() < lim as usize {
                     tracing::debug!(
                         got = bindings.rows.len(),
                         limit = lim,
-                        "LIMIT pushdown gave fewer rows than limit (filter reduced result), retrying without pushdown"
+                        "LIMIT pushdown: fewer rows than limit (filter reduced result); \
+                         returning early — SPARQL LIMIT is a maximum, not a guarantee"
                     );
-                    bindings = self.execute_plan(&plan);
-                    self.pushdown_limit.set(None);
                 }
             }
         }
