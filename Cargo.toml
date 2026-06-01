@@ -24,6 +24,9 @@ path = "src/lib.rs"
 # Advice::WillNeed (madvise) is used to pipeline disk I/O with CPU work.
 memmap2 = "0.9"
 
+# libc is used for madvise(MADV_DONTNEED) which is not exposed by memmap2 0.9.
+libc = "0.2"
+
 # Async HTTP server for SPARQL 1.1 Protocol endpoint
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["json"] }
