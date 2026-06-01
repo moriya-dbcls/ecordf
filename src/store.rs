@@ -551,16 +551,33 @@ impl Store {
         //
         // IRIs from rdf_config come as `<http://…>` (with angle brackets).
         // Strip them before lookup — the dictionary stores bare IRI strings.
+        // Resolve priority IRIs → TermIds.  Count misses and emit a single
+        // summary rather than one DEBUG line per missing IRI (which floods the
+        // log when rdf-config variable-name keys slip through the filter).
+        let mut not_found: Vec<&str> = Vec::new();
         let priority_ids: Vec<u64> = priority_iris.iter()
             .filter_map(|iri| {
                 let key = iri.trim_matches(|c| c == '<' || c == '>');
                 let id = self.dict.lookup(key);
                 if id.is_none() {
-                    tracing::debug!(iri, "pred-cache: priority IRI not in dictionary, ignoring");
+                    not_found.push(iri.as_str());
                 }
                 id
             })
             .collect();
+        if !not_found.is_empty() {
+            // TRACE: full list only when deep-debugging the IRI resolution step.
+            for iri in &not_found {
+                tracing::trace!(iri, "pred-cache: priority IRI not in dictionary");
+            }
+            // DEBUG: one-line summary visible at the default debug level.
+            tracing::debug!(
+                not_found = not_found.len(),
+                resolved  = priority_ids.len(),
+                total     = priority_iris.len(),
+                "pred-cache: priority IRI resolution summary"
+            );
+        }
         let cache = PredCache::empty();
         self.pred_cache = cache.clone();
         cache.build_sync(&*self.index, budget_bytes, per_pred_cap_bytes, &priority_ids);

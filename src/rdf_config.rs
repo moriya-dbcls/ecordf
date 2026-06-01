@@ -201,7 +201,12 @@ fn parse_prefix_yaml(text: &str) -> Result<PrefixMap, String> {
     let mut map = PrefixMap::new();
     for (k, v) in mapping {
         if let (Some(prefix), Some(iri)) = (k.as_str(), v.as_str()) {
-            map.insert(prefix.to_string(), iri.to_string());
+            // rdf-config prefix.yaml stores expansions with angle brackets:
+            //   faldo: <http://biohackathon.org/resource/faldo#>
+            // Strip the angle brackets so resolve_iri can safely wrap the
+            // expanded IRI in its own <…> without producing <<…>local>.
+            let bare = iri.trim_matches(|c| c == '<' || c == '>');
+            map.insert(prefix.to_string(), bare.to_string());
         }
     }
     Ok(map)
@@ -328,13 +333,29 @@ fn walk_property_item(
 
         // Predicate key: resolve prefix and extend the path.
         //
-        // rdf-config appends cardinality markers to predicate keys:
-        //   jpost:hasPeptide+   → one-or-more
-        //   jpost:hasPsm*       → zero-or-more
-        //   jpost:hasIsoform?   → zero-or-one
-        // Strip these before IRI resolution so the resulting IRI matches
-        // what is actually stored in the triple store.
+        // rdf-config model.yaml uses two kinds of keys:
+        //
+        //   A) Predicate keys — always contain ':' (prefixed name) or start
+        //      with '<' (full IRI), optionally with cardinality suffixes:
+        //        jpost:hasPeptide+   → one-or-more
+        //        faldo:begin         → exactly-one
+        //        <http://…>          → full IRI
+        //
+        //   B) Variable-name keys — snake_case identifiers used as example
+        //      values or variable names in rdf-config, e.g.:
+        //        acetyle_position: 5
+        //        active_site_begin: 505
+        //      These do NOT contain ':' or start with '<'.
+        //
+        // Only process type-A keys as predicates.  Type-B keys are variable
+        // names whose values are scalar examples; skip them entirely (they
+        // should never appear as path segments in the triple store).
         let Some(pred_str_raw) = key.as_str() else { continue };
+        if !pred_str_raw.contains(':') && !pred_str_raw.starts_with('<') {
+            // Variable name key — not a predicate, skip.
+            continue;
+        }
+        // Strip cardinality markers before IRI resolution.
         let pred_str = pred_str_raw.trim_end_matches(|c| c == '+' || c == '*' || c == '?');
         let resolved = resolve_iri(pred_str, prefixes);
 
@@ -410,6 +431,28 @@ mod tests {
         m.insert("up".into(),    "http://purl.uniprot.org/core/".into());
         m.insert("faldo".into(), "http://biohackathon.org/resource/faldo#".into());
         m
+    }
+
+    #[test]
+    fn test_parse_prefix_yaml_strips_angle_brackets() {
+        // Real rdf-config prefix.yaml stores expansion IRIs WITH angle brackets.
+        // parse_prefix_yaml must strip them so resolve_iri doesn't double-wrap.
+        let prefix_yaml = "\
+faldo: <http://biohackathon.org/resource/faldo#>
+up: <http://purl.uniprot.org/core/>
+rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+";
+        let prefixes = parse_prefix_yaml(prefix_yaml).unwrap();
+        // Values must NOT contain angle brackets
+        assert_eq!(prefixes["faldo"], "http://biohackathon.org/resource/faldo#");
+        assert_eq!(prefixes["up"], "http://purl.uniprot.org/core/");
+        // resolve_iri must produce a single-wrapped IRI
+        assert_eq!(
+            resolve_iri("faldo:begin", &prefixes),
+            "<http://biohackathon.org/resource/faldo#begin>"
+        );
+        // Must NOT be <<http://biohackathon.org/resource/faldo#>begin>
+        assert!(!resolve_iri("faldo:begin", &prefixes).contains(">>"));
     }
 
     #[test]
