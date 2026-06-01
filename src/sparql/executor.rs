@@ -1561,18 +1561,17 @@ impl<'a> Executor<'a> {
         // in ascending TermId order, successive HDD reads advance through the index
         // monotonically — similar to a sequential scan rather than random seeks.
         //
-        // Example: 263 pepevi blank nodes in random insertion order might span the
-        // entire SPO space (large seek distance).  Sorted, accesses cluster tightly
-        // (each blank node's triples are contiguous in SPO), so the disk arm barely
-        // moves between groups.
+        // SAFETY CAP: only sort when the group count is small enough that the
+        // sort overhead is justified.  For very large group counts (> MAX_SORT_GROUPS)
+        // the sort itself can take seconds and consumes significant memory bandwidth.
+        // Beyond ~100 K groups the I/O locality gain also diminishes: with 100 K+
+        // random subjects the OS page cache cannot hold them all anyway, so the
+        // benefit of sorted order approaches zero.
         //
         // SPARQL result sets are bags (unordered); ORDER BY is applied later at the
-        // SELECT level, so changing group evaluation order here is always safe.
-        //
-        // The sort key is the first non-None TermId in the group's binding key —
-        // for subject-bound ScanBound patterns this is the subject's TermId, which
-        // maps directly to position in the SPO index.
-        if groups.len() > 1 {
+        // SELECT level, so changing group evaluation order is always safe.
+        const MAX_SORT_GROUPS: usize = 100_000;
+        if groups.len() > 1 && groups.len() <= MAX_SORT_GROUPS {
             groups.sort_unstable_by_key(|(key, _)| {
                 key.iter().find_map(|k| *k).unwrap_or(TermId::MAX)
             });
@@ -1584,26 +1583,30 @@ impl<'a> Executor<'a> {
 
         // ── I/O Optimization 3: Batch madvise Prefetch ───────────────────────
         //
-        // Fire all madvise(MADV_WILLNEED) hints *before* starting execution,
-        // for every ScanBound node reachable from right_plan (including nested
-        // Join trees such as Join(ScanBound, ScanBound)).
+        // Fire madvise(MADV_WILLNEED) hints *before* starting execution so the
+        // OS can pipeline disk reads in the background.
         //
-        // The OS pipelines disk reads in the background (SSD I/O queue depth
-        // ~32) while the CPU sets up the first group's evaluation, converting
-        //   O(N × serial_seek_latency)  →  O(⌈N/queue_depth⌉ × latency)
+        // SAFETY CAP: MAX_PREFETCH_GROUPS limits the number of groups for which
+        // we issue hints.  Without this cap, a query with millions of groups
+        // (e.g. all PSMs: N=1M) causes:
         //
-        // For N=263 groups @ 40 ms/seek: sequential = 10.5 s,
-        // with queue_depth=32 prefetch: ~0.3 s (32× speedup on SSD).
+        //   1. 1M HashMap clones (outer.clone()) → gigabytes of heap churn.
+        //   2. 1M × N_patterns madvise syscalls → kernel MADV queue exhaustion,
+        //      stalling the entire system (login impossible).
         //
-        // Predicates in pred_cache bypass the HDD entirely, so their patterns
-        // are skipped (collect_scanbound_patterns already checks pred_cache).
+        // The OS I/O queue depth is ~32–256 on modern hardware; issuing more
+        // than ~1024 hints simultaneously provides no additional throughput.
+        // For large group counts the predicate-scan path (Opt 1) is the right
+        // tool; the prefetch path is a fallback for moderate counts only.
         //
-        // The groups have already been sorted above, so prefetch hints arrive at
-        // the OS in the same order as the subsequent reads — maximising the
-        // chance that each page is warm by the time it is first accessed.
+        // Predicates in pred_cache are skipped (no HDD I/O needed).
+        const MAX_PREFETCH_GROUPS: usize = 1_024;
         if groups.len() > PRED_SCAN_THRESHOLD {
+            let prefetch_n = MAX_PREFETCH_GROUPS.min(groups.len());
+            // Reuse the patterns Vec across iterations to avoid per-group allocation.
+            let mut patterns: Vec<TriplePattern> = Vec::new();
             let mut total_prefetches = 0usize;
-            for (key, _) in &groups {
+            for (key, _) in groups.iter().take(prefetch_n) {
                 // Build the full binding for this group (outer + group-key vars).
                 let mut row_binding = outer.clone();
                 for (key_pos, (_, var_name)) in needed.iter().enumerate() {
@@ -1611,8 +1614,7 @@ impl<'a> Executor<'a> {
                         row_binding.insert(var_name.clone(), id);
                     }
                 }
-                // Collect all ScanBound patterns, skipping pred_cache hits.
-                let mut patterns: Vec<TriplePattern> = Vec::new();
+                patterns.clear(); // reuse allocation
                 collect_scanbound_patterns(right_plan, &row_binding, &self.pred_cache, &mut patterns);
                 for pat in &patterns {
                     self.index.prefetch_pattern(pat);
@@ -1622,7 +1624,9 @@ impl<'a> Executor<'a> {
             if total_prefetches > 0 {
                 tracing::debug!(
                     groups = groups.len(),
+                    prefetched_groups = prefetch_n,
                     prefetches = total_prefetches,
+                    capped = (groups.len() > MAX_PREFETCH_GROUPS),
                     "bind_join: batch prefetch fired (madvise WILLNEED)"
                 );
             }

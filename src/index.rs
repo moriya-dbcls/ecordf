@@ -1908,33 +1908,43 @@ fn try_open_index(path: &Path, kind: IndexKind) -> io::Result<Option<IndexFile>>
     }
 }
 
-/// Predicate cardinality threshold for OPS routing.
+/// Denominator for computing the OPS routing threshold relative to dataset size.
 ///
-/// When `(s=free, p=bound, o=bound)` and the predicate has more than this many
-/// triples, the OPS index is used instead of POS.
+/// The actual threshold is `total_triples / OPS_ROUTING_DIVISOR`, clamped to
+/// `[OPS_ROUTING_MIN, OPS_ROUTING_MAX]`.
 ///
-/// ## Why this works
+/// ## Why relative, not fixed
 ///
-/// POS searches within a predicate's range: O(log |pred|) page faults.
-/// OPS starts from the object (SkipIndex: 1 page fault) then binary-searches
-/// for the predicate within the object's degree: O(log deg(o)).
+/// OPS wins over POS for `(p+o bound)` when `|pred| >> deg_o`, where `deg_o` is
+/// the object's degree in the OPS index (how many predicates point to it).
+/// Both `|pred|` and `deg_o` scale proportionally with dataset size, so the
+/// crossover point is naturally expressed as a fraction of total triples.
 ///
-/// When |pred| >> deg(o) — common for hub predicates like rdf:type, rdfs:label,
-/// owl:sameAs — OPS is dramatically faster.  The crossover at 1 M triples
-/// covers almost all biological "class membership" and "annotation" predicates.
+/// **Example: rdf:type across dataset sizes**
 ///
-/// | Predicate        | |pred|  | deg(o) typical | Winner |
-/// |------------------|---------|----------------|--------|
-/// | rdf:type         | 500 M   | 10 – 10 000    | OPS    |
-/// | rdfs:label       | 100 M   | 1 – 100        | OPS    |
-/// | up:sequence      |  10 M   | 1              | OPS    |
-/// | faldo:position   |  11 M   | 1              | OPS    |
-/// | up:organism      |   5 M   | 1 000 – 100 000| OPS    |
-/// | jpo:hasPeptide   |   263   | 10 – 1 000     | POS    |
+/// | Dataset size | rdf:type | threshold (÷1000) | POS cost        | OPS cost      |
+/// |-------------|----------|-------------------|-----------------|---------------|
+/// |  545 M triples | 500 M    |  545 K            | log₂(500M) = 29 | log₂(~10K) ≈ 13 |
+/// |    5 B triples |   5 B    |    5 M            | log₂(5B)   = 32 | log₂(~100K) ≈ 17 |
+/// |   50 B triples |  50 B    |   50 M            | log₂(50B)  = 36 | log₂(~1M)  ≈ 20 |
 ///
-/// The threshold is a constant here but could be exposed in `ecordf.toml`
-/// under `[query]` if fine-tuning becomes necessary.
-const OPS_ROUTING_THRESHOLD: usize = 1_000_000;
+/// OPS consistently wins for hub predicates regardless of scale.
+///
+/// **Example: selective predicate (jpo:hasPeptide, 263 triples)**
+///
+/// | Dataset size | threshold | POS cost         | OPS cost        |
+/// |-------------|-----------|------------------|-----------------|
+/// |  545 M      |  545 K    | log₂(263) ≈ 8   | 1 + log₂(~1) ≈ 1 |
+///
+/// → POS wins (threshold 545K >> 263 → stays in POS).  Correct.
+///
+/// **Semantics of the divisor = 1000:**
+/// A predicate is routed to OPS if it carries > 0.1 % of all triples.
+/// In biological RDF graphs, hub predicates (rdf:type, rdfs:label, …) typically
+/// account for 5–30 % of triples; relationship predicates account for ≪ 0.1 %.
+const OPS_ROUTING_DIVISOR: usize = 1_000;
+const OPS_ROUTING_MIN:     usize = 10_000;      // never route tiny predicates to OPS
+const OPS_ROUTING_MAX:     usize = 50_000_000;  // cap so huge stores don't set threshold too high
 
 impl TripleIndex {
     pub fn open(dir: &Path) -> io::Result<Self> {
@@ -1977,15 +1987,26 @@ impl TripleIndex {
         if pat.s == UNBOUND && pat.p != UNBOUND && pat.o != UNBOUND
             && self.ops.is_some()
         {
+            // Relative threshold: OPS_ROUTING_DIVISOR-th fraction of total triples.
+            // Scales automatically with dataset size — 10× more data → 10× higher
+            // threshold — so the same fraction of "hub predicates" is routed to OPS
+            // regardless of how many triples the store contains.
+            let total = self.triple_count();
+            let threshold = (total / OPS_ROUTING_DIVISOR)
+                .max(OPS_ROUTING_MIN)
+                .min(OPS_ROUTING_MAX);
+
             let pred_size = self.pos.pred_idx.as_ref()
                 .and_then(|pi| pi.get(pat.p))
                 .map(|(lo, hi)| hi - lo)
                 .unwrap_or(0);
-            if pred_size > OPS_ROUTING_THRESHOLD {
+
+            if pred_size > threshold {
                 tracing::trace!(
                     pred = pat.p,
                     pred_size,
-                    threshold = OPS_ROUTING_THRESHOLD,
+                    threshold,
+                    total_triples = total,
                     "index routing: (p+o bound) → OPS (large predicate)"
                 );
                 return IndexKind::Ops;
@@ -1997,8 +2018,9 @@ impl TripleIndex {
     /// Select the best index for a pattern and return matching triples.
     ///
     /// Uses `best_kind()` (statistics-aware) rather than `pat.best_index()`
-    /// (statistics-free), so large predicates in `(p+o)` patterns are routed
-    /// to OPS instead of POS.
+    /// (statistics-free), so hub predicates in `(p+o)` patterns are routed
+    /// to OPS instead of POS based on a relative threshold that scales with
+    /// dataset size.
     ///
     /// When the optimal 6-index is absent (3-index store), falls back to the
     /// nearest existing index:
