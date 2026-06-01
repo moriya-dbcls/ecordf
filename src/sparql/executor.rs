@@ -179,15 +179,25 @@ pub struct Executor<'a> {
     /// In-RAM path cache for multi-hop property paths from rdf-config.
     /// `PathCache::empty()` when no cache is configured.
     pub path_cache: PathCache,
+    /// LIMIT pushdown budget: BGP execution stops once this many rows are
+    /// accumulated, avoiding full-dataset scans for queries with small LIMITs.
+    ///
+    /// Set to `Some(limit + offset)` at the start of `execute_select` when the
+    /// query has no ORDER BY / DISTINCT / GROUP BY (those require all rows).
+    /// Reset to `None` for subqueries so their own LIMIT logic is independent.
+    ///
+    /// Uses `Cell` so it can be updated from `&self` context without changing
+    /// function signatures across the recursive call tree.
+    pushdown_limit: std::cell::Cell<Option<usize>>,
 }
 
 impl<'a> Executor<'a> {
     pub fn new(index: &'a TripleIndex, dict: &'a QueryDict) -> Self {
-        Self { index, dict, config: QueryConfig::default(), stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty() }
+        Self { index, dict, config: QueryConfig::default(), stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), pushdown_limit: std::cell::Cell::new(None) }
     }
 
     pub fn with_config(index: &'a TripleIndex, dict: &'a QueryDict, config: QueryConfig) -> Self {
-        Self { index, dict, config, stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty() }
+        Self { index, dict, config, stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), pushdown_limit: std::cell::Cell::new(None) }
     }
 
     pub fn with_config_and_stats(
@@ -196,7 +206,13 @@ impl<'a> Executor<'a> {
         config: QueryConfig,
         stats: Option<&'a StoreStatistics>,
     ) -> Self {
-        Self { index, dict, config, stats, pred_cache: PredCache::empty(), path_cache: PathCache::empty() }
+        Self { index, dict, config, stats, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), pushdown_limit: std::cell::Cell::new(None) }
+    }
+
+    /// Returns `true` if the current BGP row count has reached the pushdown limit.
+    #[inline]
+    fn is_limit_reached(&self, rows: usize) -> bool {
+        matches!(self.pushdown_limit.get(), Some(lim) if rows >= lim)
     }
 
     /// Builder: attach a predicate cache.
@@ -234,9 +250,31 @@ impl<'a> Executor<'a> {
         let plan_us = t_plan.elapsed().as_micros();
         tracing::debug!(?plan, plan_us, "query plan");
 
+        // LIMIT pushdown: propagate LIMIT into BGP execution when post-processing
+        // does not require all rows (no ORDER BY / DISTINCT / GROUP BY / HAVING /
+        // aggregates).  Stops joins early once `limit + offset` rows are found.
+        // Reset to None after execution so subquery calls don't bleed the limit.
+        let can_pushdown = query.order_by.is_empty()
+            && !query.distinct
+            && query.group_by.is_empty()
+            && query.having.is_empty()
+            && !projection_has_aggregates(query);
+        if can_pushdown {
+            if let Some(lim) = query.limit {
+                let budget = (lim as usize).saturating_add(query.offset.unwrap_or(0) as usize);
+                self.pushdown_limit.set(Some(budget));
+                tracing::debug!(limit = lim, offset = ?query.offset, budget, "LIMIT pushdown enabled");
+            } else {
+                self.pushdown_limit.set(None);
+            }
+        } else {
+            self.pushdown_limit.set(None);
+        }
+
         // 2. Execute
         let t_bgp = Instant::now();
         let mut bindings = self.execute_plan(&plan);
+        self.pushdown_limit.set(None); // clear after BGP so later calls are unaffected
         let bgp_us = t_bgp.elapsed().as_micros();
 
         // Short-circuit: if execution was truncated, return immediately with the
@@ -678,7 +716,13 @@ impl<'a> Executor<'a> {
                 // its DISTINCT / GROUP BY / ORDER BY / LIMIT are applied before
                 // the result is handed back to the outer query as a plain ResultSet.
                 // This is the correct SPARQL 1.1 semantics for { SELECT … } subqueries.
-                self.execute_select(sq)
+                //
+                // Save and restore the outer pushdown_limit so the subquery's own
+                // execute_select (which resets pushdown_limit) doesn't clear ours.
+                let saved = self.pushdown_limit.get();
+                let result = self.execute_select(sq);
+                self.pushdown_limit.set(saved);
+                result
             }
             ExecutionPlan::NamedGraph { graph, inner } => {
                 self.execute_named_graph(graph, inner)
@@ -1366,6 +1410,10 @@ impl<'a> Executor<'a> {
                                 result.overflow = true;
                                 return Some(result);
                             }
+                            if self.is_limit_reached(result.rows.len()) {
+                                tracing::debug!(rows = result.rows.len(), "predicate scan (filter): LIMIT reached, stopping early");
+                                return Some(result);
+                            }
                         }
                     }
                 }
@@ -1433,7 +1481,7 @@ impl<'a> Executor<'a> {
         let triples_matched: usize = s_to_objects.values().map(|v| v.len()).sum();
 
         // Expand: for each (S, O) pair, cross with all left rows sharing that S.
-        for (s_id, objects) in &s_to_objects {
+        'expand: for (s_id, objects) in &s_to_objects {
             let Some(row_indices) = s_to_rows.get(s_id) else { continue; };
             for &o_id in objects {
                 for &row_idx in *row_indices {
@@ -1451,6 +1499,10 @@ impl<'a> Executor<'a> {
                     if result.rows.len() >= self.config.max_intermediate_rows {
                         result.overflow = true;
                         return Some(result);
+                    }
+                    if self.is_limit_reached(result.rows.len()) {
+                        tracing::debug!(rows = result.rows.len(), "predicate scan (join): LIMIT reached, stopping early");
+                        break 'expand;
                     }
                 }
             }
@@ -1700,12 +1752,21 @@ impl<'a> Executor<'a> {
                         result.overflow = true;
                         return result;
                     }
+                    if self.is_limit_reached(result.rows.len()) {
+                        tracing::debug!(rows = result.rows.len(), "bind_join: LIMIT reached, stopping early");
+                        return result;
+                    }
                 }
             }
 
             if right_overflow {
                 result.overflow = true;
                 return result;
+            }
+            // Check limit after finishing a group (catches the case where the
+            // last row of a group exactly hit the limit).
+            if self.is_limit_reached(result.rows.len()) {
+                break;
             }
         }
         tracing::debug!(
