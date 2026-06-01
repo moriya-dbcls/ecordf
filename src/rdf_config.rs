@@ -242,11 +242,40 @@ fn extract_compound_paths(
 
     let mut result: Vec<CompoundPath> = Vec::new();
 
-    // Top level: mapping of class names to their property lists
-    if let Some(top_mapping) = value.as_mapping() {
-        for (_class_name, class_def) in top_mapping {
-            // class_def is a sequence of property specs
-            walk_property_list(class_def, &[], prefixes, &mut result);
+    // rdf-config model.yaml comes in two forms:
+    //
+    //   A) Sequence (the standard rdf-config format):
+    //        - ClassName instance_uri:
+    //          - predicate: ...
+    //      Each list item is a one-key mapping whose value is the property list.
+    //
+    //   B) Plain mapping (used in unit tests and some hand-written files):
+    //        ClassName:
+    //          - predicate: ...
+    //
+    // Handle both so that the parser works with real rdf-config repos as well
+    // as our own test fixtures.
+    match &value {
+        serde_yaml::Value::Mapping(top) => {
+            // Form B: top-level mapping, each value is a property list.
+            for (_class_name, class_def) in top {
+                walk_property_list(class_def, &[], prefixes, &mut result);
+            }
+        }
+        serde_yaml::Value::Sequence(items) => {
+            // Form A: top-level sequence, each item is a one-key mapping
+            // where the key is "ClassName instance_uri" and the value is
+            // the property list.
+            for item in items {
+                if let Some(mapping) = item.as_mapping() {
+                    for (_class_name, class_def) in mapping {
+                        walk_property_list(class_def, &[], prefixes, &mut result);
+                    }
+                }
+            }
+        }
+        _ => {
+            // Unknown structure — return empty rather than error.
         }
     }
 
@@ -297,8 +326,16 @@ fn walk_property_item(
             continue;
         }
 
-        // Predicate key: resolve prefix and extend the path
-        let Some(pred_str) = key.as_str() else { continue };
+        // Predicate key: resolve prefix and extend the path.
+        //
+        // rdf-config appends cardinality markers to predicate keys:
+        //   jpost:hasPeptide+   → one-or-more
+        //   jpost:hasPsm*       → zero-or-more
+        //   jpost:hasIsoform?   → zero-or-one
+        // Strip these before IRI resolution so the resulting IRI matches
+        // what is actually stored in the triple store.
+        let Some(pred_str_raw) = key.as_str() else { continue };
+        let pred_str = pred_str_raw.trim_end_matches(|c| c == '+' || c == '*' || c == '?');
         let resolved = resolve_iri(pred_str, prefixes);
 
         let mut new_path: Vec<String> = current_path.to_vec();
@@ -408,13 +445,7 @@ faldo: http://biohackathon.org/resource/faldo#
 up: http://purl.uniprot.org/core/
 xsd: http://www.w3.org/2001/XMLSchema#
 ";
-        // A two-hop path through a blank node:
-        // MyClass:
-        //   - up:range:
-        //     - []:
-        //       - faldo:begin:
-        //         - []:
-        //           - faldo:position: xsd:integer
+        // Form B (mapping): MyClass: - up:range: ...
         let model_yaml = "
 MyClass:
   - up:range:
@@ -426,16 +457,84 @@ MyClass:
         let prefixes = parse_prefix_yaml(prefix_yaml).unwrap();
         let paths = extract_compound_paths(model_yaml, &prefixes).unwrap();
 
-        // We expect compound paths of length ≥ 2
-        let two_hop: Vec<_> = paths.iter()
-            .filter(|p| p.len() == 2)
-            .collect();
+        let two_hop: Vec<_> = paths.iter().filter(|p| p.len() == 2).collect();
         assert!(
             two_hop.iter().any(|p|
                 p[0] == "<http://purl.uniprot.org/core/range>" &&
                 p[1] == "<http://biohackathon.org/resource/faldo#begin>"
             ),
             "expected [up:range, faldo:begin] in paths; got: {:?}", paths
+        );
+    }
+
+    #[test]
+    fn test_extract_paths_sequence_format() {
+        // Form A (sequence): actual rdf-config format with leading "-"
+        // Also tests cardinality suffix stripping (+, *, ?)
+        let prefix_yaml = "
+faldo: http://biohackathon.org/resource/faldo#
+jpost: http://rdf.jpostdb.org/ontology/jpost.owl#
+";
+        let model_yaml = "
+- Protein jpostdb:PRT001:
+  - jpost:hasPeptideEvidence+:
+    - []:
+      - a: jpost:PeptideEvidence
+      - faldo:location:
+        - []:
+          - a: faldo:Region
+          - faldo:begin:
+            - []:
+              - faldo:position: xsd:integer
+";
+        let prefixes = parse_prefix_yaml(prefix_yaml).unwrap();
+        let paths = extract_compound_paths(model_yaml, &prefixes).unwrap();
+
+        // Should find [hasPeptideEvidence, faldo:location], [hasPeptideEvidence, faldo:location, faldo:begin], etc.
+        // Cardinality '+' must be stripped from jpost:hasPeptideEvidence+
+        assert!(
+            !paths.is_empty(),
+            "expected compound paths from sequence-format model.yaml, got none"
+        );
+        // faldo:location should appear in at least one path
+        let has_location = paths.iter().any(|p| p.iter().any(|iri| iri.contains("faldo#location")));
+        assert!(has_location, "expected faldo:location in some compound path; got: {:?}", paths);
+        // faldo:begin should appear (without '+' contamination)
+        let has_begin = paths.iter().any(|p| p.iter().any(|iri| iri == "<http://biohackathon.org/resource/faldo#begin>"));
+        assert!(has_begin, "expected bare faldo:begin IRI; got: {:?}", paths);
+    }
+
+    #[test]
+    fn test_cardinality_suffix_stripped() {
+        // Predicates with +, *, ? suffixes must produce clean IRIs
+        let prefix_yaml = "jpost: http://rdf.jpostdb.org/ontology/jpost.owl#\n";
+        let model_yaml = "
+- Cls:
+  - jpost:hasA+:
+    - []:
+      - jpost:hasB*:
+        - []:
+          - jpost:hasC?: value
+";
+        let prefixes = parse_prefix_yaml(prefix_yaml).unwrap();
+        let paths = extract_compound_paths(model_yaml, &prefixes).unwrap();
+        let base = "http://rdf.jpostdb.org/ontology/jpost.owl#";
+        // All IRIs must be clean (no +, *, ? at end)
+        for path in &paths {
+            for iri in path {
+                assert!(
+                    !iri.ends_with("+>") && !iri.ends_with("*>") && !iri.ends_with("?>"),
+                    "cardinality suffix leaked into IRI: {}", iri
+                );
+            }
+        }
+        // Should still find paths
+        let two_hop = paths.iter().filter(|p| p.len() == 2).count();
+        assert!(two_hop > 0, "expected length-2 paths; got: {:?}", paths);
+        // Check specific clean IRI
+        assert!(
+            paths.iter().any(|p| p[0] == format!("<{}hasA>", base)),
+            "expected clean <jpost:hasA> IRI, got: {:?}", paths
         );
     }
 
