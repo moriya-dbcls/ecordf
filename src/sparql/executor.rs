@@ -2304,10 +2304,24 @@ impl<'a> Executor<'a> {
 
     fn eval_aggregate(&self, expr: &Expression, rows: &[Vec<Option<TermId>>], rs: &ResultSet) -> Option<TermId> {
         match expr {
-            Expression::Count { expr: inner, .. } => {
+            Expression::Count { distinct, expr: inner } => {
                 let count = if inner.is_none() {
+                    // COUNT(*) — count all rows in the group.
                     rows.len()
+                } else if *distinct {
+                    // COUNT(DISTINCT ?x) — collect distinct TermId values.
+                    let mut seen = HashSet::new();
+                    for row in rows {
+                        let b = row_to_binding(&rs.variables, row);
+                        if let Some(inner_expr) = inner {
+                            if let Some(id) = self.eval_term(inner_expr, &b) {
+                                seen.insert(id);
+                            }
+                        }
+                    }
+                    seen.len()
                 } else {
+                    // COUNT(?x) — count rows where ?x is bound.
                     rows.iter().filter(|row| {
                         let b = row_to_binding(&rs.variables, row);
                         if let Some(inner_expr) = inner {
@@ -2318,17 +2332,23 @@ impl<'a> Executor<'a> {
                 let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", count);
                 Some(self.dict.encode(&s))
             }
-            Expression::Sum { expr, .. } => {
-                let mut sum = 0.0f64;
-                for row in rows {
-                    let b = row_to_binding(&rs.variables, row);
-                    if let Some(id) = self.eval_term(expr, &b) {
-                        let sv = self.dict.decode(id);
-                        if let Some(v) = parse_numeric(&sv) {
-                            sum += v;
-                        }
-                    }
-                }
+            Expression::Sum { distinct, expr } => {
+                // Collect bound TermIds, optionally deduplicating.
+                let ids: Vec<TermId> = if *distinct {
+                    let mut seen = HashSet::new();
+                    rows.iter().filter_map(|row| {
+                        let b = row_to_binding(&rs.variables, row);
+                        self.eval_term(expr, &b).filter(|id| seen.insert(*id))
+                    }).collect()
+                } else {
+                    rows.iter().filter_map(|row| {
+                        let b = row_to_binding(&rs.variables, row);
+                        self.eval_term(expr, &b)
+                    }).collect()
+                };
+                let sum: f64 = ids.iter().filter_map(|&id| {
+                    parse_numeric(&self.dict.decode(id))
+                }).sum();
                 let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#decimal>", sum);
                 Some(self.dict.encode(&s))
             }
@@ -2358,14 +2378,23 @@ impl<'a> Executor<'a> {
                     self.dict.encode(&s)
                 })
             }
-            Expression::Avg { expr, .. } => {
-                let vals: Vec<f64> = rows.iter().filter_map(|row| {
-                    let b = row_to_binding(&rs.variables, row);
-                    self.eval_term(expr, &b).and_then(|id| {
-                        let sv = self.dict.decode(id);
-                        parse_numeric(&sv)
-                    })
-                }).collect();
+            Expression::Avg { distinct, expr } => {
+                let vals: Vec<f64> = if *distinct {
+                    let mut seen = HashSet::new();
+                    rows.iter().filter_map(|row| {
+                        let b = row_to_binding(&rs.variables, row);
+                        self.eval_term(expr, &b)
+                            .filter(|id| seen.insert(*id))
+                            .and_then(|id| parse_numeric(&self.dict.decode(id)))
+                    }).collect()
+                } else {
+                    rows.iter().filter_map(|row| {
+                        let b = row_to_binding(&rs.variables, row);
+                        self.eval_term(expr, &b).and_then(|id| {
+                            parse_numeric(&self.dict.decode(id))
+                        })
+                    }).collect()
+                };
                 if vals.is_empty() { return None; }
                 let avg = vals.iter().sum::<f64>() / vals.len() as f64;
                 let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#decimal>", avg);
@@ -2381,13 +2410,21 @@ impl<'a> Executor<'a> {
                 }
                 None
             }
-            // GROUP_CONCAT(?x; separator="...") — concatenate all values.
-            Expression::GroupConcat { expr, separator, .. } => {
+            // GROUP_CONCAT(?x [DISTINCT]; separator="...") — concatenate values.
+            Expression::GroupConcat { distinct, expr, separator } => {
                 let sep = separator.as_deref().unwrap_or(" ");
-                let parts: Vec<String> = rows.iter().filter_map(|row| {
-                    let b = row_to_binding(&rs.variables, row);
-                    self.eval_string(expr, &b)
-                }).collect();
+                let parts: Vec<String> = if *distinct {
+                    let mut seen = HashSet::new();
+                    rows.iter().filter_map(|row| {
+                        let b = row_to_binding(&rs.variables, row);
+                        self.eval_string(expr, &b).filter(|s| seen.insert(s.clone()))
+                    }).collect()
+                } else {
+                    rows.iter().filter_map(|row| {
+                        let b = row_to_binding(&rs.variables, row);
+                        self.eval_string(expr, &b)
+                    }).collect()
+                };
                 if parts.is_empty() { return None; }
                 let joined = parts.join(sep);
                 Some(self.dict.encode(&format!("\"{}\"", joined)))
