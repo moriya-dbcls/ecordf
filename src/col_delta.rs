@@ -46,7 +46,18 @@ use memmap2::Mmap;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
+/// ECOCOL02: standard encoding — all blocks are exactly `DELTA_BLOCK_SIZE`
+/// entries (except the last which may be smaller).  Block index entry = 16 B:
+/// `(first_value: u64, byte_offset: u64)`.
 pub const DELTA_MAGIC: &[u8; 8] = b"ECOCOL02";
+
+/// ECOCOL03: pred-aligned encoding — blocks may be smaller than
+/// `DELTA_BLOCK_SIZE` at predicate boundaries.  Block index entry = 24 B:
+/// `(first_value: u64, byte_offset: u64, start_pos: u64)`.
+/// `start_pos` is the cumulative logical index of the first entry in that block,
+/// stored explicitly so `DeltaColFile::open` never needs to scan block headers.
+pub const DELTA_MAGIC_V3: &[u8; 8] = b"ECOCOL03";
+
 pub const DELTA_HDR: usize = 32; // magic(8)+count(8)+block_count(8)+idx_offset(8)
 pub const DELTA_BLOCK_SIZE: usize = 256;
 
@@ -211,36 +222,33 @@ fn decode_block(data: &[u8], offset: usize, out: &mut Vec<u64>) -> usize {
 
 /// A memory-mapped delta-encoded column file with a loaded block index.
 ///
-/// Provides O(log block_count) access to any value and efficient sequential
-/// iteration via [`DeltaColIter`].
+/// Supports two on-disk formats:
 ///
-/// ## Variable-sized blocks
+/// - **ECOCOL02** (`encode_column`): all blocks are exactly `DELTA_BLOCK_SIZE`
+///   entries (except the last).  Block index entry = 16 B.
+///   `start_positions[i] = i * DELTA_BLOCK_SIZE` — zero I/O at open.
 ///
-/// [`encode_column_pred_aligned`] may produce blocks smaller than
-/// `DELTA_BLOCK_SIZE` at predicate boundaries.  `start_positions[i]` holds the
-/// cumulative logical start position of block `i`, computed once at open time
-/// by scanning each block's `count_m1` byte.  All random-access methods
-/// (`get`, `lower_bound`, `iter_from`) use a binary search on `start_positions`
-/// instead of the old `pos / DELTA_BLOCK_SIZE` division, so they work correctly
-/// regardless of block size.
+/// - **ECOCOL03** (`encode_column_pred_aligned`): blocks may be shorter at
+///   predicate boundaries.  Block index entry = 24 B, third field = `start_pos`.
+///   Loaded directly from the index section — zero extra I/O at open.
 pub struct DeltaColFile {
-    /// Keep both the `File` handle and `Mmap` alive together.
     _file: File,
     mmap:  Mmap,
-    /// Total number of u64 values in the column.
     pub count: usize,
-    /// `(first_value, byte_offset_of_block)` for each block.
+    /// `(first_value, byte_offset)` for each block.
     block_index: Vec<(u64, u64)>,
     /// `start_positions[i]` = logical index of the first entry in block `i`.
-    /// Derived from `count_m1` bytes at open time; supports variable block sizes.
+    ///
+    /// ECOCOL02: computed as `i * DELTA_BLOCK_SIZE` (no I/O).
+    /// ECOCOL03: read directly from the 24-byte block index entries (no I/O).
     start_positions: Vec<usize>,
+    /// True when all blocks are exactly DELTA_BLOCK_SIZE (except the last),
+    /// allowing `pos / DELTA_BLOCK_SIZE` as a fast O(1) block lookup.
+    fixed_size: bool,
 }
 
 impl DeltaColFile {
-    /// Open and memory-map a delta-encoded column file.
-    ///
-    /// Loads the block index and derives `start_positions` (one sequential scan
-    /// of block headers, ≈ 2 bytes per block).
+    /// Open and memory-map a delta-encoded column file (ECOCOL02 or ECOCOL03).
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -248,38 +256,50 @@ impl DeltaColFile {
         if mmap.len() < DELTA_HDR {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "delta col too small"));
         }
-        if &mmap[0..8] != DELTA_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad delta col magic"));
+
+        let magic = &mmap[0..8];
+        let is_v3 = magic == DELTA_MAGIC_V3;
+        if !is_v3 && magic != DELTA_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("bad delta col magic: {:?}", &mmap[0..8])));
         }
 
         let count       = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
         let block_count = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
         let idx_offset  = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
 
-        if mmap.len() < idx_offset + block_count * 16 {
+        let entry_bytes = if is_v3 { 24 } else { 16 };
+        if mmap.len() < idx_offset + block_count * entry_bytes {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated block index"));
         }
 
-        let mut block_index = Vec::with_capacity(block_count);
+        let mut block_index      = Vec::with_capacity(block_count);
+        let mut start_positions  = Vec::with_capacity(block_count);
+
         for i in 0..block_count {
-            let base_off = idx_offset + i * 16;
-            let first_val = u64::from_le_bytes(mmap[base_off..base_off+8].try_into().unwrap());
-            let byte_off  = u64::from_le_bytes(mmap[base_off+8..base_off+16].try_into().unwrap());
+            let base_off  = idx_offset + i * entry_bytes;
+            let first_val = u64::from_le_bytes(mmap[base_off     ..base_off+8 ].try_into().unwrap());
+            let byte_off  = u64::from_le_bytes(mmap[base_off+8   ..base_off+16].try_into().unwrap());
             block_index.push((first_val, byte_off));
+
+            if is_v3 {
+                // start_pos stored explicitly — no extra I/O, no mmap touching.
+                let sp = u64::from_le_bytes(mmap[base_off+16..base_off+24].try_into().unwrap());
+                start_positions.push(sp as usize);
+            } else {
+                // ECOCOL02: fixed-size blocks, start_pos is trivially i * BLOCK_SIZE.
+                start_positions.push(i * DELTA_BLOCK_SIZE);
+            }
         }
 
-        // Derive start_positions from count_m1 byte of each block header.
-        // Block header layout: enc(1) + count_m1(1) + base_val(8) + deltas…
-        // count_m1 = (entries_in_block - 1), so entries = count_m1 + 1.
-        let mut start_positions = Vec::with_capacity(block_count);
-        let mut pos = 0usize;
-        for &(_, byte_off) in &block_index {
-            start_positions.push(pos);
-            let count_m1 = mmap[byte_off as usize + 1] as usize;
-            pos += count_m1 + 1;
-        }
-
-        Ok(Self { _file: file, mmap, count, block_index, start_positions })
+        Ok(Self {
+            _file: file,
+            mmap,
+            count,
+            block_index,
+            start_positions,
+            fixed_size: !is_v3,
+        })
     }
 
     /// Decompress the block at `block_idx` into `out`.
@@ -288,23 +308,23 @@ impl DeltaColFile {
         decode_block(&self.mmap, offset, out);
     }
 
-    /// Find the block index that contains logical position `pos`.
+    /// Find `(block_idx, offset_within_block)` for logical position `pos`.
     ///
-    /// Uses binary search on `start_positions` — works for both fixed-size
-    /// (standard `encode_column`) and variable-size (pred-aligned) blocks.
+    /// ECOCOL02 (fixed-size): O(1) division.
+    /// ECOCOL03 (variable-size): O(log block_count) binary search.
     #[inline]
     fn block_for_pos(&self, pos: usize) -> (usize, usize) {
-        // block_idx = last i where start_positions[i] <= pos
-        let block_idx = self.start_positions.partition_point(|&sp| sp <= pos)
-            .saturating_sub(1);
-        let block_offset = pos - self.start_positions[block_idx];
-        (block_idx, block_offset)
+        if self.fixed_size {
+            (pos / DELTA_BLOCK_SIZE, pos % DELTA_BLOCK_SIZE)
+        } else {
+            let block_idx = self.start_positions
+                .partition_point(|&sp| sp <= pos)
+                .saturating_sub(1);
+            (block_idx, pos - self.start_positions[block_idx])
+        }
     }
 
     /// Return the value at logical position `pos`.
-    ///
-    /// O(BLOCK_SIZE) decompression work per call.  Use [`DeltaColIter`] for
-    /// sequential scanning to amortise decompression across the block.
     pub fn get(&self, pos: usize) -> u64 {
         let (block_idx, block_offset) = self.block_for_pos(pos);
         let mut buf = Vec::with_capacity(DELTA_BLOCK_SIZE);
@@ -313,34 +333,27 @@ impl DeltaColFile {
     }
 
     /// Return the index of the first block whose `first_value > target`.
-    /// Used to narrow the search range for `lower_bound`.
     pub fn block_upper_bound(&self, target: u64) -> usize {
         self.block_index.partition_point(|&(fv, _)| fv <= target)
     }
 
     /// Find the position of the first value `>= target` (lower bound).
-    ///
-    /// Uses the block index for O(log block_count) narrowing, then linear
-    /// scan within at most one block.
     pub fn lower_bound(&self, target: u64) -> usize {
         if self.block_index.is_empty() {
             return 0;
         }
-        // Last block whose first_value <= target.
         let bub = self.block_upper_bound(target);
         let block_start = if bub == 0 { 0 } else { bub - 1 };
 
         let mut buf = Vec::with_capacity(DELTA_BLOCK_SIZE);
         self.decompress_block(block_start, &mut buf);
 
-        // base_pos: logical start of this block (works for variable-size blocks)
         let base_pos = self.start_positions[block_start];
         for (i, &v) in buf.iter().enumerate() {
             if v >= target {
                 return base_pos + i;
             }
         }
-        // Target is in the next block or beyond the end.
         if block_start + 1 < self.start_positions.len() {
             self.start_positions[block_start + 1]
         } else {
@@ -367,8 +380,7 @@ pub struct DeltaColIter<'a> {
 
 impl<'a> DeltaColIter<'a> {
     fn new(col: &'a DeltaColFile, start_pos: usize) -> Self {
-        // Use block_for_pos so variable-size blocks are handled correctly.
-        let (block_idx, buf_pos) = if start_pos < col.count && !col.start_positions.is_empty() {
+        let (block_idx, buf_pos) = if start_pos < col.count && !col.block_index.is_empty() {
             col.block_for_pos(start_pos)
         } else {
             (col.block_index.len(), 0)
@@ -451,28 +463,29 @@ pub fn encode_column_pred_aligned(
     let f = File::create(path)?;
     let mut w = BufWriter::with_capacity(8 * 1024 * 1024, f);
 
-    w.write_all(DELTA_MAGIC)?;
+    // ECOCOL03: write new magic so open() knows block index entries are 24 bytes.
+    w.write_all(DELTA_MAGIC_V3)?;
     w.write_all(&(count as u64).to_le_bytes())?;
     w.write_all(&0u64.to_le_bytes())?; // block_count placeholder
     w.write_all(&0u64.to_le_bytes())?; // block_idx_offset placeholder
 
-    let mut block_index: Vec<(u64, u64)> = Vec::new();
+    // (first_value, byte_offset, start_pos) — 24 bytes per entry.
+    let mut block_index: Vec<(u64, u64, u64)> = Vec::new();
     let mut byte_pos: u64 = DELTA_HDR as u64;
+    let mut logical_pos: usize = 0; // cumulative entry count = start_pos of next block
 
     let mut pos = 0usize;
-    let mut force_idx = 0usize; // index into force_starts
+    let mut force_idx = 0usize;
 
     while pos < count {
         let base = values[pos];
 
-        // Determine the end of this block: min(pos + DELTA_BLOCK_SIZE, next_boundary, count)
         let natural_end = (pos + DELTA_BLOCK_SIZE).min(count);
         let forced_end = if force_idx < force_starts.len() && force_starts[force_idx] > pos {
             force_starts[force_idx].min(natural_end)
         } else {
             natural_end
         };
-        // Advance force_idx past any boundaries we are consuming.
         while force_idx < force_starts.len() && force_starts[force_idx] <= forced_end {
             force_idx += 1;
         }
@@ -480,23 +493,16 @@ pub fn encode_column_pred_aligned(
         let chunk = &values[pos..forced_end];
         let n = chunk.len();
 
-        block_index.push((base, byte_pos));
+        block_index.push((base, byte_pos, logical_pos as u64));
 
         let max_delta = if n == 1 { 0 } else {
             chunk[1..].iter().fold(0u64, |acc, &v| acc.max(v - base))
         };
-
-        let enc = if max_delta == 0 {
-            ENC_ALL_SAME
-        } else if max_delta <= u8::MAX as u64 {
-            ENC_U8
-        } else if max_delta <= u16::MAX as u64 {
-            ENC_U16
-        } else if max_delta <= u32::MAX as u64 {
-            ENC_U32
-        } else {
-            ENC_U64
-        };
+        let enc = if max_delta == 0 { ENC_ALL_SAME }
+                  else if max_delta <= u8::MAX  as u64 { ENC_U8  }
+                  else if max_delta <= u16::MAX as u64 { ENC_U16 }
+                  else if max_delta <= u32::MAX as u64 { ENC_U32 }
+                  else                                  { ENC_U64 };
 
         let count_m1 = (n - 1) as u8;
         w.write_all(&[enc, count_m1])?;
@@ -504,36 +510,26 @@ pub fn encode_column_pred_aligned(
 
         match enc {
             ENC_ALL_SAME => { byte_pos += 2 + 8; }
-            ENC_U8 => {
-                for &v in &chunk[1..] { w.write_all(&[(v - base) as u8])?; }
-                byte_pos += 2 + 8 + (n - 1) as u64;
-            }
-            ENC_U16 => {
-                for &v in &chunk[1..] { w.write_all(&((v - base) as u16).to_le_bytes())?; }
-                byte_pos += 2 + 8 + (n - 1) as u64 * 2;
-            }
-            ENC_U32 => {
-                for &v in &chunk[1..] { w.write_all(&((v - base) as u32).to_le_bytes())?; }
-                byte_pos += 2 + 8 + (n - 1) as u64 * 4;
-            }
-            _ => {
-                for &v in &chunk[1..] { w.write_all(&v.to_le_bytes())?; }
-                byte_pos += 2 + 8 + (n - 1) as u64 * 8;
-            }
+            ENC_U8  => { for &v in &chunk[1..] { w.write_all(&[(v-base) as u8])?; }       byte_pos += 2+8+(n-1) as u64; }
+            ENC_U16 => { for &v in &chunk[1..] { w.write_all(&((v-base) as u16).to_le_bytes())?; } byte_pos += 2+8+(n-1) as u64*2; }
+            ENC_U32 => { for &v in &chunk[1..] { w.write_all(&((v-base) as u32).to_le_bytes())?; } byte_pos += 2+8+(n-1) as u64*4; }
+            _       => { for &v in &chunk[1..] { w.write_all(&v.to_le_bytes())?; }         byte_pos += 2+8+(n-1) as u64*8; }
         }
 
+        logical_pos += n;
         pos = forced_end;
     }
 
-    // Write block index.
+    // Write 24-byte block index entries: (first_value, byte_offset, start_pos).
     let idx_offset = byte_pos;
     let block_count = block_index.len();
-    for (first_val, offset) in &block_index {
+    for (first_val, byte_off, start_pos) in &block_index {
         w.write_all(&first_val.to_le_bytes())?;
-        w.write_all(&offset.to_le_bytes())?;
+        w.write_all(&byte_off.to_le_bytes())?;
+        w.write_all(&start_pos.to_le_bytes())?;
     }
 
-    // Back-patch header: block_count at offset 16, block_idx_offset at offset 24.
+    // Back-patch block_count (offset 16) and idx_offset (offset 24).
     let mut f = w.into_inner().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     f.seek(SeekFrom::Start(16))?;
     f.write_all(&(block_count as u64).to_le_bytes())?;
