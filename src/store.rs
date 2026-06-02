@@ -355,6 +355,19 @@ impl Store {
         // Cleanup entire tmp dir (dict_sorted.bin + any remaining chunk dirs)
         let _ = fs::remove_dir_all(&tmp_dir);
 
+        // ── Auto compress-cols (build.auto_compress_cols = true) ──────────────
+        if config.build.auto_compress_cols {
+            eprintln!("Auto-compressing column files (build.auto_compress_cols = true)…");
+            let t_compress = Instant::now();
+            match crate::index::TripleIndex::compress_columns(dir, false) {
+                Ok(n) => eprintln!(
+                    "Column compression done: {} file(s) in {:.1}s.",
+                    n, t_compress.elapsed().as_secs_f64()
+                ),
+                Err(e) => eprintln!("Warning: column compression failed — {e}"),
+            }
+        }
+
         // Open query-time dictionary from the persisted mmap file.
         let dict = QueryDict::from_mmap(ReadonlyDict::open(&store_dict_sorted)?);
         let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;

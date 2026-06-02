@@ -83,6 +83,17 @@ enum Command {
         ///   ecordf build --dir ./store --resume-phase2 --from-file inputs.txt
         #[arg(long, default_value_t = false)]
         resume_phase2: bool,
+
+        /// ビルド完了後にデルタ圧縮（compress-cols）を自動実行する。
+        ///
+        /// ecordf.toml の `build.auto_compress_cols` より優先される。
+        ///
+        /// 【推奨環境】
+        ///   HDD / SATA SSD: 強く推奨。I/O が支配的なため 8× 圧縮の効果が大きい。
+        ///   NVMe SSD: 任意。ディスク節約目的なら有効。クエリ速度への影響は小さい。
+        ///   NVMe + 大容量 RAM (ほぼページキャッシュ): 不要。展開コストが逆効果になりうる。
+        #[arg(long, default_value_t = false)]
+        auto_compress_cols: bool,
     },
 
     /// Start the SPARQL 1.1 HTTP endpoint
@@ -330,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Build { dir, files, from_file, resume_phase2 } => {
+        Command::Build { dir, files, from_file, resume_phase2, auto_compress_cols } => {
             let inputs = resolve_input_files(files, from_file)?;
             if inputs.is_empty() {
                 anyhow::bail!(
@@ -338,11 +349,23 @@ async fn main() -> anyhow::Result<()> {
                      Pass files directly, or use --from-file <list> (or --from-file - to read from stdin)."
                 );
             }
-            let store = if resume_phase2 {
+            // CLI flag overrides config file.
+            let mut store = if resume_phase2 {
                 Store::load_with_graphs_resume_phase2(&dir, &inputs)?
             } else {
                 Store::load_with_graphs(&dir, &inputs)?
             };
+            if auto_compress_cols && !store.config.build.auto_compress_cols {
+                // CLI flag set but config didn't trigger it yet — run now.
+                eprintln!("Auto-compressing column files (--auto-compress-cols)…");
+                let t = std::time::Instant::now();
+                match ecordf::index::TripleIndex::compress_columns(&dir, false) {
+                    Ok(n) => eprintln!("Column compression done: {} file(s) in {:.1}s.", n, t.elapsed().as_secs_f64()),
+                    Err(e) => eprintln!("Warning: column compression failed — {e}"),
+                }
+                store.config.build.auto_compress_cols = true;
+            }
+            let store = store;
             let stats = store.stats();
             if stats.graph_count > 0 {
                 println!(

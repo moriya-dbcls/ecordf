@@ -90,6 +90,32 @@ dict_chunk_mb = 200
 #
 parallel_threads = 0
 
+# ビルド完了後にデルタ圧縮（compress-cols）を自動実行する。
+#
+# true にすると `ecordf build` が完了した直後に全列ファイルを自動圧縮する。
+# false（デフォルト）の場合は `ecordf compress-cols --dir <store>` で別途実行。
+#
+# 推奨環境:
+#   HDD (7200rpm など)    → true を強く推奨
+#     I/O が支配的。8× 圧縮で読み出し時間が 8× 短縮。
+#     デルタ展開コスト（~50ns/ブロック）は I/O 削減に比べ無視できる。
+#
+#   SATA SSD (~500 MB/s)  → true を推奨
+#     帯域がデルタ展開速度（~1–2 GB/s）より遅く、依然 I/O ボトルネック。
+#     ディスク使用量も 1/4～1/8 に削減。
+#
+#   NVMe SSD (3–7 GB/s)   → 任意
+#     帯域とデルタ展開速度が近く効果は小さい。ディスク節約目的なら有効。
+#     クエリ速度への影響は ±5% 程度。
+#
+#   NVMe + 大容量 RAM（データがほぼページキャッシュに乗る環境）
+#                         → false を検討
+#     キャッシュ済みならデルタ展開コストの方が高くつく場合がある。
+#     raw .c0/.c1/.c2 の方が速い可能性がある。
+#
+# CLI フラグ --auto-compress-cols でも指定可能（フラグが優先）。
+auto_compress_cols = false
+
 # ── Query execution tunables ──────────────────────────────────────────────────
 
 [query]
@@ -326,3 +352,24 @@ rdf_configs = []
 #
 # Overridable with --path-cache-mb on the command line (CLI value wins when > 0).
 path_cache_mb = 0
+
+# ── TypeCache ──────────────────────────────────────────────────────────────────
+# RAM budget (MiB) for the per-class subject membership cache.
+# Turns `?x a SomeClass` filter steps from POS scans into O(log N) binary
+# searches, eliminating multi-second type-filter costs on large predicates.
+# 0 = disabled.
+type_cache_mb = 256
+
+# ── Query timeout ─────────────────────────────────────────────────────────────
+# Per-query wall-clock timeout in seconds. 0 = no timeout (default).
+# When a query exceeds this limit, the executor is cancelled at its next inner-
+# loop checkpoint and the client receives HTTP 408.
+# Recommended when EcoRDF shares a host with other services (e.g. 120).
+query_timeout_secs = 0
+
+# ── MADV_DONTNEED after large scans ───────────────────────────────────────────
+# Release page-cache pages after sequential index scans larger than this (MiB).
+# 0 = disabled (default). Prevents EcoRDF from monopolising the page cache.
+# Enable (e.g. 1024) when co-located with other services.
+# Trade-off: subsequent identical scans will be cold again.
+scan_dontneed_mb = 0

@@ -178,6 +178,28 @@ pub struct BuildConfig {
     ///
     /// Set to 1 if you hit memory pressure on a machine with many cores.
     pub parallel_threads: usize,
+
+    /// Automatically run delta compression (`compress-cols`) after `ecordf build`.
+    ///
+    /// When `true`, EcoRDF calls `compress-cols` immediately after writing the
+    /// raw column files (`.c0`, `.c1`, `.c2`), replacing them with delta-encoded
+    /// `.dz` files before the build command exits.  This combines the two steps
+    /// into one and ensures the store is always served in its optimal format.
+    ///
+    /// ## いつ有効にするか（推奨環境）
+    ///
+    /// | 環境 | 推奨 | 理由 |
+    /// |------|------|------|
+    /// | HDD（7200rpm など）| **true を強く推奨** | I/O が支配的。8× 圧縮で読み出し時間が 8× 短縮。展開コストは I/O 削減に比べ無視できる |
+    /// | SATA SSD | **true を推奨** | SSD 帯域（500 MB/s 程度）はデルタ展開速度（1–2 GB/s）より遅いため依然 I/O ボトルネック |
+    /// | NVMe SSD | **どちらでも可** | NVMe 帯域（3–7 GB/s）はデルタ展開速度に近く、圧縮の効果が小さい。ディスク節約が目的なら true |
+    /// | NVMe + 大容量 RAM（データがほぼページキャッシュに乗る）| **false を検討** | キャッシュ済みなら展開コストの方が高くつく場合がある |
+    ///
+    /// デフォルト `false` — 明示的に `compress-cols` を実行するか、このフラグを `true` に
+    /// することで圧縮を有効にする。既存ストアへの再適用は `ecordf compress-cols --force` を使う。
+    ///
+    /// Overridable with `--auto-compress-cols` on the command line.
+    pub auto_compress_cols: bool,
 }
 
 impl Default for BuildConfig {
@@ -186,6 +208,7 @@ impl Default for BuildConfig {
             chunk_size: 5_000_000,
             dict_chunk_mb: 200,
             parallel_threads: 0,
+            auto_compress_cols: false,
         }
     }
 }
