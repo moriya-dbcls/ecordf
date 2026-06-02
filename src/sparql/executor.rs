@@ -1453,9 +1453,25 @@ impl<'a> Executor<'a> {
         let free_var_name = &free_vars[0].0;
         let outer_var_name = &outer_vars[0].0;
 
-        // Collect unique subjects from PSO (no subject filter: we want any push_limit subjects).
+        // Build a subject filter from the left side so PSO only returns subjects
+        // that are actually present in the left result.
+        //
+        // Without this filter the PSO scan returns the first `push_limit` subjects
+        // in PSO index order (arbitrary IDs), which may have zero overlap with the
+        // left result, producing an incorrect empty output.
+        //
+        // Skip the filter when left is very small (< push_limit × 4) — the early
+        // exit condition above already handles that case — or when the left
+        // column index is out of range.
+        let left_subjects: HashSet<TermId> = left.rows.iter()
+            .filter_map(|row| row.get(*subj_col).copied().flatten())
+            .collect();
+
+        if left_subjects.is_empty() { return None; }
+
+        // Collect unique subjects from PSO, restricted to left_subjects.
         let (s_to_objects, _exhausted) = self.index.scan_pso_subject_limit(
-            base.p, push_limit, &HashSet::new()
+            base.p, push_limit, &left_subjects
         );
 
         if s_to_objects.is_empty() { return None; }
