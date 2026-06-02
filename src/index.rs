@@ -1533,10 +1533,24 @@ impl IndexFile {
     // ── Scan API ──────────────────────────────────────────────────────────────
 
     /// Scan the index for all triples matching `pat`. Yields triples in SPO order.
+    ///
+    /// For DeltaColumnar storage, builds a `DeltaScanState` that uses three
+    /// `DeltaColIter`s so each entry costs O(1) amortised instead of O(BLOCK_SIZE).
     pub fn scan(&self, pat: &TriplePattern) -> TripleScan {
         let raw_pat = pattern_to_raw(*pat, self.kind);
         let (start, end) = self.range_for_pattern(&raw_pat);
-        TripleScan { index: self, raw_pat, pos: start, end }
+        let delta = if let IndexStorage::DeltaColumnar { cols } = &self.storage {
+            let remaining = end.saturating_sub(start);
+            Some(DeltaScanState {
+                iter0: cols[0].iter_from(start),
+                iter1: cols[1].iter_from(start),
+                iter2: cols[2].iter_from(start),
+                remaining,
+            })
+        } else {
+            None
+        };
+        TripleScan { index: self, raw_pat, pos: start, end, delta }
     }
 
     /// Compute the [start, end) range in the index that covers `raw`.
@@ -1688,25 +1702,55 @@ impl IndexFile {
 
 // ── Iterator over matching triples ───────────────────────────────────────────
 
+/// Internal state for delta-columnar scans.
+///
+/// Holds three `DeltaColIter`s that advance in lockstep, decompressing one
+/// 256-entry block per iterator step instead of one entry per step.
+///
+/// Without this, `TripleScan::next` would call `DeltaColFile::get(pos)` for
+/// each position which decompresses the entire block (256 entries) and throws
+/// away 255 — making sequential scans O(N × BLOCK_SIZE) instead of O(N).
+struct DeltaScanState<'a> {
+    iter0: crate::col_delta::DeltaColIter<'a>,
+    iter1: crate::col_delta::DeltaColIter<'a>,
+    iter2: crate::col_delta::DeltaColIter<'a>,
+    remaining: usize,
+}
+
 pub struct TripleScan<'a> {
-    index: &'a IndexFile,
+    index:   &'a IndexFile,
     raw_pat: [Option<u64>; 3],
-    pos: usize,
-    end: usize,
+    pos:     usize,
+    end:     usize,
+    /// Set for DeltaColumnar storage; `None` for Columnar/Interleaved.
+    delta:   Option<DeltaScanState<'a>>,
 }
 
 impl<'a> Iterator for TripleScan<'a> {
     type Item = Triple;
 
     fn next(&mut self) -> Option<Triple> {
+        // ── Delta-columnar path: use DeltaColIter for O(N) amortised cost ──────
+        if let Some(ref mut ds) = self.delta {
+            while ds.remaining > 0 {
+                let v0 = ds.iter0.next()?;
+                let v1 = ds.iter1.next()?;
+                let v2 = ds.iter2.next()?;
+                ds.remaining -= 1;
+                if let Some(k2) = self.raw_pat[2] {
+                    if v2 != k2 { continue; }
+                }
+                return Some(self.index.to_triple([v0, v1, v2]));
+            }
+            return None;
+        }
+
+        // ── Columnar / interleaved path (unchanged) ───────────────────────────
         while self.pos < self.end {
             let raw = self.index.get_raw(self.pos);
             self.pos += 1;
-            // Check 3rd component if bound
             if let Some(k2) = self.raw_pat[2] {
-                if raw[2] != k2 {
-                    continue;
-                }
+                if raw[2] != k2 { continue; }
             }
             return Some(self.index.to_triple(raw));
         }
