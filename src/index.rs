@@ -883,7 +883,8 @@ fn merge_to_columnar_direct(
     }
 
     // ── Write skip index (anchors collected during merge, no extra I/O) ───────
-    let skip = SkipIndex { anchors: skip_anchors, count: count as usize };
+    let anchors_l2 = SkipIndex::build_l2(&skip_anchors);
+    let skip = SkipIndex { anchors: skip_anchors, anchors_l2, count: count as usize };
     skip.save(&skip_path_from_c0(&cpaths[0]))?;
 
     // ── Write predicate secondary index for Pos (no extra I/O) ───────────────
