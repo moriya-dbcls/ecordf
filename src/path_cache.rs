@@ -141,6 +141,10 @@ impl PathCache {
             "path-cache: starting build (with sub-sequence expansion)"
         );
 
+        let remaining_budget = |used: usize| -> usize {
+            budget_bytes.saturating_sub(used)
+        };
+
         for path_iris in &expanded {
             // Resolve IRI strings → TermIds
             let path_ids: Vec<TermId> = match resolve_path(path_iris, dict) {
@@ -156,6 +160,44 @@ impl PathCache {
 
             // Already cached (duplicate sub-sequence from different parent paths)
             if entries.contains_key(&path_ids) {
+                continue;
+            }
+
+            // ── Pre-estimate: skip materialisation if the first predicate's POS
+            // range already exceeds the remaining budget.
+            //
+            // materialise_path does a full POS scan + sort + merge-join and can
+            // be very expensive.  If the first hop alone produces more pairs than
+            // the budget allows, materialising the path is pointless — we'd spend
+            // seconds scanning just to discard the result.
+            //
+            // The POS range is an upper bound on output pairs (each hop can only
+            // shrink the set).  If even the upper bound doesn't fit, skip entirely.
+            let budget_left = remaining_budget(total_bytes);
+            if budget_left == 0 {
+                // Paths are sorted shortest-first.  All remaining paths are at
+                // least as long (and thus at least as large) as the current one,
+                // so no further path will fit.  Stop immediately.
+                tracing::debug!(
+                    remaining = expanded.len(),
+                    "path-cache: budget exhausted, stopping"
+                );
+                break;
+            }
+
+            let first_pred_est_pairs = index
+                .pos_predicate_range(path_ids[0])
+                .map(|(lo, hi)| hi - lo)
+                .unwrap_or(0);
+            let first_pred_est_bytes = first_pred_est_pairs * 16;
+
+            if first_pred_est_bytes > budget_left {
+                tracing::debug!(
+                    path = ?path_iris,
+                    est_mb = first_pred_est_bytes / (1024 * 1024),
+                    budget_left_mb = budget_left / (1024 * 1024),
+                    "path-cache: pre-estimate exceeds budget, skipping materialisation"
+                );
                 continue;
             }
 
@@ -175,10 +217,8 @@ impl PathCache {
                     path = ?path_iris,
                     pairs = pairs.len(),
                     mb = pair_bytes / (1024 * 1024),
-                    "path-cache: budget exhausted, skipping remaining paths"
+                    "path-cache: materialised but over budget, skipping"
                 );
-                // Continue scanning (don't break) — a later shorter path might
-                // still fit in the remaining budget.
                 continue;
             }
 
