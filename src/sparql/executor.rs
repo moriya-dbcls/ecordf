@@ -2598,6 +2598,11 @@ impl<'a> Executor<'a> {
                 let s = self.dict.decode(id);
                 Some(s.starts_with("_:"))
             }
+            Expression::IsNumeric(e) => {
+                let id = self.eval_term(e, binding)?;
+                let s = self.dict.decode(id);
+                Some(parse_numeric(&s).is_some())
+            }
             Expression::Contains(a, b) => {
                 let sa = self.eval_string(a, binding)?;
                 let sb = self.eval_string(b, binding)?;
@@ -2746,6 +2751,173 @@ impl<'a> Executor<'a> {
                     .map(|re| re.replace_all(&text, repl.as_str()).into_owned())?;
                 Some(self.dict.encode(&format!("\"{}\"", replaced)))
             }
+
+            // ── STRLEN(?str) → xsd:integer ────────────────────────────────────
+            // Returns the number of Unicode code points (chars) in the lexical form.
+            Expression::Strlen(e) => {
+                let s = self.eval_string(e, binding)?;
+                let n = s.chars().count();
+                Some(self.dict.encode(&format!(
+                    "\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n
+                )))
+            }
+
+            // ── SUBSTR(?str, startingLoc [, length]) → plain literal ──────────
+            // SPARQL 1.1 §17.4.3.3 — 1-based character positions.
+            // startingLoc < 1 is clamped to 1 (chars before the string are empty).
+            Expression::Substr(s_expr, start_expr, len_expr) => {
+                let s     = self.eval_string(s_expr, binding)?;
+                let start = {
+                    let v = self.eval_term(start_expr, binding)?;
+                    let sv = self.dict.decode(v);
+                    parse_numeric(&sv)? as isize
+                };
+                let chars: Vec<char> = s.chars().collect();
+                let n = chars.len() as isize;
+                // Convert 1-based start to 0-based, clamping to [0, n].
+                let begin = (start - 1).max(0).min(n) as usize;
+                let slice: String = match len_expr {
+                    Some(len_e) => {
+                        let lv = self.eval_term(len_e, binding)?;
+                        let ls = self.dict.decode(lv);
+                        let len = parse_numeric(&ls)? as isize;
+                        // end = begin + len, but also clamped; negative len → ""
+                        let end = (begin as isize + len).max(begin as isize).min(n) as usize;
+                        chars[begin..end].iter().collect()
+                    }
+                    None => chars[begin..].iter().collect(),
+                };
+                Some(self.dict.encode(&format!("\"{}\"", slice)))
+            }
+
+            // ── STRBEFORE(?str, ?marker) → plain literal ──────────────────────
+            // Returns the part of str before the first occurrence of marker.
+            // If marker is "" → "". If not found → "".
+            Expression::StrBefore(s_expr, m_expr) => {
+                let s = self.eval_string(s_expr, binding)?;
+                let m = self.eval_string(m_expr, binding)?;
+                let result = if m.is_empty() {
+                    String::new()
+                } else {
+                    s.find(m.as_str())
+                        .map(|i| s[..i].to_string())
+                        .unwrap_or_default()
+                };
+                Some(self.dict.encode(&format!("\"{}\"", result)))
+            }
+
+            // ── STRAFTER(?str, ?marker) → plain literal ───────────────────────
+            // Returns the part of str after the first occurrence of marker.
+            // If marker is "" → str. If not found → "".
+            Expression::StrAfter(s_expr, m_expr) => {
+                let s = self.eval_string(s_expr, binding)?;
+                let m = self.eval_string(m_expr, binding)?;
+                let result = if m.is_empty() {
+                    s.clone()
+                } else {
+                    s.find(m.as_str())
+                        .map(|i| s[i + m.len()..].to_string())
+                        .unwrap_or_default()
+                };
+                Some(self.dict.encode(&format!("\"{}\"", result)))
+            }
+
+            // ── ENCODE_FOR_URI(?str) → plain literal ──────────────────────────
+            // Percent-encodes all characters except unreserved per RFC 3986.
+            Expression::EncodeForUri(e) => {
+                let s = self.eval_string(e, binding)?;
+                let encoded = percent_encoding::utf8_percent_encode(
+                    &s,
+                    percent_encoding::NON_ALPHANUMERIC,
+                ).to_string();
+                Some(self.dict.encode(&format!("\"{}\"", encoded)))
+            }
+
+            // ── IRI(?str) / URI(?str) → IRI ───────────────────────────────────
+            // Constructs an IRI from a string literal.
+            Expression::Iri2(e) => {
+                let s = self.eval_string(e, binding)?;
+                // Look up the bare IRI (as stored in the dictionary without <>).
+                self.dict.lookup(&s)
+            }
+
+            // ── Date/time component extraction ────────────────────────────────
+            // These operate on xsd:dateTime literals of the form
+            // "YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]"^^xsd:dateTime.
+            Expression::Year(e) => {
+                let s = self.eval_string(e, binding)?;
+                let year = s.splitn(2, '-').next()?.parse::<i32>().ok()?;
+                Some(self.dict.encode(&format!(
+                    "\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", year
+                )))
+            }
+            Expression::Month(e) => {
+                let s = self.eval_string(e, binding)?;
+                let parts: Vec<&str> = s.splitn(3, '-').collect();
+                let m = parts.get(1)?.parse::<u32>().ok()?;
+                Some(self.dict.encode(&format!(
+                    "\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", m
+                )))
+            }
+            Expression::Day(e) => {
+                let s = self.eval_string(e, binding)?;
+                let day_part = s.splitn(3, '-').nth(2)?;
+                let d = day_part.splitn(2, 'T').next()?.parse::<u32>().ok()?;
+                Some(self.dict.encode(&format!(
+                    "\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", d
+                )))
+            }
+            Expression::Hours(e) => {
+                let s = self.eval_string(e, binding)?;
+                let t = s.splitn(2, 'T').nth(1)?;
+                let h = t.splitn(2, ':').next()?.parse::<u32>().ok()?;
+                Some(self.dict.encode(&format!(
+                    "\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", h
+                )))
+            }
+            Expression::Minutes(e) => {
+                let s = self.eval_string(e, binding)?;
+                let t = s.splitn(2, 'T').nth(1)?;
+                let m = t.splitn(3, ':').nth(1)?.parse::<u32>().ok()?;
+                Some(self.dict.encode(&format!(
+                    "\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", m
+                )))
+            }
+            Expression::Seconds(e) => {
+                let s = self.eval_string(e, binding)?;
+                let t = s.splitn(2, 'T').nth(1)?;
+                let sec_str = t.splitn(3, ':').nth(2)?;
+                // Strip timezone suffix (Z, +HH:MM, -HH:MM) if present.
+                let sec_num = sec_str.trim_end_matches(|c: char| c == 'Z')
+                    .split('+').next()
+                    .and_then(|s| s.split('-').next())
+                    .unwrap_or(sec_str);
+                let sec = sec_num.parse::<f64>().ok()?;
+                Some(self.dict.encode(&format!(
+                    "\"{}\"^^<http://www.w3.org/2001/XMLSchema#decimal>", sec
+                )))
+            }
+            Expression::Now => {
+                // Return current UTC time as xsd:dateTime.
+                // Uses std::time; format: "YYYY-MM-DDTHH:MM:SSZ"
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                // Simple UTC conversion (no leap seconds).
+                let s = secs % 60;
+                let m = (secs / 60) % 60;
+                let h = (secs / 3600) % 24;
+                let days = secs / 86400;
+                // Gregorian calendar (days since 1970-01-01).
+                let (year, month, day) = days_to_ymd(days as u64);
+                let dt = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month, day, h, m, s);
+                Some(self.dict.encode(&format!(
+                    "\"{}\"^^<http://www.w3.org/2001/XMLSchema#dateTime>", dt
+                )))
+            }
+
             _ => None,
         }
     }
@@ -4467,6 +4639,23 @@ fn bind_pattern_with_binding(
         }
     }
     p
+}
+
+/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
+/// Used by NOW() to produce a human-readable xsd:dateTime without chrono dependency.
+fn days_to_ymd(days: u64) -> (u32, u32, u32) {
+    // Algorithm: civil_from_days (Howard Hinnant, public domain)
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y   = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp  = (5 * doy + 2) / 153;
+    let d   = doy - (153 * mp + 2) / 5 + 1;
+    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y   = if m <= 2 { y + 1 } else { y };
+    (y as u32, m as u32, d as u32)
 }
 
 fn extract_literal_value(s: &str) -> String {

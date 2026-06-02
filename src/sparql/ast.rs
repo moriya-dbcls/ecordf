@@ -226,6 +226,9 @@ pub enum Expression {
     Replace(Box<Expression>, Box<Expression>, Box<Expression>, Option<Box<Expression>>),
     Substr(Box<Expression>, Box<Expression>, Option<Box<Expression>>),
     Strlen(Box<Expression>),
+    StrBefore(Box<Expression>, Box<Expression>),
+    StrAfter(Box<Expression>, Box<Expression>),
+    EncodeForUri(Box<Expression>),
     UCase(Box<Expression>),
     LCase(Box<Expression>),
     Concat(Vec<Expression>),
@@ -239,11 +242,14 @@ pub enum Expression {
     Year(Box<Expression>),
     Month(Box<Expression>),
     Day(Box<Expression>),
+    Hours(Box<Expression>),
+    Minutes(Box<Expression>),
+    Seconds(Box<Expression>),
     Now,
     If(Box<Expression>, Box<Expression>, Box<Expression>),
     Coalesce(Vec<Expression>),
     SameTerm(Box<Expression>, Box<Expression>),
-    Iri2(Box<Expression>),   // IRI() function
+    Iri2(Box<Expression>),   // IRI() / URI() function
 
     // Aggregates
     Count { distinct: bool, expr: Option<Box<Expression>> },

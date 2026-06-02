@@ -1225,6 +1225,7 @@ impl<'a> Parser<'a> {
             "strlen" => { let e = self.parse_paren_expr()?; Ok(Expression::Strlen(Box::new(e))) }
             "ucase" => { let e = self.parse_paren_expr()?; Ok(Expression::UCase(Box::new(e))) }
             "lcase" => { let e = self.parse_paren_expr()?; Ok(Expression::LCase(Box::new(e))) }
+            "encode_for_uri" => { let e = self.parse_paren_expr()?; Ok(Expression::EncodeForUri(Box::new(e))) }
             "abs" => { let e = self.parse_paren_expr()?; Ok(Expression::Abs(Box::new(e))) }
             "round" => { let e = self.parse_paren_expr()?; Ok(Expression::Round(Box::new(e))) }
             "ceil" => { let e = self.parse_paren_expr()?; Ok(Expression::Ceil(Box::new(e))) }
@@ -1232,6 +1233,9 @@ impl<'a> Parser<'a> {
             "year" => { let e = self.parse_paren_expr()?; Ok(Expression::Year(Box::new(e))) }
             "month" => { let e = self.parse_paren_expr()?; Ok(Expression::Month(Box::new(e))) }
             "day" => { let e = self.parse_paren_expr()?; Ok(Expression::Day(Box::new(e))) }
+            "hours" => { let e = self.parse_paren_expr()?; Ok(Expression::Hours(Box::new(e))) }
+            "minutes" => { let e = self.parse_paren_expr()?; Ok(Expression::Minutes(Box::new(e))) }
+            "seconds" => { let e = self.parse_paren_expr()?; Ok(Expression::Seconds(Box::new(e))) }
             "now" => { Ok(Expression::Now) }
             "sameterm" => {
                 self.expect(Token::LParen)?;
@@ -1322,6 +1326,22 @@ impl<'a> Parser<'a> {
                 let b = self.parse_expression()?;
                 self.expect(Token::RParen)?;
                 Ok(Expression::StrEnds(Box::new(a), Box::new(b)))
+            }
+            "strbefore" => {
+                self.expect(Token::LParen)?;
+                let a = self.parse_expression()?;
+                self.expect(Token::Comma)?;
+                let b = self.parse_expression()?;
+                self.expect(Token::RParen)?;
+                Ok(Expression::StrBefore(Box::new(a), Box::new(b)))
+            }
+            "strafter" => {
+                self.expect(Token::LParen)?;
+                let a = self.parse_expression()?;
+                self.expect(Token::Comma)?;
+                let b = self.parse_expression()?;
+                self.expect(Token::RParen)?;
+                Ok(Expression::StrAfter(Box::new(a), Box::new(b)))
             }
             "if" => {
                 self.expect(Token::LParen)?;
