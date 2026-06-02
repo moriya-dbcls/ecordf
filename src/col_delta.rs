@@ -213,21 +213,34 @@ fn decode_block(data: &[u8], offset: usize, out: &mut Vec<u64>) -> usize {
 ///
 /// Provides O(log block_count) access to any value and efficient sequential
 /// iteration via [`DeltaColIter`].
+///
+/// ## Variable-sized blocks
+///
+/// [`encode_column_pred_aligned`] may produce blocks smaller than
+/// `DELTA_BLOCK_SIZE` at predicate boundaries.  `start_positions[i]` holds the
+/// cumulative logical start position of block `i`, computed once at open time
+/// by scanning each block's `count_m1` byte.  All random-access methods
+/// (`get`, `lower_bound`, `iter_from`) use a binary search on `start_positions`
+/// instead of the old `pos / DELTA_BLOCK_SIZE` division, so they work correctly
+/// regardless of block size.
 pub struct DeltaColFile {
     /// Keep both the `File` handle and `Mmap` alive together.
     _file: File,
     mmap:  Mmap,
     /// Total number of u64 values in the column.
     pub count: usize,
-    /// (first_value, byte_offset_of_block) for each block, sorted by first_value
-    /// (naturally true since the column is sorted and blocks are sequential).
+    /// `(first_value, byte_offset_of_block)` for each block.
     block_index: Vec<(u64, u64)>,
+    /// `start_positions[i]` = logical index of the first entry in block `i`.
+    /// Derived from `count_m1` bytes at open time; supports variable block sizes.
+    start_positions: Vec<usize>,
 }
 
 impl DeltaColFile {
     /// Open and memory-map a delta-encoded column file.
     ///
-    /// Loads the block index into RAM (≈ 16 bytes × block_count).
+    /// Loads the block index and derives `start_positions` (one sequential scan
+    /// of block headers, ≈ 2 bytes per block).
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -255,7 +268,18 @@ impl DeltaColFile {
             block_index.push((first_val, byte_off));
         }
 
-        Ok(Self { _file: file, mmap, count, block_index })
+        // Derive start_positions from count_m1 byte of each block header.
+        // Block header layout: enc(1) + count_m1(1) + base_val(8) + deltas…
+        // count_m1 = (entries_in_block - 1), so entries = count_m1 + 1.
+        let mut start_positions = Vec::with_capacity(block_count);
+        let mut pos = 0usize;
+        for &(_, byte_off) in &block_index {
+            start_positions.push(pos);
+            let count_m1 = mmap[byte_off as usize + 1] as usize;
+            pos += count_m1 + 1;
+        }
+
+        Ok(Self { _file: file, mmap, count, block_index, start_positions })
     }
 
     /// Decompress the block at `block_idx` into `out`.
@@ -264,13 +288,25 @@ impl DeltaColFile {
         decode_block(&self.mmap, offset, out);
     }
 
+    /// Find the block index that contains logical position `pos`.
+    ///
+    /// Uses binary search on `start_positions` — works for both fixed-size
+    /// (standard `encode_column`) and variable-size (pred-aligned) blocks.
+    #[inline]
+    fn block_for_pos(&self, pos: usize) -> (usize, usize) {
+        // block_idx = last i where start_positions[i] <= pos
+        let block_idx = self.start_positions.partition_point(|&sp| sp <= pos)
+            .saturating_sub(1);
+        let block_offset = pos - self.start_positions[block_idx];
+        (block_idx, block_offset)
+    }
+
     /// Return the value at logical position `pos`.
     ///
     /// O(BLOCK_SIZE) decompression work per call.  Use [`DeltaColIter`] for
     /// sequential scanning to amortise decompression across the block.
     pub fn get(&self, pos: usize) -> u64 {
-        let block_idx   = pos / DELTA_BLOCK_SIZE;
-        let block_offset = pos % DELTA_BLOCK_SIZE;
+        let (block_idx, block_offset) = self.block_for_pos(pos);
         let mut buf = Vec::with_capacity(DELTA_BLOCK_SIZE);
         self.decompress_block(block_idx, &mut buf);
         buf[block_offset]
@@ -297,14 +333,19 @@ impl DeltaColFile {
         let mut buf = Vec::with_capacity(DELTA_BLOCK_SIZE);
         self.decompress_block(block_start, &mut buf);
 
-        let base_pos = block_start * DELTA_BLOCK_SIZE;
+        // base_pos: logical start of this block (works for variable-size blocks)
+        let base_pos = self.start_positions[block_start];
         for (i, &v) in buf.iter().enumerate() {
             if v >= target {
                 return base_pos + i;
             }
         }
         // Target is in the next block or beyond the end.
-        (block_start + 1) * DELTA_BLOCK_SIZE
+        if block_start + 1 < self.start_positions.len() {
+            self.start_positions[block_start + 1]
+        } else {
+            self.count
+        }
     }
 
     /// Create a sequential iterator starting at logical position `start_pos`.
@@ -326,8 +367,12 @@ pub struct DeltaColIter<'a> {
 
 impl<'a> DeltaColIter<'a> {
     fn new(col: &'a DeltaColFile, start_pos: usize) -> Self {
-        let block_idx = start_pos / DELTA_BLOCK_SIZE;
-        let buf_pos   = start_pos % DELTA_BLOCK_SIZE;
+        // Use block_for_pos so variable-size blocks are handled correctly.
+        let (block_idx, buf_pos) = if start_pos < col.count && !col.start_positions.is_empty() {
+            col.block_for_pos(start_pos)
+        } else {
+            (col.block_index.len(), 0)
+        };
 
         let mut buf = Vec::with_capacity(DELTA_BLOCK_SIZE);
         if block_idx < col.block_index.len() {
