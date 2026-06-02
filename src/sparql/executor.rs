@@ -1350,6 +1350,124 @@ impl<'a> Executor<'a> {
     ///
     /// Returns `None` if the pattern does not match; caller falls back to
     /// `bind_join`.
+    /// PSO early-termination fast path for `bind_join`.
+    ///
+    /// Bypasses the O(N_left) group-building HashMap when LIMIT pushdown is
+    /// active and there are far more left rows than the pushdown limit.
+    ///
+    /// Algorithm:
+    ///   1. PSO scan for the predicate → collect `push_limit` unique subjects
+    ///      with their objects.  Cost: O(push_limit × avg_fanout).
+    ///   2. Build a HashSet of those subjects for O(1) lookup.
+    ///   3. Linear scan of `left.rows`: for each row, if its subject is in the
+    ///      PSO subject set, emit output rows.  Cost: O(N_left) sequential.
+    ///
+    /// Returns `None` when conditions are not met (caller falls back to the
+    /// standard group-building path).
+    fn try_pso_fast_path(
+        &self,
+        left: &ResultSet,
+        right_plan: &ExecutionPlan,
+        needed: &[(usize, String)],
+        outer: &Binding,
+    ) -> Option<ResultSet> {
+        // Conditions: pushdown active, one needed left var, right is a join ScanBound.
+        let push_limit = self.pushdown_limit.get()?;
+
+        // Must have exactly one needed variable (the subject key).
+        if needed.len() != 1 { return None; }
+        let (subj_col, subj_var) = &needed[0];
+
+        // Fast path only worth it when left is significantly larger than limit.
+        if left.rows.len() <= push_limit * 4 { return None; }
+
+        // Right plan must be a join ScanBound: s=outer_var, p=fixed, o=free.
+        let (base, free_vars, outer_vars) = match right_plan {
+            ExecutionPlan::ScanBound { base, free_vars, outer_vars } => (base, free_vars, outer_vars),
+            _ => return None,
+        };
+        if outer_vars.len() != 1 || outer_vars[0].1 != 0 { return None; }
+        if outer.contains_key(outer_vars[0].0.as_str()) { return None; }
+        if base.p == UNBOUND { return None; }
+        // Join mode only (o is free, one free_var at position 2).
+        if base.o != UNBOUND || free_vars.len() != 1 || free_vars[0].1 != 2 { return None; }
+        // PSO must be available.
+        if !self.index.has_pso() { return None; }
+
+        // Check pred_cache/pred_partition first — they're faster than PSO for small predicates.
+        if self.pred_cache.get(base.p).is_some() { return None; }
+        if self.pred_partitions.get(base.p).is_some() { return None; }
+
+        let free_var_name = &free_vars[0].0;
+        let outer_var_name = &outer_vars[0].0;
+
+        // Collect unique subjects from PSO (no subject filter: we want any push_limit subjects).
+        let (s_to_objects, _exhausted) = self.index.scan_pso_subject_limit(
+            base.p, push_limit, &HashSet::new()
+        );
+
+        if s_to_objects.is_empty() { return None; }
+
+        let fanout = s_to_objects.values().map(|v| v.len()).max().unwrap_or(1).max(1);
+        let expansion_limit = push_limit.saturating_mul(fanout);
+
+        tracing::debug!(
+            pred = base.p,
+            left_rows = left.rows.len(),
+            push_limit,
+            pso_subjects = s_to_objects.len(),
+            fanout,
+            "PSO fast path: collected subjects, scanning left"
+        );
+
+        // Build output schema.
+        let mut out_vars = left.variables.clone();
+        if !out_vars.contains(free_var_name) { out_vars.push(free_var_name.clone()); }
+        let mut result = ResultSet::empty(out_vars.clone());
+        let out_len = out_vars.len();
+        let free_var_oi = result.variable_index(free_var_name);
+
+        // Linear scan of left.rows: for each row, check subject ∈ PSO subjects.
+        'scan: for lr in &left.rows {
+            if self.is_cancelled() { result.overflow = true; break; }
+
+            let s_id = match lr.get(*subj_col).copied().flatten() {
+                Some(id) => id,
+                None => continue,
+            };
+            let Some(objects) = s_to_objects.get(&s_id) else { continue };
+
+            for &o_id in objects {
+                let mut row = vec![None; out_len];
+                for (li, lv) in left.variables.iter().enumerate() {
+                    if let Some(oi) = result.variable_index(lv) {
+                        row[oi] = lr.get(li).copied().flatten();
+                    }
+                }
+                if let Some(oi) = free_var_oi { row[oi] = Some(o_id); }
+                // Re-inject the outer var so downstream joins can match on it.
+                if let Some(oi) = result.variable_index(outer_var_name) {
+                    row[oi] = Some(s_id);
+                }
+                result.rows.push(row);
+                if result.rows.len() >= self.config.max_intermediate_rows {
+                    result.overflow = true;
+                    break 'scan;
+                }
+                if matches!(Some(expansion_limit), Some(lim) if result.rows.len() >= lim) {
+                    tracing::debug!(rows = result.rows.len(), "PSO fast path: expansion limit reached");
+                    break 'scan;
+                }
+            }
+        }
+
+        tracing::debug!(
+            out_rows = result.rows.len(),
+            "PSO fast path: done"
+        );
+        Some(result)
+    }
+
     fn try_predicate_scan_join(
         &self,
         left: &ResultSet,
@@ -1753,6 +1871,31 @@ impl<'a> Executor<'a> {
             .filter(|(_, v)| right_refs.contains(v.as_str()))
             .map(|(i, v)| (i, v.clone()))
             .collect();
+
+        // ── PSO early-termination fast path ───────────────────────────────────
+        //
+        // When LIMIT pushdown is active AND:
+        //   - right_plan is a join ScanBound (s=outer, p=fixed, o=free)
+        //   - PSO index is available
+        //   - left has far more rows than the pushdown limit
+        //
+        // We bypass the expensive group-building phase entirely.
+        //
+        // Normal path: build 10M groups (HashMap) → PSO → expand → 1000 rows
+        //   Cost: O(N_left) HashMap build + O(LIMIT) PSO = 10s + 1.3s
+        //
+        // Fast path: PSO first → scan left.rows once for matching subjects
+        //   Cost: O(LIMIT) PSO + O(N_left) linear scan = 1.3s + ~1s
+        //   (no HashMap allocation, just sequential reads + HashSet lookup)
+        if let Some(fast) = self.try_pso_fast_path(&left, right_plan, &needed, outer) {
+            tracing::debug!(
+                left_rows = left.rows.len(),
+                out_rows = fast.rows.len(),
+                elapsed_us = t_bj.elapsed().as_micros(),
+                "bind_join done (PSO fast path)"
+            );
+            return fast;
+        }
 
         // Group left rows by the binding key right_plan actually uses.
         // Insertion-order Vec preserves output row order.
