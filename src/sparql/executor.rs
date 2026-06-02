@@ -710,8 +710,60 @@ impl<'a> Executor<'a> {
                 if left_rs.rows.len() <= self.config.bind_join_threshold {
                     return self.bind_join(left_rs, right, outer);
                 }
-                let right_rs = self.execute_plan_with_ctx(right, outer);
+                let mut right_rs = self.execute_plan_with_ctx(right, outer);
                 if right_rs.overflow { return right_rs; }
+
+                // ── SIP (Sideways Information Passing) pre-filter (改善5) ───────
+                // Before hash_join, filter right_rs to only rows whose shared-variable
+                // values are present in left_rs.  This is a "late SIP": the right scan
+                // I/O is unchanged (sequential POS reads are already fast), but we
+                // shrink the right result set before the hash-join phase, reducing
+                // memory pressure and hash-probe work.
+                //
+                // We apply SIP only when:
+                //   1. left_rs is small enough that building the filter sets is cheap
+                //      (≤ SIP_MAX_LEFT_VALUES unique values per shared variable).
+                //   2. right_rs is significantly larger than left_rs (otherwise the
+                //      join is already cheap).
+                //
+                // Example: left=508 peptides, right=10M rdf:type triples.
+                //   Build filter {508 peptide IDs} → filter right_rs to 508 rows
+                //   before hash_join → hash_join 508×508 instead of 508×10M.
+                const SIP_MAX_LEFT_VALUES: usize = 100_000;
+                if left_rs.rows.len() < right_rs.rows.len() / 10 {
+                    // Find shared variables (same name in both result sets).
+                    let sip_pairs: Vec<(usize, usize)> = left_rs.variables.iter()
+                        .enumerate()
+                        .filter_map(|(li, lv)| right_rs.variable_index(lv).map(|ri| (li, ri)))
+                        .collect();
+                    if !sip_pairs.is_empty() {
+                        // Build per-variable HashSets from left_rs.
+                        let sip_filters: Vec<HashSet<TermId>> = sip_pairs.iter()
+                            .map(|&(li, _)| {
+                                left_rs.rows.iter()
+                                    .filter_map(|row| row.get(li).copied().flatten())
+                                    .collect::<HashSet<TermId>>()
+                            })
+                            .collect();
+                        // Only apply if all filter sets are small (cheap to build + probe).
+                        if sip_filters.iter().all(|fs| fs.len() <= SIP_MAX_LEFT_VALUES) {
+                            let before = right_rs.rows.len();
+                            right_rs.rows.retain(|row| {
+                                sip_pairs.iter().zip(sip_filters.iter()).all(|(&(_, ri), fs)| {
+                                    row.get(ri).and_then(|v| *v).map_or(true, |id| fs.contains(&id))
+                                })
+                            });
+                            tracing::debug!(
+                                shared_vars = sip_pairs.len(),
+                                right_before = before,
+                                right_after = right_rs.rows.len(),
+                                reduction = before.saturating_sub(right_rs.rows.len()),
+                                "SIP pre-filter applied"
+                            );
+                        }
+                    }
+                }
+
                 self.hash_join(left_rs, right_rs)
             }
             ExecutionPlan::LeapfrogJoin { patterns } => {
@@ -1571,21 +1623,21 @@ impl<'a> Executor<'a> {
             // Priority 2: pred_cache — sorted (S,O) Vec in RAM.
             // Priority 3: pred_partitions — sorted (S,O) mmap file on disk.
             // Priority 4: POS/OPS index scan (fallback).
-            let passing: HashSet<TermId> = if let Some(class_subjects) =
+            let passing: HashSet<TermId> = if let Some(class_bitmap) =
                 self.type_cache.rdf_type_id()
                     .filter(|&rdf_type| base.p == rdf_type)
-                    .and_then(|_| self.type_cache.get_class(base.o))
+                    .and_then(|_| self.type_cache.get_bitmap(base.o))
             {
                 tracing::debug!(
                     pred = base.p,
                     class = base.o,
                     unique_subjects = subjects.len(),
-                    class_size = class_subjects.len(),
-                    mode = "type_cache_filter",
-                    "bind_join filter: using type cache"
+                    class_size = class_bitmap.len(),
+                    mode = "type_cache_filter_bitmap",
+                    "bind_join filter: using type cache (RoaringTreemap O(1))"
                 );
                 subjects.iter().copied().filter(|&s| {
-                    class_subjects.binary_search(&s).is_ok()
+                    class_bitmap.contains(s)   // O(1) bitmap lookup
                 }).collect()
             } else if let Some(cached) = self.pred_cache.get(base.p) {
                 tracing::debug!(
@@ -1677,18 +1729,40 @@ impl<'a> Executor<'a> {
                 }
             }
         } else if let Some(part) = self.pred_partitions.get(base.p) {
-            tracing::debug!(
-                pred = base.p,
-                unique_subjects = subjects.len(),
-                part_pairs = part.len(),
-                mode = "pred_partition_join",
-                "bind_join join: using pred partition"
-            );
-            for &s in &subjects {
-                let pairs = part.get_objects(s);
-                if !pairs.is_empty() {
-                    let objs: Vec<TermId> = pairs.iter().map(|&(_, o)| o).collect();
-                    s_to_objects.insert(s, objs);
+            // Check if this is a functional predicate (改善6): each subject has
+            // at most one object.  If so, use get_single_object() which is O(log N)
+            // with zero Vec allocation, vs get_objects() which allocates a slice.
+            let is_functional = self.stats
+                .map(|st| st.is_functional(base.p))
+                .unwrap_or(false);
+
+            if is_functional {
+                tracing::debug!(
+                    pred = base.p,
+                    unique_subjects = subjects.len(),
+                    part_pairs = part.len(),
+                    mode = "pred_partition_functional_join",
+                    "bind_join join: using pred partition (functional predicate, O(log N) single lookup)"
+                );
+                for &s in &subjects {
+                    if let Some(o) = part.get_single_object(s) {
+                        s_to_objects.insert(s, vec![o]);
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    pred = base.p,
+                    unique_subjects = subjects.len(),
+                    part_pairs = part.len(),
+                    mode = "pred_partition_join",
+                    "bind_join join: using pred partition"
+                );
+                for &s in &subjects {
+                    let pairs = part.get_objects(s);
+                    if !pairs.is_empty() {
+                        let objs: Vec<TermId> = pairs.iter().map(|&(_, o)| o).collect();
+                        s_to_objects.insert(s, objs);
+                    }
                 }
             }
         } else if let Some(push_limit) = self.pushdown_limit.get().filter(|&lim| {

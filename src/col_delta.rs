@@ -362,6 +362,142 @@ impl<'a> Iterator for DeltaColIter<'a> {
     }
 }
 
+/// Encode a sorted slice of u64 values with **predicate-boundary-aligned blocks**.
+///
+/// Identical to [`encode_column`] except that a new delta block is forced at
+/// each index listed in `boundaries`.  This guarantees that no compressed block
+/// straddles two predicates, maximising the compression ratio for POS c1 (objects):
+///
+/// ```text
+/// Without alignment: block may span pred_A tail + pred_B head
+///   → max_delta covers both predicates' object ranges → wider delta → larger blocks
+///
+/// With alignment: every block is entirely within one predicate's object range
+///   → max_delta is the object range of that predicate only → smaller delta → U8/U16 encoding
+/// ```
+///
+/// `boundaries`: sorted list of entry indices where a new block must start.
+///   Typically the `(lo, hi)` values from the `PredicateIndex` (each `lo > 0` is a boundary).
+///   Entry 0 is implicit and need not be included.
+///
+/// The compression gain is most significant for POS c1 (objects ordered within
+/// each predicate's range): without alignment the occasional large jump when the
+/// predicate changes forces U64 raw encoding for those blocks.
+pub fn encode_column_pred_aligned(
+    values: &[u64],
+    boundaries: &[usize],
+    path: &Path,
+) -> io::Result<()> {
+    let count = values.len();
+    if count == 0 {
+        return encode_column(values, path);
+    }
+
+    // Build a sorted, deduped set of forced block-start positions.
+    let mut force_starts: Vec<usize> = boundaries.iter()
+        .copied()
+        .filter(|&b| b > 0 && b < count)
+        .collect();
+    force_starts.sort_unstable();
+    force_starts.dedup();
+
+    // We'll accumulate (block_first_value, byte_offset) as we write.
+    // Count of blocks is unknown upfront; reserve a placeholder for block_idx_offset.
+    let f = File::create(path)?;
+    let mut w = BufWriter::with_capacity(8 * 1024 * 1024, f);
+
+    w.write_all(DELTA_MAGIC)?;
+    w.write_all(&(count as u64).to_le_bytes())?;
+    w.write_all(&0u64.to_le_bytes())?; // block_count placeholder
+    w.write_all(&0u64.to_le_bytes())?; // block_idx_offset placeholder
+
+    let mut block_index: Vec<(u64, u64)> = Vec::new();
+    let mut byte_pos: u64 = DELTA_HDR as u64;
+
+    let mut pos = 0usize;
+    let mut force_idx = 0usize; // index into force_starts
+
+    while pos < count {
+        let base = values[pos];
+
+        // Determine the end of this block: min(pos + DELTA_BLOCK_SIZE, next_boundary, count)
+        let natural_end = (pos + DELTA_BLOCK_SIZE).min(count);
+        let forced_end = if force_idx < force_starts.len() && force_starts[force_idx] > pos {
+            force_starts[force_idx].min(natural_end)
+        } else {
+            natural_end
+        };
+        // Advance force_idx past any boundaries we are consuming.
+        while force_idx < force_starts.len() && force_starts[force_idx] <= forced_end {
+            force_idx += 1;
+        }
+
+        let chunk = &values[pos..forced_end];
+        let n = chunk.len();
+
+        block_index.push((base, byte_pos));
+
+        let max_delta = if n == 1 { 0 } else {
+            chunk[1..].iter().fold(0u64, |acc, &v| acc.max(v - base))
+        };
+
+        let enc = if max_delta == 0 {
+            ENC_ALL_SAME
+        } else if max_delta <= u8::MAX as u64 {
+            ENC_U8
+        } else if max_delta <= u16::MAX as u64 {
+            ENC_U16
+        } else if max_delta <= u32::MAX as u64 {
+            ENC_U32
+        } else {
+            ENC_U64
+        };
+
+        let count_m1 = (n - 1) as u8;
+        w.write_all(&[enc, count_m1])?;
+        w.write_all(&base.to_le_bytes())?;
+
+        match enc {
+            ENC_ALL_SAME => { byte_pos += 2 + 8; }
+            ENC_U8 => {
+                for &v in &chunk[1..] { w.write_all(&[(v - base) as u8])?; }
+                byte_pos += 2 + 8 + (n - 1) as u64;
+            }
+            ENC_U16 => {
+                for &v in &chunk[1..] { w.write_all(&((v - base) as u16).to_le_bytes())?; }
+                byte_pos += 2 + 8 + (n - 1) as u64 * 2;
+            }
+            ENC_U32 => {
+                for &v in &chunk[1..] { w.write_all(&((v - base) as u32).to_le_bytes())?; }
+                byte_pos += 2 + 8 + (n - 1) as u64 * 4;
+            }
+            _ => {
+                for &v in &chunk[1..] { w.write_all(&v.to_le_bytes())?; }
+                byte_pos += 2 + 8 + (n - 1) as u64 * 8;
+            }
+        }
+
+        pos = forced_end;
+    }
+
+    // Write block index.
+    let idx_offset = byte_pos;
+    let block_count = block_index.len();
+    for (first_val, offset) in &block_index {
+        w.write_all(&first_val.to_le_bytes())?;
+        w.write_all(&offset.to_le_bytes())?;
+    }
+
+    // Back-patch header: block_count at offset 16, block_idx_offset at offset 24.
+    let mut f = w.into_inner().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    f.seek(SeekFrom::Start(16))?;
+    f.write_all(&(block_count as u64).to_le_bytes())?;
+    f.write_all(&idx_offset.to_le_bytes())?;
+    f.flush()?;
+
+    Ok(())
+}
+
 // ── Suffix helper ─────────────────────────────────────────────────────────────
 
 /// Return the `.dz` variant path: `spo.c0` → `spo.c0.dz`.

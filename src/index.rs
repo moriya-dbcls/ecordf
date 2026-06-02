@@ -64,18 +64,37 @@ const TRIPLE_BYTES: usize = 24; // 3 × u64
 const COL_MAGIC: &[u8; 8] = b"ECOCOL01";
 const COL_VALUE_BYTES: usize = 8; // one u64 per entry
 
-/// Skip index magic and header size.
-/// File layout: magic(8) + stride(4) + entry_count(4) + total_count(8) + entries[u64…]
-const SKIP_MAGIC: &[u8; 8] = b"ECOSKIP1";
-const SKIP_HDR: usize = 24; // 8 + 4 + 4 + 8
-
-/// One skip anchor every SKIP_STRIDE entries in c0.
+/// Skip index v1 magic (legacy, single-level).
+const SKIP_MAGIC_V1: &[u8; 8] = b"ECOSKIP1";
+/// Skip index v2 magic (two-level: L1 stride=512, L2 stride=512²=262144).
 ///
-/// At 3 B triples: ~5.86 M anchors × 8 B ≈ 46.9 MB per index (140 MB total).
-/// After narrowing the range is exactly SKIP_STRIDE entries = 4 KB = 1 OS page.
-/// The binary search after narrow() runs entirely within that single page —
-/// 1 page fault per cold search vs ~31 without the skip index.
+/// ## File layout (v2)
+/// ```text
+/// magic(8) = "ECOSKIP2"
+/// stride_l1: u32   = 512
+/// stride_l2: u32   = 262144
+/// l1_count:  u64   number of L1 anchors
+/// l2_count:  u64   number of L2 anchors
+/// total_count: u64 total entries in c0
+/// l1_data: [u64; l1_count]
+/// l2_data: [u64; l2_count]
+/// ```
+const SKIP_MAGIC: &[u8; 8] = b"ECOSKIP2";
+const SKIP_HDR: usize = 40; // magic(8)+stride_l1(4)+stride_l2(4)+l1_count(8)+l2_count(8)+total(8)
+
+/// L1 skip anchor: one every SKIP_STRIDE entries.
+///
+/// At 3 B triples: ~5.86 M anchors × 8 B ≈ 46.9 MB per index.
+/// After L1 narrow() the range is exactly SKIP_STRIDE entries = 4 KB = 1 OS page.
 const SKIP_STRIDE: usize = 512;
+
+/// L2 skip anchor: one every SKIP_STRIDE² = 262 144 entries.
+///
+/// At 3 B triples: ~11 444 anchors × 8 B ≈ 91 KB per index — **fits in L2 CPU cache**.
+/// Binary search in anchors_l2 costs ~14 L2-cache comparisons (zero page faults),
+/// narrowing the L1 search to exactly SKIP_STRIDE anchors (4 KB).
+/// Combined: 14 L2-cache hits → 14 L1-cache hits → 1 c0 page fault.
+const SKIP_STRIDE_L2: usize = SKIP_STRIDE * SKIP_STRIDE; // 262 144
 
 // ── Helper: derive the three column paths from a base index path ──────────────
 //
@@ -109,47 +128,64 @@ fn skip_path_from_c0(c0: &Path) -> PathBuf {
 
 // ── Skip index ────────────────────────────────────────────────────────────────
 
-/// Sparse in-memory index over the primary-key column (c0) of a columnar index.
+/// Two-level sparse in-memory index over the primary-key column (c0).
 ///
-/// Stores one anchor value per `SKIP_STRIDE` entries: `anchors[i] = c0[i × SKIP_STRIDE]`.
-/// With SKIP_STRIDE = 512 the anchor array for 3 B triples is ~5.86 M entries × 8 B ≈ 47 MB,
-/// which stays hot in CPU cache; `narrow()` costs ~23 cache-resident comparisons and
-/// returns a ≤ 512-entry range — exactly 4 KB = 1 OS page of *contiguous* c0 data.
+/// ## Level structure
 ///
-/// ## I/O improvement (3 B triples, 22 GiB c0 file, SKIP_STRIDE = 512)
+/// ```text
+/// L2 anchors: anchors_l2[i] = c0[i × SKIP_STRIDE_L2]    (~11 444 entries for 3 B triples → 91 KB)
+/// L1 anchors: anchors[i]    = c0[i × SKIP_STRIDE]        (~5.86 M entries for 3 B triples → 47 MB)
+/// ```
 ///
-/// Before: `lower_bound_0` does log₂(3 × 10⁹) ≈ 31 random page faults.
-/// After:  `narrow()` in hot RAM → `prefetch_c0` fires async MADV_WILLNEED on 4 KB →
-///         binary search over 512 entries fits in the 1 resident page →
-///         **1 page fault per cold search** (physical minimum without loading c0 into RAM).
+/// ## I/O improvement (3 B triples, 22 GiB c0 file)
+///
+/// Before (1-level): `narrow()` binary-searches 47 MB L1 → ~23 cache misses, 1 page fault
+/// After  (2-level): L2 binary-search in 91 KB (L2-cache-resident) → 14 L2 hits → narrows to
+///   512 L1 anchors (4 KB window) → 14 L1 hits → 1 c0 page fault.
+///   Total: zero cold page faults on anchors. Same 1 c0 page fault (irreducible).
 struct SkipIndex {
-    /// `anchors[i] == c0[i * SKIP_STRIDE]`
+    /// L1: `anchors[i] == c0[i * SKIP_STRIDE]`
     anchors: Vec<u64>,
+    /// L2: `anchors_l2[i] == c0[i * SKIP_STRIDE_L2]` where `SKIP_STRIDE_L2 = SKIP_STRIDE²`.
+    /// Also equals `anchors[i * SKIP_STRIDE]`.
+    /// At 3 B triples: ~11 444 entries × 8 B ≈ 91 KB (fits entirely in L2 CPU cache).
+    anchors_l2: Vec<u64>,
     /// Total number of entries in the c0 column.
     count: usize,
 }
 
 impl SkipIndex {
+    /// Derive L2 anchors from an already-built L1 anchor slice.
+    fn build_l2(anchors: &[u64]) -> Vec<u64> {
+        (0..)
+            .map(|i: usize| i * SKIP_STRIDE)
+            .take_while(|&pos| pos < anchors.len())
+            .map(|pos| anchors[pos])
+            .collect()
+    }
+
     /// Build from an in-memory sorted slice of triples.
-    /// Samples c0 (column 0) every `SKIP_STRIDE` rows.
+    /// Samples c0 (column 0) every `SKIP_STRIDE` rows (L1), then derives L2.
     fn build_from_triples(triples: &[[u64; 3]]) -> Self {
         let count = triples.len();
-        let anchors = (0..)
+        let anchors: Vec<u64> = (0..)
             .map(|i: usize| i * SKIP_STRIDE)
             .take_while(|&pos| pos < count)
             .map(|pos| triples[pos][0])
             .collect();
-        SkipIndex { anchors, count }
+        let anchors_l2 = Self::build_l2(&anchors);
+        SkipIndex { anchors, anchors_l2, count }
     }
 
     /// Build from a delta-encoded column file.
     fn build_from_delta(col: &crate::col_delta::DeltaColFile, count: usize) -> Self {
-        let anchors = (0..)
+        let anchors: Vec<u64> = (0..)
             .map(|i: usize| i * SKIP_STRIDE)
             .take_while(|&pos| pos < count)
             .map(|pos| col.get(pos))
             .collect();
-        SkipIndex { anchors, count }
+        let anchors_l2 = Self::build_l2(&anchors);
+        SkipIndex { anchors, anchors_l2, count }
     }
 
     /// Build by doing one sequential scan over an already-open c0 mmap.
@@ -157,7 +193,7 @@ impl SkipIndex {
     /// Called when an existing index was built before skip support was added.
     /// One sequential pass — OS sequential prefetcher makes this fast.
     fn build_from_mmap(mmap: &Mmap, count: usize) -> Self {
-        let anchors = (0..)
+        let anchors: Vec<u64> = (0..)
             .map(|i: usize| i * SKIP_STRIDE)
             .take_while(|&pos| pos < count)
             .map(|pos| {
@@ -165,74 +201,133 @@ impl SkipIndex {
                 u64::from_le_bytes(mmap[off..off + 8].try_into().unwrap())
             })
             .collect();
-        SkipIndex { anchors, count }
+        let anchors_l2 = Self::build_l2(&anchors);
+        SkipIndex { anchors, anchors_l2, count }
     }
 
-    /// Save to a `.skip` file alongside the `.c0` column.
+    /// Save to a `.skip` file in v2 format.
+    ///
+    /// Format: `magic(8) + stride_l1(4) + stride_l2(4) + l1_count(8) + l2_count(8) + total(8)
+    ///          + l1_data[u64 × l1_count] + l2_data[u64 × l2_count]`
     fn save(&self, path: &Path) -> io::Result<()> {
         let f = File::create(path)?;
         let mut w = BufWriter::new(f);
-        w.write_all(SKIP_MAGIC)?;
-        w.write_all(&(SKIP_STRIDE as u32).to_le_bytes())?;
-        w.write_all(&(self.anchors.len() as u32).to_le_bytes())?;
-        w.write_all(&(self.count as u64).to_le_bytes())?;
-        for &v in &self.anchors {
-            w.write_all(&v.to_le_bytes())?;
-        }
+        w.write_all(SKIP_MAGIC)?;                                         // 8
+        w.write_all(&(SKIP_STRIDE as u32).to_le_bytes())?;               // 4
+        w.write_all(&(SKIP_STRIDE_L2 as u32).to_le_bytes())?;            // 4
+        w.write_all(&(self.anchors.len() as u64).to_le_bytes())?;        // 8
+        w.write_all(&(self.anchors_l2.len() as u64).to_le_bytes())?;     // 8
+        w.write_all(&(self.count as u64).to_le_bytes())?;                // 8 → total HDR = 40
+        for &v in &self.anchors    { w.write_all(&v.to_le_bytes())?; }
+        for &v in &self.anchors_l2 { w.write_all(&v.to_le_bytes())?; }
         w.flush()
     }
 
-    /// Load from a `.skip` file.
+    /// Load from a `.skip` file (v1 or v2).
+    ///
+    /// v1 (`ECOSKIP1`): reads L1, derives L2 in-memory (no disk re-write).
+    /// v2 (`ECOSKIP2`): reads both L1 and L2 from disk.
     fn load(path: &Path) -> io::Result<Self> {
         let mut buf = Vec::new();
         File::open(path)?.read_to_end(&mut buf)?;
-        if buf.len() < SKIP_HDR {
+        if buf.len() < 8 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "skip file too small"));
         }
+
+        // ── v1 (ECOSKIP1): legacy single-level ───────────────────────────────
+        if &buf[0..8] == SKIP_MAGIC_V1 {
+            // Old header: magic(8) + stride(4) + l1_count(4) + total_count(8) = 24 bytes
+            const V1_HDR: usize = 24;
+            if buf.len() < V1_HDR {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "v1 skip file too small"));
+            }
+            let stride = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+            let n      = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+            let count  = u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize;
+            if stride != SKIP_STRIDE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("v1 skip stride mismatch: {}", stride)));
+            }
+            if buf.len() < V1_HDR + n * 8 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "v1 skip file truncated"));
+            }
+            let anchors: Vec<u64> = (0..n)
+                .map(|i| u64::from_le_bytes(buf[V1_HDR + i*8 .. V1_HDR + i*8+8].try_into().unwrap()))
+                .collect();
+            let anchors_l2 = Self::build_l2(&anchors);
+            return Ok(SkipIndex { anchors, anchors_l2, count });
+        }
+
+        // ── v2 (ECOSKIP2): two-level ─────────────────────────────────────────
         if &buf[0..8] != SKIP_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad skip magic"));
         }
-        let stride = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
-        let n      = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
-        let count  = u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize;
-        if stride != SKIP_STRIDE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("skip stride mismatch: file={} code={}", stride, SKIP_STRIDE),
-            ));
+        if buf.len() < SKIP_HDR {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "v2 skip file too small"));
         }
-        if buf.len() != SKIP_HDR + n * 8 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "skip file size mismatch"));
+        let stride_l1 = u32::from_le_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let stride_l2 = u32::from_le_bytes(buf[12..16].try_into().unwrap()) as usize;
+        let l1_count  = u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize;
+        let l2_count  = u64::from_le_bytes(buf[24..32].try_into().unwrap()) as usize;
+        let count     = u64::from_le_bytes(buf[32..40].try_into().unwrap()) as usize;
+        if stride_l1 != SKIP_STRIDE || stride_l2 != SKIP_STRIDE_L2 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("v2 skip stride mismatch: L1={} L2={}", stride_l1, stride_l2)));
         }
-        let anchors = (0..n)
-            .map(|i| {
-                let off = SKIP_HDR + i * 8;
-                u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
-            })
+        let expected = SKIP_HDR + (l1_count + l2_count) * 8;
+        if buf.len() < expected {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "v2 skip file truncated"));
+        }
+        let mut off = SKIP_HDR;
+        let anchors: Vec<u64> = (0..l1_count)
+            .map(|_| { let v = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8; v })
             .collect();
-        Ok(SkipIndex { anchors, count })
+        // Recompute L2 from L1 to avoid any serialisation drift, OR load from file:
+        // Loading from file is safe because we wrote them ourselves.
+        let anchors_l2: Vec<u64> = (0..l2_count)
+            .map(|_| { let v = u64::from_le_bytes(buf[off..off+8].try_into().unwrap()); off += 8; v })
+            .collect();
+        Ok(SkipIndex { anchors, anchors_l2, count })
     }
 
     /// Return the narrowed `[lo, hi)` range that is guaranteed to contain the
     /// position `lower_bound(key)` in c0.
     ///
-    /// The range spans at most `SKIP_STRIDE + 1` contiguous entries — 4 KB (1 OS
-    /// page) with SKIP_STRIDE = 512.  A single `prefetch_c0` hint on this range
-    /// is enough to load the entire binary search window in one disk I/O.
+    /// ## Two-level search
+    ///
+    /// 1. L2 binary search in `anchors_l2` (~91 KB, L2-cache-resident for 3 B triples):
+    ///    narrows to a window of ≤ `SKIP_STRIDE` L1 anchors (4 KB).
+    /// 2. L1 binary search in that 4 KB window:
+    ///    narrows to ≤ `SKIP_STRIDE` c0 entries (4 KB = 1 OS page).
+    ///
+    /// Total anchor work: ~14 L2-cache hits + ~14 L1-cache hits.
+    /// c0 disk I/O: exactly 1 OS page (irreducible minimum).
     #[inline]
     fn narrow(&self, key: u64) -> (usize, usize) {
         if self.anchors.is_empty() {
             return (0, self.count);
         }
-        // `slot` = first anchor index where anchors[slot] >= key.
-        let slot = self.anchors.partition_point(|&a| a < key);
-        // Everything before (slot-1)*SKIP_STRIDE is guaranteed < key (sorted).
-        let lo = slot.saturating_sub(1) * SKIP_STRIDE;
-        let hi = if slot < self.anchors.len() {
-            // anchors[slot] >= key, so lower_bound is at most slot*SKIP_STRIDE.
-            (slot * SKIP_STRIDE + 1).min(self.count)
+
+        // ── Level 2: narrow to a SKIP_STRIDE-wide window of L1 anchors ───────
+        let (l1_lo, l1_hi) = if self.anchors_l2.is_empty() {
+            (0, self.anchors.len())
         } else {
-            // All anchors < key; lower_bound is somewhere in the tail.
+            let slot_l2 = self.anchors_l2.partition_point(|&a| a < key);
+            let lo = slot_l2.saturating_sub(1) * SKIP_STRIDE;
+            let hi = if slot_l2 < self.anchors_l2.len() {
+                (slot_l2 * SKIP_STRIDE + 1).min(self.anchors.len())
+            } else {
+                self.anchors.len()
+            };
+            (lo, hi)
+        };
+
+        // ── Level 1: narrow to a SKIP_STRIDE-wide window of c0 entries ───────
+        let slot_l1 = l1_lo + self.anchors[l1_lo..l1_hi].partition_point(|&a| a < key);
+        let lo = slot_l1.saturating_sub(1) * SKIP_STRIDE;
+        let hi = if slot_l1 < self.anchors.len() {
+            (slot_l1 * SKIP_STRIDE + 1).min(self.count)
+        } else {
             self.count
         };
         (lo, hi)
@@ -240,36 +335,30 @@ impl SkipIndex {
 
     /// Return a tight **upper bound** (exclusive) for entries with c0 == `key`.
     ///
-    /// All positions `i` with `c0[i] == key` satisfy `i < upper_hint(key)`.
-    ///
-    /// ## Why this matters: secondary-key binary search
-    ///
-    /// `range_for_pattern` with two bound keys (e.g. SPO with s=X, p=Y) needs to
-    /// binary-search for the secondary key within k0's range.  Without this hint,
-    /// the upper bound defaults to `self.count` (the whole index), causing
-    /// O(log total_count) ≈ 31 random page faults on a 500 M-triple store.
-    ///
-    /// With `upper_hint`, the binary search is bounded by the k0's actual degree
-    /// (number of triples with that subject/predicate/object):
-    ///
-    /// ```text
-    /// degree(k0) = upper_hint(k0) − lower_bound(k0)  (at most a few skip blocks)
-    /// binary-search steps = log₂(degree(k0))         (e.g. log₂(1000) = 10)
-    /// ```
-    ///
-    /// For a subject with 1000 triples and SKIP_STRIDE = 512, the hint narrows
-    /// the secondary search to ≤ 2 skip blocks (1024 entries) from 500 M.
+    /// Uses L2 then L1 to narrow the search, same two-level strategy as `narrow()`.
     #[inline]
     pub fn upper_hint(&self, key: u64) -> usize {
         if self.anchors.is_empty() {
             return self.count;
         }
-        // First slot where anchor > key (i.e. anchors[slot] > key).
-        // Because anchors are sorted and anchors[i] = c0[i * SKIP_STRIDE]:
-        //   c0[slot * SKIP_STRIDE] > key
-        // Therefore all entries with c0 == key appear before position slot * SKIP_STRIDE.
-        let slot = self.anchors.partition_point(|&a| a <= key);
-        (slot * SKIP_STRIDE).min(self.count)
+
+        // L2 narrow: find the L1 window
+        let (l1_lo, l1_hi) = if self.anchors_l2.is_empty() {
+            (0, self.anchors.len())
+        } else {
+            let slot_l2 = self.anchors_l2.partition_point(|&a| a <= key);
+            let lo = slot_l2.saturating_sub(1) * SKIP_STRIDE;
+            let hi = if slot_l2 < self.anchors_l2.len() {
+                (slot_l2 * SKIP_STRIDE + 1).min(self.anchors.len())
+            } else {
+                self.anchors.len()
+            };
+            (lo, hi)
+        };
+
+        // L1 narrow: first anchor > key gives the upper bound
+        let slot_l1 = l1_lo + self.anchors[l1_lo..l1_hi].partition_point(|&a| a <= key);
+        (slot_l1 * SKIP_STRIDE).min(self.count)
     }
 }
 
@@ -2362,14 +2451,29 @@ impl TripleIndex {
     /// - `force = false`: skip columns whose `.dz` already exists.
     /// - `force = true`:  overwrite existing `.dz` files.
     ///
+    /// **Predicate-boundary alignment**: for `pos.c1` and `pso.c1` (object
+    /// column of predicate-sorted indexes), a new delta block is forced at each
+    /// predicate boundary.  This keeps all object IDs in a block within one
+    /// predicate's range, minimising maximum delta and enabling U8/U16 encoding.
+    ///
     /// Returns the number of column files compressed.
     pub fn compress_columns(store_dir: &std::path::Path, force: bool) -> io::Result<usize> {
-        use crate::col_delta::encode_column;
+        use crate::col_delta::{encode_column, encode_column_pred_aligned};
+
+        /// Load predicate run boundaries (lo positions > 0) from the .pidx alongside c0.
+        fn load_pred_boundaries(c0_path: &std::path::Path) -> Vec<usize> {
+            let pidx_path = pidx_path_from_c0(c0_path);
+            let Ok(pidx) = PredicateIndex::load(&pidx_path) else { return Vec::new(); };
+            let mut boundaries: Vec<usize> = pidx.ranges.values().map(|&(lo, _)| lo).collect();
+            boundaries.sort_unstable();
+            boundaries.retain(|&b| b > 0);
+            boundaries
+        }
 
         let mut compressed = 0usize;
         for entry in std::fs::read_dir(store_dir)?.flatten() {
             let path = entry.path();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
             // Match *.c0, *.c1, *.c2 (but not *.c0.dz, etc.)
             if !( (name.ends_with(".c0") || name.ends_with(".c1") || name.ends_with(".c2"))
                   && !name.ends_with(".dz") )
@@ -2411,13 +2515,33 @@ impl TripleIndex {
                 .collect();
 
             let t = std::time::Instant::now();
-            encode_column(&values, &dz_path)?;
+
+            // For pos.c1 / pso.c1 (object column of predicate-sorted index),
+            // use predicate-boundary-aligned encoding for better compression.
+            let use_pred_align = name == "pos.c1" || name == "pso.c1";
+            if use_pred_align {
+                let c0_name = name.replace(".c1", ".c0");
+                let c0_path = path.with_file_name(&c0_name);
+                let boundaries = load_pred_boundaries(&c0_path);
+                if !boundaries.is_empty() {
+                    tracing::debug!(
+                        col = name.as_str(),
+                        boundaries = boundaries.len(),
+                        "compress-cols: using pred-aligned encoding"
+                    );
+                    encode_column_pred_aligned(&values, &boundaries, &dz_path)?;
+                } else {
+                    encode_column(&values, &dz_path)?;
+                }
+            } else {
+                encode_column(&values, &dz_path)?;
+            }
             let orig_mb = mmap.len() as f64 / (1024.0 * 1024.0);
             let dz_size = std::fs::metadata(&dz_path)?.len();
             let dz_mb   = dz_size as f64 / (1024.0 * 1024.0);
             let ratio   = orig_mb / dz_mb;
             tracing::info!(
-                col = name,
+                col = name.as_str(),
                 orig_mb = format!("{:.1}", orig_mb),
                 dz_mb   = format!("{:.1}", dz_mb),
                 ratio   = format!("{:.1}×", ratio),

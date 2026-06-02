@@ -61,6 +61,10 @@ form_urlencoded = "1"
 # Error handling in main
 anyhow = "1"
 
+# Compressed bitset for rdf:type subject membership (TypeCache)
+# RoaringTreemap supports u64 keys; RoaringBitmap covers u32 only.
+roaring = "0.10"
+
 # Configuration file parsing
 toml = "0.8"
 

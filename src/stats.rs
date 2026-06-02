@@ -219,6 +219,52 @@ impl StoreStatistics {
         Ok(Self { total_triples, predicate_stats })
     }
 
+    // ── Functional predicate detection (改善6) ───────────────────────────────
+
+    /// Return `true` if `pred_id` is a **functional predicate** — one where
+    /// each subject has at most one object.
+    ///
+    /// A predicate is considered functional when
+    ///   `triple_count ≤ subject_count × FUNCTIONAL_RATIO_THRESHOLD`
+    /// where `FUNCTIONAL_RATIO_THRESHOLD = 1.05` (5% tolerance for data anomalies).
+    ///
+    /// Functional predicates include: `dct:identifier`, `up:mnemonic`,
+    /// `schema:name` for most entities, `xsd:value`, etc.  For these, the
+    /// (S → O) mapping can be resolved in O(log N) via PredPartitions with
+    /// a single binary search, rather than returning a range of multiple objects.
+    ///
+    /// ## Why this matters
+    ///
+    /// When a pattern `?x pred:functional ?value` is used in a JOIN where `?x`
+    /// is already bound, the executor can:
+    ///   - Skip the general POS scan (may touch many OS pairs)
+    ///   - Use `PredPartFile::get_single_object(s)` → exactly one result
+    ///   - Avoid allocating a Vec for the scan output
+    ///
+    /// This is detected statically from `stats.bin` so there is no runtime cost.
+    #[inline]
+    pub fn is_functional(&self, pred_id: TermId) -> bool {
+        const FUNCTIONAL_RATIO_THRESHOLD: f64 = 1.05;
+        self.predicate_stats.get(&pred_id).map_or(false, |ps| {
+            ps.subject_count > 0
+                && (ps.triple_count as f64) <= (ps.subject_count as f64) * FUNCTIONAL_RATIO_THRESHOLD
+        })
+    }
+
+    /// Return a `Vec` of all functional predicate IDs.
+    ///
+    /// Used by the build step to decide which predicates warrant a dedicated
+    /// `pp_{id}.bin` partition file (highest priority targets for functional
+    /// lookups during query time).
+    pub fn functional_predicate_ids(&self) -> Vec<TermId> {
+        self.predicate_stats.iter()
+            .filter(|(_, ps)| {
+                ps.subject_count > 0 && ps.triple_count <= ((ps.subject_count as f64 * 1.05) as u64)
+            })
+            .map(|(&pred_id, _)| pred_id)
+            .collect()
+    }
+
     // ── Cardinality estimation ────────────────────────────────────────────────
 
     /// Estimate the number of results for a triple pattern.

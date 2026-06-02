@@ -864,6 +864,84 @@ Semaphore (max_concurrent_queries): アプリ層の同時数キャップ
 
 ---
 
+---
+
+## インデックス改善 (2024実装)
+
+以下の6つの改善をまとめて実装しました。再インデックスコストを考慮して1回の実装にまとめています。
+
+### 改善1: 述語境界アライン Delta エンコーディング (`col_delta.rs` + `index.rs`)
+
+`encode_column_pred_aligned(values, boundaries, path)` を追加。`ecordf compress-cols` の `pos.c1` / `pso.c1` (述語内オブジェクト列) に述語境界でブロックを強制分割してから圧縮。
+
+```
+従来: 1ブロックが述語Aの末尾+述語Bの先頭をまたぐ → max_delta が2述語分のO範囲 → U32/U64 エンコード
+改善後: ブロックは常に1述語内に収まる → max_delta が当該述語のO範囲のみ → U8/U16 エンコードに改善
+```
+
+**実装**: `compress_columns()` が `.pidx` から境界を読み取り、`pos.c1`/`pso.c1` に `encode_column_pred_aligned` を適用。他の列は従来通り `encode_column`。
+
+### 改善2: PFOR-Delta ✅ (既実装)
+
+`col_delta.rs` (ECOCOL02) で実装済み。`ALL_SAME` (述語列に256×圧縮), `U8/U16/U32/U64` 最小幅デルタ。
+
+### 改善3: Roaring Bitmap TypeCache (`type_cache.rs` + `Cargo.toml`)
+
+`TypeCache` の `HashMap<TermId, Vec<TermId>>` を `HashMap<TermId, RoaringTreemap>` に変更。
+
+| 操作 | Vec + binary_search | RoaringTreemap |
+|-----|---------------------|----------------|
+| `contains()` | O(log N) | O(1) |
+| 2クラス積集合 | O(N) マージ | SIMD AND, O(N/64) |
+| メモリ (3.7M subjects) | 28 MB | 2–4 MB |
+
+**実装**: `get_bitmap(class_id) -> Option<&RoaringTreemap>` を追加。executor.rs を `get_bitmap` + `bm.contains(s)` に更新。`roaring = "0.10"` を `Cargo.toml` に追加。
+
+### 改善4: 二段 SkipIndex (`index.rs`)
+
+`SkipIndex` に L2 アンカーを追加 (`SKIP_STRIDE_L2 = 512² = 262144`)。
+
+```
+L2 anchors: 3Bトリプルで ~11,444 × 8B ≈ 91 KB → L2 CPU キャッシュに収まる
+L1 anchors: 3Bトリプルで ~5.86M × 8B ≈ 47 MB (キャッシュ外)
+
+2段 narrow(): L2 binary search (14回 L2キャッシュヒット) → L1 window (512エントリ, 4KB) → 1 page fault
+1段 narrow(): L1 binary search (23回, 47MBからランダム) → 1 page fault
+```
+
+`.skip` ファイルフォーマットを `ECOSKIP1` (v1) → `ECOSKIP2` (v2) に更新。v1 の自動読み込みも対応（L2は L1から再導出）。
+
+### 改善5: SIP (Sideways Information Passing) 汎化 (`executor.rs`)
+
+既存の `eval_sequence_with_subject_filter` に加え、hash_join パス全体に SIP 事前フィルタを追加。
+
+**既存 SIP**: 2-hop Sequence パスの step 0 → step 1 削減 (11.8M → 508)
+
+**新規 SIP**: `hash_join` 選択時、`right_rs` を実行後・結合前にフィルタリング。
+
+```
+条件: left_rs.rows < right_rs.rows / 10 かつ共有変数ごとの left値集合 ≤ 100,000
+効果: right_rs から join 不可能な行を除去 → hash_join のメモリと処理コストを削減
+例: left=508 peptide, right=10M rdf:type → right を508行にフィルタ後 join
+```
+
+SIP_MAX_LEFT_VALUES = 100,000。超過時はフィルタをスキップして従来の hash_join へ。
+
+### 改善6: 機能的述語の自動検出と最適化 (`stats.rs` + `pred_partition.rs` + `executor.rs`)
+
+`StoreStatistics::is_functional(pred_id)` を追加。`triple_count ≤ subject_count × 1.05` の述語を機能的と判定。
+
+`PredPartFile::get_single_object(s) -> Option<TermId>` を追加。機能的述語の S → O 直接ルックアップ (O(log N)、Vec 割り当てなし)。
+
+executor.rs の `bind_join` 内 pred_partition パスで、機能的述語検出時に `get_single_object` を使用:
+
+```
+非機能的述語: get_objects(s) → &[(S,O)] → Vec 割り当て → HashMap
+機能的述語:   get_single_object(s) → Option<TermId> → 直接 HashMap 挿入
+```
+
+---
+
 ## 今後の拡張候補
 
 1. **SPARQL UPDATE** — INSERT DATA / DELETE DATA / MODIFY

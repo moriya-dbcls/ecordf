@@ -129,6 +129,26 @@ impl PredPartFile {
     pub fn contains(&self, s: TermId, o: TermId) -> bool {
         self.pairs.binary_search(&(s, o)).is_ok()
     }
+
+    /// O(log N) lookup for the unique object of a **functional predicate**.
+    ///
+    /// For predicates where each subject has at most one object, this returns
+    /// `Some(o)` when subject `s` is found, and `None` when `s` is absent.
+    ///
+    /// ## Why functional predicates benefit (改善6)
+    ///
+    /// `get_objects(s)` works correctly for all predicates but allocates no
+    /// result for subjects absent in the partition.  For functional predicates
+    /// (one object per subject) the slice always has length 0 or 1, so this
+    /// specialisation avoids the slice overhead entirely.
+    ///
+    /// Callers should confirm the predicate is functional via
+    /// `StoreStatistics::is_functional()` before using this method.
+    #[inline]
+    pub fn get_single_object(&self, s: TermId) -> Option<TermId> {
+        let lo = self.pairs.partition_point(|&(ps, _)| ps < s);
+        self.pairs.get(lo).filter(|&&(ps, _)| ps == s).map(|&(_, o)| o)
+    }
 }
 
 // ── Collection ────────────────────────────────────────────────────────────────
