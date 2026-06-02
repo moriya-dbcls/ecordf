@@ -39,7 +39,7 @@
 
 use memmap2::{Advice, Mmap};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -2242,6 +2242,74 @@ impl TripleIndex {
     /// This is a pure in-RAM operation — no disk I/O, no binary search.
     pub fn pos_predicate_range(&self, pred: TermId) -> Option<(usize, usize)> {
         self.pos.pred_idx.as_ref()?.get(pred)
+    }
+
+    /// Returns true when the PSO index is available.
+    pub fn has_pso(&self) -> bool {
+        self.pso.is_some()
+    }
+
+    /// Scan PSO for `pred` and collect up to `subject_limit` unique subjects
+    /// with their objects.
+    ///
+    /// ## Why this beats POS + full-scan for LIMIT queries
+    ///
+    /// POS is `(P, O, S)` — subjects for a given predicate are scattered
+    /// across the sort.  Collecting K unique subjects requires reading O(|pred|)
+    /// entries even when K ≪ |pred|.
+    ///
+    /// PSO is `(P, S, O)` — subjects are contiguous within the predicate range.
+    /// Collecting the first K unique subjects requires reading only
+    /// O(K × avg_objects_per_subject) entries.
+    ///
+    /// Example: `dct:identifier` has 10 M entries (1 per PSM).
+    ///   POS scan:           reads all 10 M entries → 15 s
+    ///   PSO early-exit:     reads 1 000 entries    → < 1 ms
+    ///
+    /// ## Subject filter
+    ///
+    /// `subject_filter`: when non-empty, only subjects present in this set are
+    /// collected.  When empty, all subjects in the predicate range are accepted.
+    ///
+    /// ## Return value
+    ///
+    /// `(s_to_objects, exhausted)` where:
+    ///   - `s_to_objects`: subject → objects mapping (sorted by object)
+    ///   - `exhausted`: true when the predicate range was fully scanned
+    ///     (subject_limit was not reached; the result is complete)
+    pub fn scan_pso_subject_limit(
+        &self,
+        pred: TermId,
+        subject_limit: usize,
+        subject_filter: &HashSet<TermId>,
+    ) -> (HashMap<TermId, Vec<TermId>>, bool) {
+        let Some(pso) = &self.pso else {
+            return (HashMap::new(), false);
+        };
+
+        // PSO is (P,S,O); pattern with P bound and S,O free.
+        let pat = TriplePattern { s: UNBOUND, p: pred, o: UNBOUND };
+        // The raw pattern for PSO reorders to [P, S, O].
+        // Use scan() which calls range_for_pattern → pred_idx gives O(1) range.
+        let mut s_to_objects: HashMap<TermId, Vec<TermId>> = HashMap::new();
+        let mut unique_subjects = 0usize;
+
+        for triple in pso.scan(&pat) {
+            let s = triple.s;
+            if !subject_filter.is_empty() && !subject_filter.contains(&s) {
+                continue;
+            }
+            let is_new = !s_to_objects.contains_key(&s);
+            s_to_objects.entry(s).or_default().push(triple.o);
+            if is_new {
+                unique_subjects += 1;
+                if unique_subjects >= subject_limit {
+                    return (s_to_objects, false); // limit reached, not exhausted
+                }
+            }
+        }
+
+        (s_to_objects, true) // fully exhausted
     }
 
     /// Number of distinct predicates in the store (from the predicate index).

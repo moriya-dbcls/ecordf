@@ -1573,6 +1573,38 @@ impl<'a> Executor<'a> {
                     s_to_objects.insert(s, objs);
                 }
             }
+        } else if let Some(push_limit) = self.pushdown_limit.get().filter(|&lim| {
+            // Use PSO early-termination when:
+            //   1. LIMIT pushdown is active
+            //   2. PSO index is available
+            //   3. subjects.len() > push_limit (more candidates than needed —
+            //      the whole point is to avoid scanning all of them)
+            //
+            // PSO is (P, S, O): subjects are contiguous per predicate.
+            // Scanning PSO until `push_limit` unique subjects are collected
+            // costs O(push_limit × fanout) instead of O(|pred_range|).
+            //
+            // Example: dct:identifier, 10 M entries, LIMIT 1 000
+            //   POS scan:  reads 10 M entries → 15 s
+            //   PSO early: reads 1 000 entries → < 1 ms
+            self.index.has_pso() && subjects.len() > lim
+        }) {
+            tracing::debug!(
+                pred = base.p,
+                unique_subjects = subjects.len(),
+                push_limit,
+                mode = "pso_early_termination",
+                "bind_join join: using PSO early-termination scan"
+            );
+            let (pso_result, exhausted) = self.index.scan_pso_subject_limit(
+                base.p, push_limit, &subjects
+            );
+            s_to_objects = pso_result;
+            tracing::debug!(
+                collected = s_to_objects.len(),
+                exhausted,
+                "PSO early-termination: done"
+            );
         } else {
             // One sequential POS/OPS scan: collect (S → [O]) pairs for matching subjects.
             for triple in self.index.scan(&scan_pat) {
@@ -1613,6 +1645,33 @@ impl<'a> Executor<'a> {
 
         let triples_matched: usize = s_to_objects.values().map(|v| v.len()).sum();
 
+        // Fanout-adjusted expansion limit for 1:N join steps.
+        //
+        // Problem: applying pushdown_limit directly to the expansion row count
+        // causes premature truncation when each subject expands to multiple
+        // objects (1:N join).
+        //
+        // Example: LIMIT 1000, PSM → SIO_000216 (7 nodes/PSM)
+        //   raw limit = 1000 → stops after 1000 rows = 142 PSMs × 7 nodes
+        //   only 142 PSMs get v1 resolved → type filter returns 142 (wrong!)
+        //
+        // Fix: scale the expansion limit by max observed fanout:
+        //   fanout = 7 → expansion_limit = 1000 × 7 = 7000
+        //   all 1000 PSMs × 7 nodes = 7000 rows → collected in full → filter
+        //   returns 1000 (correct)
+        //
+        // For 1:1 joins (G-6 dct:identifier, fanout=1):
+        //   expansion_limit = 200 × 1 = 200 → same behaviour as before ✓
+        let max_fanout = s_to_objects.values().map(|v| v.len()).max().unwrap_or(1).max(1);
+        let expansion_limit: Option<usize> = self.pushdown_limit.get()
+            .map(|lim| lim.saturating_mul(max_fanout));
+
+        tracing::debug!(
+            max_fanout,
+            expansion_limit = ?expansion_limit,
+            "predicate scan (join): computed expansion limit"
+        );
+
         // Expand: for each (S, O) pair, cross with all left rows sharing that S.
         'expand: for (s_id, objects) in &s_to_objects {
             if self.is_cancelled() {
@@ -1637,8 +1696,8 @@ impl<'a> Executor<'a> {
                         result.overflow = true;
                         return Some(result);
                     }
-                    if self.is_limit_reached(result.rows.len()) {
-                        tracing::debug!(rows = result.rows.len(), "predicate scan (join): LIMIT reached, stopping early");
+                    if matches!(expansion_limit, Some(lim) if result.rows.len() >= lim) {
+                        tracing::debug!(rows = result.rows.len(), max_fanout, "predicate scan (join): expansion limit reached, stopping early");
                         break 'expand;
                     }
                 }
