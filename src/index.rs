@@ -456,6 +456,37 @@ impl PredicateIndex {
         Self { ranges }
     }
 
+    /// Build by one sequential scan over a delta-encoded POS c0 column.
+    ///
+    /// Called when the `.pidx` file is absent but `.c0.dz` exists (e.g. first
+    /// open after `compress-cols`).  Uses `DeltaColIter` for sequential
+    /// decompression — no random access, no page faults.
+    fn build_from_pos_c0_delta(col0: &crate::col_delta::DeltaColFile, count: usize) -> Self {
+        let mut ranges: HashMap<TermId, (usize, usize)> = HashMap::new();
+        if count == 0 {
+            return Self { ranges };
+        }
+        let mut iter = col0.iter_from(0);
+        let mut cur_pred = match iter.next() {
+            Some(v) => v,
+            None => return Self { ranges },
+        };
+        let mut run_start = 0usize;
+        for i in 1..count {
+            let p = match iter.next() {
+                Some(v) => v,
+                None => break,
+            };
+            if p != cur_pred {
+                ranges.insert(cur_pred, (run_start, i));
+                cur_pred = p;
+                run_start = i;
+            }
+        }
+        ranges.insert(cur_pred, (run_start, count));
+        Self { ranges }
+    }
+
     /// Build from skip anchors collected during a k-way merge (no extra I/O).
     /// `pred_runs` is a Vec of `(pred, lo, hi)` tuples collected during the merge loop.
     fn build_from_runs(pred_runs: Vec<(TermId, usize, usize)>) -> Self {
@@ -1061,8 +1092,15 @@ impl IndexFile {
         }
         let count = col0.count;
 
+        // The .skip and .pidx files are stored alongside the RAW column files
+        // (e.g. `pos.skip`, `pos.pidx`), not alongside the `.dz` files
+        // (e.g. `pos.c0.dz`).  Strip the `.dz` extension to get the base c0 path.
+        //
+        // delta_path(pos.c0) = pos.c0.dz  →  pos.c0.dz.with_extension("") = pos.c0
+        let c0_base = paths[0].with_extension("");
+
         // Build SkipIndex and PredicateIndex from the delta col (sequential c0 scan).
-        let skip_p = skip_path_from_c0(&paths[0]);
+        let skip_p = skip_path_from_c0(&c0_base);
         let skip = if skip_p.exists() {
             SkipIndex::load(&skip_p).ok().filter(|s| s.count == count)
         } else {
@@ -1078,11 +1116,15 @@ impl IndexFile {
 
         // Build PredicateIndex for POS/PSO.
         let pred_idx = if kind == IndexKind::Pos || kind == IndexKind::Pso {
-            let pidx_p = pidx_path_from_c0(&paths[0]);
+            let pidx_p = pidx_path_from_c0(&c0_base);
             if pidx_p.exists() {
                 PredicateIndex::load(&pidx_p).ok()
             } else {
-                None
+                // pidx not found — rebuild from delta column c0 (one sequential scan).
+                eprintln!("  [Pos/Pso] Building predicate index from delta column…");
+                let pi = PredicateIndex::build_from_pos_c0_delta(&col0, count);
+                let _ = pi.save(&pidx_p);
+                Some(pi)
             }
         } else {
             None

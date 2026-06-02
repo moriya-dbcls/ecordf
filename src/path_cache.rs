@@ -43,6 +43,7 @@ use std::time::Instant;
 
 use crate::dict_builder::QueryDict;
 use crate::index::TripleIndex;
+use crate::predcache::PredCache;
 use crate::rdf_config::CompoundPath;
 use crate::triple::{TermId, TriplePattern, UNBOUND};
 
@@ -122,6 +123,7 @@ impl PathCache {
         compound_paths: &[CompoundPath],
         dict: &QueryDict,
         index: &TripleIndex,
+        pred_cache: &PredCache,
         budget_bytes: usize,
     ) -> Self {
         let t0 = Instant::now();
@@ -201,8 +203,8 @@ impl PathCache {
                 continue;
             }
 
-            // Materialise the path
-            let pairs = materialise_path(&path_ids, index);
+            // Materialise the path (uses pred_cache when available to avoid POS scans)
+            let pairs = materialise_path(&path_ids, index, pred_cache);
             if pairs.is_empty() {
                 tracing::debug!(
                     path = ?path_iris,
@@ -296,31 +298,45 @@ fn resolve_path(path_iris: &[String], dict: &QueryDict) -> Option<Vec<TermId>> {
 
 // ── Path materialisation ──────────────────────────────────────────────────────
 
+/// Retrieve all `(s, o)` pairs for `pred_id`, preferring the pred_cache.
+///
+/// pred_cache stores pairs sorted by `(s, o)` which is exactly the order
+/// needed for merge-join.  When a cache hit occurs, we avoid:
+///   - A full POS scan (sequential I/O, potentially millions of entries)
+///   - An O(N log N) sort by subject
+///
+/// Falls back to a POS index scan + sort when the predicate is not cached.
+fn get_pred_pairs(pred_id: TermId, index: &TripleIndex, pred_cache: &PredCache)
+    -> Vec<(TermId, TermId)>
+{
+    if let Some(cached) = pred_cache.get(pred_id) {
+        // pred_cache stores (S, O) sorted by (S, O) — already the right order.
+        cached.to_vec()
+    } else {
+        let pat = TriplePattern::new(UNBOUND, pred_id, UNBOUND);
+        let mut pairs: Vec<(TermId, TermId)> = index.scan(&pat)
+            .map(|t| (t.s, t.o))
+            .collect();
+        pairs.sort_unstable_by_key(|&(s, _)| s);
+        pairs
+    }
+}
+
 /// Materialise all (start, end) pairs reachable through `path_ids`.
 ///
-/// Algorithm: iterative hop-by-hop expansion.
-///
-/// 1. Scan all `(s, o)` pairs for `path_ids[0]` from the POS index.
-/// 2. Use the object set as the subject set for `path_ids[1]`.
-/// 3. Repeat through the chain, carrying forward the full (start, mid…, end) chain
-///    as `(original_start, current_end)` pairs.
-/// 4. Return the sorted (start, end) pairs.
-///
-/// For long paths or large intermediate sets this can be memory-intensive, but
-/// in practice model.yaml paths through blank nodes have small intermediate sets
-/// (blank nodes are not shared between independent subjects).
-fn materialise_path(path_ids: &[TermId], index: &TripleIndex) -> Vec<(TermId, TermId)> {
+/// Uses `pred_cache` to avoid POS scans and sorts when predicates are cached.
+/// Each hop fetches `(s, o)` pairs sorted by `s`, then performs a merge-join.
+fn materialise_path(
+    path_ids: &[TermId],
+    index: &TripleIndex,
+    pred_cache: &PredCache,
+) -> Vec<(TermId, TermId)> {
     if path_ids.is_empty() {
         return Vec::new();
     }
 
-    // Start: scan the first predicate
-    let first_pred = path_ids[0];
-    let pat = TriplePattern::new(UNBOUND, first_pred, UNBOUND);
-    // current = Vec<(start, mid)>
-    let mut current: Vec<(TermId, TermId)> = index.scan(&pat)
-        .map(|t| (t.s, t.o))
-        .collect();
+    // First hop: get (s, o) pairs sorted by s.
+    let mut current: Vec<(TermId, TermId)> = get_pred_pairs(path_ids[0], index, pred_cache);
 
     // Subsequent hops
     for &pred_id in &path_ids[1..] {
@@ -328,19 +344,10 @@ fn materialise_path(path_ids: &[TermId], index: &TripleIndex) -> Vec<(TermId, Te
             break;
         }
 
-        // Build a HashSet of the current "frontier" (mid values) for O(1) lookup
-        // We need to join current.o with next-hop.s
-        // Strategy: collect next hop pairs for this predicate, then merge-join.
+        // next_hop: (s, o) sorted by s — ready for merge-join on current.o == next_hop.s
+        let next_hop = get_pred_pairs(pred_id, index, pred_cache);
 
-        let hop_pat = TriplePattern::new(UNBOUND, pred_id, UNBOUND);
-        // next_hop: Vec<(s, o)> sorted by s (POS scan gives P-O-S order;
-        //           we need to sort by s for merge join)
-        let mut next_hop: Vec<(TermId, TermId)> = index.scan(&hop_pat)
-            .map(|t| (t.s, t.o))
-            .collect();
-        next_hop.sort_unstable_by_key(|&(s, _)| s);
-
-        // Sort current by mid (second element) for merge join
+        // current must be sorted by .1 (the "mid" value = object of previous hop)
         current.sort_unstable_by_key(|&(_, mid)| mid);
 
         // Merge join: current.mid == next_hop.s

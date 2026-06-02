@@ -672,7 +672,7 @@ impl Store {
             return;
         }
         let budget_bytes = (budget_mb as usize) * 1024 * 1024;
-        self.path_cache = PathCache::build(compound_paths, &self.dict, &*self.index, budget_bytes);
+        self.path_cache = PathCache::build(compound_paths, &self.dict, &*self.index, &self.pred_cache, budget_bytes);
         tracing::info!(
             paths_cached = self.path_cache.len(),
             mb_used = self.path_cache.bytes_used() / (1024 * 1024),
