@@ -303,6 +303,7 @@ impl Store {
                     config.build.chunk_size,
                     num_threads,
                     ram_budget_bytes,
+                    config.build.p2a_buf_mb,
                 )
             })?
         } else {

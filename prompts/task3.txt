@@ -1,72 +1,243 @@
-# タスク3: store.rs を新 CompoundPath 型に対応
+# タスク3: 50B トリプルスケール対応 — Phase 2 チェックポイントと p2a_buf_mb 設定化
 
 ## 作業ディレクトリ
 /home/moriya/tmp/ecordf
 
 ## 担当ファイル
-- src/store.rs
+- src/config.rs
+- src/loader.rs
 
-## 背景
-task7 が rdf_config.rs の CompoundPath 型を以下のように変更する:
+## 背景と目的
 
+UniProt 全体 (~500億トリプル) の Indexing を現実的な時間（1日以内）で完了させるための
+2つの重要な改善を実装する。
+
+---
+
+## 変更 1: p2a_buf_mb を設定可能にする
+
+### 問題
+`load_triples_streaming` 内で Phase 2a の per-file バッファが
+`const P2A_BUF_BYTES: usize = 64 * 1024 * 1024;` とハードコードされている。
+大規模データセットではファイルあたりの unique string が多く、
+64MB では大量のチャンクが生成されて Join ステップが非効率になる。
+
+### config.rs への追加
+
+`BuildConfig` 構造体（`pub struct BuildConfig` のある箇所）に以下を追加:
 ```rust
-// 変更前
-pub type CompoundPath = Vec<String>;
-
-// 変更後
-pub type CompoundPath = Vec<(String, Cardinality)>;
+    /// Per-file buffer size for Phase 2a string collection (MB).
+    /// Larger values reduce the number of p2a chunk files, speeding up the
+    /// streaming Phase 2 join step at the cost of more RAM per thread.
+    /// Default: 64 MB.  For 50B+ triple datasets, 512–2048 is recommended.
+    pub p2a_buf_mb: usize,
 ```
 
-store.rs の `build_path_cache_from_compounds` は現在
-`compound_paths: &[Vec<String>]` と明示的に型注釈しているため、更新が必要。
+デフォルト値（`BuildConfig::default()` または `impl Default` の中）に追加:
+```rust
+            p2a_buf_mb: 64,
+```
 
-## 変更内容
+### loader.rs への変更
 
-### 1. import に CompoundPath を追加
-
-store.rs の先頭付近にある `use crate::rdf_config` の行を探し、
-CompoundPath を import する。
+`load_triples_streaming` 関数のシグネチャに `p2a_buf_mb: usize` を追加し、
+ハードコードの `const P2A_BUF_BYTES` を削除して引数から計算する:
 
 現在:
 ```rust
-use crate::rdf_config;
+pub fn load_triples_streaming(
+    inputs: &[InputSpec],
+    dict_path: &Path,
+    _term_count: u64,
+    tmp_dir: &Path,
+    chunk_size: usize,
+    num_threads: usize,
+    _ram_budget_bytes: usize,
+) -> io::Result<(Vec<crate::index::ParallelChunks>, LoadStats)> {
+    ...
+    const P2A_BUF_BYTES: usize = 64 * 1024 * 1024;
 ```
 
 変更後:
 ```rust
-use crate::rdf_config::{self, CompoundPath};
+pub fn load_triples_streaming(
+    inputs: &[InputSpec],
+    dict_path: &Path,
+    _term_count: u64,
+    tmp_dir: &Path,
+    chunk_size: usize,
+    num_threads: usize,
+    _ram_budget_bytes: usize,
+    p2a_buf_mb: usize,
+) -> io::Result<(Vec<crate::index::ParallelChunks>, LoadStats)> {
+    ...
+    let p2a_buf_bytes = p2a_buf_mb.max(16) * 1024 * 1024;
 ```
 
-(もし既に別の形で import されていれば、そちらに `CompoundPath` を追加する)
+以降の `P2A_BUF_BYTES` をすべて `p2a_buf_bytes` に置き換える。
 
-### 2. build_path_cache_from_compounds のシグネチャ変更
+### store.rs の呼び出し側を更新
 
-現在 (663行付近):
+`store.rs` の `load_triples_streaming(...)` 呼び出し箇所に
+`config.build.p2a_buf_mb` を渡す:
+
+現在:
 ```rust
-    pub fn build_path_cache_from_compounds(
-        &mut self,
-        compound_paths: &[Vec<String>],
-        budget_mb: u64,
-    ) {
+            pool.install(|| {
+                load_triples_streaming(
+                    inputs,
+                    &dict_sorted_path,
+                    term_count,
+                    &tmp_dir,
+                    config.build.chunk_size,
+                    num_threads,
+                    ram_budget_bytes,
+                )
+            })?
 ```
 
 変更後:
 ```rust
-    pub fn build_path_cache_from_compounds(
-        &mut self,
-        compound_paths: &[CompoundPath],
-        budget_mb: u64,
-    ) {
+            pool.install(|| {
+                load_triples_streaming(
+                    inputs,
+                    &dict_sorted_path,
+                    term_count,
+                    &tmp_dir,
+                    config.build.chunk_size,
+                    num_threads,
+                    ram_budget_bytes,
+                    config.build.p2a_buf_mb,
+                )
+            })?
 ```
 
-### 3. その他コンパイルエラーがあれば修正
+---
 
-上記の変更でコンパイルエラーが出る箇所があれば修正すること。
+## 変更 2: Phase 2 バッチ単位チェックポイント（最重要）
+
+### 問題
+50B トリプルのビルドは Phase 2 streaming に 10-20 時間かかる。
+途中でクラッシュした場合、`--resume-phase2` は Phase 1 をスキップするが、
+Phase 2 の各バッチを最初からやり直す必要がある。
+16 バッチあれば 1 バッチ = 約 1 時間のロスが最大 15 時間になる。
+
+### 実装方針
+
+`load_triples_streaming` 内で、各バッチ処理の前後に
+`_ecordf_tmp/p2_progress.json` を読み書きしてチェックポイントを管理する。
+
+```json
+{"completed_batches": [0, 1, 2, 3]}
+```
+
+完了したバッチ番号のリストを保持し、再実行時にスキップする。
+
+### loader.rs の変更
+
+`load_triples_streaming` 関数内のバッチループを以下のように修正する。
+
+**チェックポイントファイルのパス定義**（関数先頭付近）:
+```rust
+    let checkpoint_path = tmp_dir.join("p2_progress.json");
+```
+
+**チェックポイントの読み込み**（バッチループの前）:
+```rust
+    // Load existing checkpoint if present (resume support).
+    let completed_batches: std::collections::HashSet<usize> = {
+        if let Ok(data) = std::fs::read_to_string(&checkpoint_path) {
+            // Parse {"completed_batches": [0, 1, 2, ...]}
+            let parsed: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
+            parsed["completed_batches"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                .unwrap_or_default()
+        } else {
+            std::collections::HashSet::new()
+        }
+    };
+    if !completed_batches.is_empty() {
+        eprintln!(
+            "  Resuming: {} batch(es) already completed: {:?}",
+            completed_batches.len(),
+            {
+                let mut v: Vec<usize> = completed_batches.iter().copied().collect();
+                v.sort();
+                v
+            }
+        );
+    }
+    let mut completed_batches_vec: Vec<usize> = {
+        let mut v: Vec<usize> = completed_batches.iter().copied().collect();
+        v.sort();
+        v
+    };
+```
+
+**バッチループの先頭**（スキップ判定を追加）:
+```rust
+    for (batch_idx, (batch_inputs, batch_p2a)) in inputs
+        .chunks(max_batch)
+        .zip(p2a_files.chunks(max_batch))
+        .enumerate()
+    {
+        // Skip already-completed batches on resume.
+        if completed_batches.contains(&batch_idx) {
+            eprintln!(
+                "--- Batch {}/{}: skipped (already completed) ---",
+                batch_idx + 1,
+                num_batches,
+            );
+            continue;
+        }
+        let t_batch = std::time::Instant::now();
+        eprintln!(
+            "--- Batch {}/{}: {} files ---",
+            ...
+        );
+```
+
+**バッチ完了後のチェックポイント書き込み**（バッチループの末尾、`all_chunks.extend(...)` の後）:
+```rust
+        // Write checkpoint after each batch completes.
+        completed_batches_vec.push(batch_idx);
+        {
+            let json = serde_json::json!({
+                "completed_batches": completed_batches_vec
+            });
+            if let Ok(mut f) = std::fs::File::create(&checkpoint_path) {
+                let _ = std::io::Write::write_all(&mut f, json.to_string().as_bytes());
+            }
+        }
+```
+
+**ビルド完了後にチェックポイントファイルを削除**（store.rs の load_two_pass_internal 末尾 or
+loader.rs の load_triples_streaming の return 直前）:
+```rust
+    // Clean up checkpoint on successful completion.
+    let _ = std::fs::remove_file(&checkpoint_path);
+```
+
+### serde_json の依存確認
+
+`serde_json` が既に Cargo.toml に含まれているか確認する:
+```bash
+grep "serde_json" /home/moriya/tmp/ecordf/Cargo.toml
+```
+
+含まれていれば追加不要。含まれていなければ `Cargo.toml` の `[dependencies]` に追加:
+```toml
+serde_json = "1"
+```
+
+---
 
 ## ビルドと確認
 
 ```bash
 cd /home/moriya/tmp/ecordf
+grep "serde_json" Cargo.toml  # 依存確認
 cargo build --release 2>&1 | tail -30
 cargo test 2>&1 | tail -20
 ```
@@ -74,13 +245,16 @@ cargo test 2>&1 | tail -20
 ## やらないこと
 - git push
 - サーバーの起動・停止
-- src/store.rs 以外のソース変更
+- src/config.rs / src/loader.rs / src/store.rs 以外のソース変更
 
 ## 報告先
-report/task3.md に追記(なければ新規作成):
+report/task3.md に追記:
 ```
-## CompoundPath 型対応 (2026-06-03)
-- 変更: store.rs build_path_cache_from_compounds の引数型を CompoundPath に統一
+## 50Bスケール対応 (2026-06-03)
+- 変更: config.rs に p2a_buf_mb 追加 (デフォルト 64)
+- 変更: loader.rs の load_triples_streaming に p2a_buf_mb 引数追加
+- 変更: loader.rs に Phase 2 バッチ単位チェックポイント実装
+- 変更: store.rs の呼び出し側を更新
 - ビルド: 成功/失敗
 - テスト: 成功/失敗
 ```

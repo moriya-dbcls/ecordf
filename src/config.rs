@@ -200,6 +200,13 @@ pub struct BuildConfig {
     ///
     /// Overridable with `--auto-compress-cols` on the command line.
     pub auto_compress_cols: bool,
+
+    /// Per-file buffer size for Phase 2a string collection (MB).
+    ///
+    /// Larger values reduce the number of p2a chunk files, speeding up the
+    /// streaming Phase 2 join step at the cost of more RAM per thread.
+    /// Default: 64 MB.  For 50B+ triple datasets, 512–2048 is recommended.
+    pub p2a_buf_mb: usize,
 }
 
 impl Default for BuildConfig {
@@ -209,6 +216,7 @@ impl Default for BuildConfig {
             dict_chunk_mb: 200,
             parallel_threads: 0,
             auto_compress_cols: false,
+            p2a_buf_mb: 64,
         }
     }
 }

@@ -565,7 +565,7 @@ pub fn load_triples_parallel(
 //
 // Phase 2a — Collect sorted unique strings per file to disk (parallel):
 //   Use DictBuilder (external sort, bounded RAM) → write ESRT0001 p2a file.
-//   Peak RAM per thread = P2A_BUF_BYTES (64 MB).  No HashSet in RAM.
+//   Peak RAM per thread = p2a_buf_bytes (64 MB).  No HashSet in RAM.
 //
 // Join — Sequential dict scan, build LocalDict files (sequential, per batch):
 //   Open one DictScanner per p2a file in the batch.
@@ -918,6 +918,7 @@ pub fn load_triples_streaming(
     chunk_size: usize,
     num_threads: usize,
     _ram_budget_bytes: usize,
+    p2a_buf_mb: usize,
 ) -> io::Result<(Vec<crate::index::ParallelChunks>, LoadStats)> {
     use rayon::prelude::*;
     use crate::dict_builder::fd_soft_limit;
@@ -925,8 +926,8 @@ pub fn load_triples_streaming(
     let n = num_threads.max(1);
     let per_thread_chunk_size = (chunk_size / n).max(100_000);
 
-    // Per-file external-sort buffer for Phase 2a (64 MB per file/thread).
-    const P2A_BUF_BYTES: usize = 64 * 1024 * 1024;
+    // Per-file external-sort buffer for Phase 2a.
+    let p2a_buf_bytes = p2a_buf_mb.max(16) * 1024 * 1024;
 
     // fd-based batch size: each file uses 3 fds during the join.
     let fds = fd_soft_limit();
@@ -945,7 +946,7 @@ pub fn load_triples_streaming(
     eprintln!(
         "  fd_soft_limit={}  P2A_BUF={}MB",
         fds,
-        P2A_BUF_BYTES / (1024 * 1024),
+        p2a_buf_bytes / (1024 * 1024),
     );
 
     // ── Phase 2a: ALL files → p2a files on disk (parallel) ───────────────────
@@ -958,7 +959,7 @@ pub fn load_triples_streaming(
         .map(|(i, input)| {
             let out = p2a_dir.join(format!("p2a_{:06}.esrt", i));
             let count =
-                collect_strings_for_file_to_disk(input, &p2a_dir, &out, P2A_BUF_BYTES)?;
+                collect_strings_for_file_to_disk(input, &p2a_dir, &out, p2a_buf_bytes)?;
             Ok((out, count))
         })
         .collect();
@@ -977,11 +978,52 @@ pub fn load_triples_streaming(
     let mut all_chunks: Vec<crate::index::ParallelChunks> = Vec::new();
     let mut total = LoadStats { triples_loaded: 0, lines_processed: 0, errors: 0 };
 
+    let checkpoint_path = tmp_dir.join("p2_progress.json");
+
+    // Load existing checkpoint if present (resume support).
+    let completed_batches: std::collections::HashSet<usize> = {
+        if let Ok(data) = std::fs::read_to_string(&checkpoint_path) {
+            let parsed: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
+            parsed["completed_batches"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                .unwrap_or_default()
+        } else {
+            std::collections::HashSet::new()
+        }
+    };
+    if !completed_batches.is_empty() {
+        eprintln!(
+            "  Resuming: {} batch(es) already completed: {:?}",
+            completed_batches.len(),
+            {
+                let mut v: Vec<usize> = completed_batches.iter().copied().collect();
+                v.sort();
+                v
+            }
+        );
+    }
+    let mut completed_batches_vec: Vec<usize> = {
+        let mut v: Vec<usize> = completed_batches.iter().copied().collect();
+        v.sort();
+        v
+    };
+
     for (batch_idx, (batch_inputs, batch_p2a)) in inputs
         .chunks(max_batch)
         .zip(p2a_files.chunks(max_batch))
         .enumerate()
     {
+        // Skip already-completed batches on resume.
+        if completed_batches.contains(&batch_idx) {
+            eprintln!(
+                "--- Batch {}/{}: skipped (already completed) ---",
+                batch_idx + 1,
+                num_batches,
+            );
+            continue;
+        }
+
         let t_batch = std::time::Instant::now();
         eprintln!(
             "--- Batch {}/{}: {} files ---",
@@ -1057,10 +1099,22 @@ pub fn load_triples_streaming(
             t_2b.elapsed().as_secs_f64(),
             t_batch.elapsed().as_secs_f64()
         );
+
+        // Write checkpoint after each batch completes.
+        completed_batches_vec.push(batch_idx);
+        {
+            let json = serde_json::json!({
+                "completed_batches": completed_batches_vec
+            });
+            if let Ok(mut f) = std::fs::File::create(&checkpoint_path) {
+                let _ = std::io::Write::write_all(&mut f, json.to_string().as_bytes());
+            }
+        }
     }
 
-    // Clean up Phase 2a directory.
+    // Clean up Phase 2a directory and checkpoint on successful completion.
     let _ = fs::remove_dir_all(&p2a_dir);
+    let _ = std::fs::remove_file(&checkpoint_path);
 
     Ok((all_chunks, total))
 }
