@@ -1480,10 +1480,26 @@ impl IndexFile {
 
     /// First position where `col0 >= key`.  Reads only column 0.
     ///
-    /// Uses the skip index to narrow the binary search to exactly 1 OS page
-    /// (SKIP_STRIDE = 512 entries = 4 KB), then fires a non-blocking prefetch
-    /// so the kernel pipelines the disk read while the CPU works.
+    /// **DeltaColumnar fast path**: uses `DeltaColFile::lower_bound` which
+    /// binary-searches the block index (all in RAM / page-cached) and decompresses
+    /// exactly one block — instead of decompressing a full block per binary search
+    /// probe (log₂(512) ≈ 9 probes × 256 entries = 2,304 ops with the skip path).
+    ///
+    /// **Columnar / Interleaved**: uses the skip index to narrow the binary search
+    /// to ≤ SKIP_STRIDE entries (1 OS page), then fires a non-blocking prefetch.
+    /// First position where `col0 >= key`.  Reads only column 0.
+    ///
+    /// **DeltaColumnar fast path**: uses `DeltaColFile::lower_bound` which
+    /// binary-searches the block index (all in RAM / page-cached) and decompresses
+    /// exactly one block — instead of decompressing a full block per binary search
+    /// probe (log₂(512) ≈ 9 probes × 256 entries = 2,304 ops with the skip path).
+    ///
+    /// **Columnar / Interleaved**: uses the skip index to narrow the binary search
+    /// to ≤ SKIP_STRIDE entries (1 OS page), then fires a non-blocking prefetch.
     fn lower_bound_0(&self, key: u64) -> usize {
+        if let IndexStorage::DeltaColumnar { cols } = &self.storage {
+            return cols[0].lower_bound(key);
+        }
         let (mut lo, mut hi) = match &self.skip {
             Some(s) => s.narrow(key),
             None    => (0, self.count),
@@ -1594,14 +1610,15 @@ impl IndexFile {
                     if (c0, c1) < (k0, k1) { a = mid + 1; } else { b = mid; }
                 }
                 let start = a;
-                // Sequential scan for end (typically a tiny range for filter patterns).
-                let mut end = start;
-                while end < k0_hi {
-                    let (c0, c1) = self.get_col01(end);
-                    if c0 != k0 || c1 != k1 { break; }
-                    end += 1;
+                // Binary search for exclusive upper bound: first pos where (c0,c1) > (k0,k1).
+                // Reduces O(degree(k0,k1)) sequential scan to O(log(degree(k0,k1))).
+                let (mut a, mut b) = (start, k0_hi);
+                while a < b {
+                    let mid = a + (b - a) / 2;
+                    let (c0, c1) = self.get_col01(mid);
+                    if (c0, c1) <= (k0, k1) { a = mid + 1; } else { b = mid; }
                 }
-                (start, end)
+                (start, a)
             }
             (Some(k0), None) => {
                 // Fast path: predicate secondary index gives exact range in O(1).

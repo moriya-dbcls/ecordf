@@ -185,7 +185,7 @@ impl Literal {
 
 // ── Expressions ───────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     // Terminals
     Variable(String),

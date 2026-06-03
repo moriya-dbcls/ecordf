@@ -26,8 +26,10 @@ cargo build --release --no-default-features  # gzip なし
 ./target/release/ecordf query --dir ./store "SELECT ..."
 
 # HTTP サーバー起動
-./target/release/ecordf serve --dir ./store --port 7878
+./target/release/ecordf serve --dir ./store --port 17878
 ```
+- ただし、サーバーの起動、再起動はユーザが行うものとするため、再起動が必要な場合は連絡する。
+- また、起動は完了まで時間がかかることがあるため、debug.logに"Server ready"があるかを１分毎に確認して作業を進める。
 
 ## モジュール構成と担当タスク
 
@@ -57,6 +59,32 @@ src/
 ```
 
 各タスクの詳細は `docs/task{1-7}-*.md` を参照。
+
+## タスクの割り振りと並列処理ルール
+
+Claude Code（親タスク）は作業要件をタスク1〜7に切り分け、各タスクごとに `screen` セッションを立てて別途 claude を起動することで並列処理する。子タスクは `report/task[1-7].md` へ報告し、親タスクが取りまとめる。
+
+### 並列化の粒度
+- **タスク番号（1〜7）単位**で並列化する。`task5a/5b/5c` のような細分割はしない。
+- 同一タスク番号内の複数改善は **1つの screen インスタンス**にまとめて渡す。
+- タスク番号が異なる場合のみ並列化する（担当ファイルが重複しないため競合しない）。
+
+### screen 起動方法
+```bash
+# メインリポジトリを直接編集（コピー不要）
+screen -dmS task5 bash -c "cd /opt/services/moriya/tmp/ecordf && claude --dangerously-skip-permissions < /tmp/prompt_task5.txt"
+screen -dmS task6 bash -c "cd /opt/services/moriya/tmp/ecordf && claude --dangerously-skip-permissions < /tmp/prompt_task6.txt"
+```
+
+### プロンプトファイルに含める情報
+- 作業ディレクトリ（`/opt/services/moriya/tmp/ecordf`）
+- 担当ファイル（CLAUDE.md のモジュール構成を参照）
+- 問題の詳細・修正方針
+- 報告先: `/opt/services/moriya/tmp/ecordf/report/task[N].md`
+
+### ポート確認
+サーバー（port=17878）の起動・再起動はユーザーが行う。空いていなければ報告する。
+また、親タスクはクエリの実行、ログの解析などを行い判断と報告を行う。
 
 ## 主要な型
 

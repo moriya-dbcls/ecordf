@@ -220,30 +220,35 @@ fn decode_block(data: &[u8], offset: usize, out: &mut Vec<u64>) -> usize {
 
 // ── DeltaColFile ──────────────────────────────────────────────────────────────
 
-/// A memory-mapped delta-encoded column file with a loaded block index.
+/// A memory-mapped delta-encoded column file.
 ///
 /// Supports two on-disk formats:
 ///
 /// - **ECOCOL02** (`encode_column`): all blocks are exactly `DELTA_BLOCK_SIZE`
 ///   entries (except the last).  Block index entry = 16 B.
-///   `start_positions[i] = i * DELTA_BLOCK_SIZE` — zero I/O at open.
+///   Block positions are computed as `i * DELTA_BLOCK_SIZE` — no Vec needed.
 ///
 /// - **ECOCOL03** (`encode_column_pred_aligned`): blocks may be shorter at
 ///   predicate boundaries.  Block index entry = 24 B, third field = `start_pos`.
-///   Loaded directly from the index section — zero extra I/O at open.
+///
+/// The block index lives at the end of the mmap (offset `idx_offset`).
+/// It is **not** copied into a Vec — the OS page cache manages which portions
+/// are hot, and binary search touches only O(log block_count) mmap pages.
+/// For 800 M triples / 256 entries ≈ 3.1 M blocks × 16 B = 49.8 MB per column;
+/// previously loading all 18 columns into Vecs cost ~900 MB and ~7 s at startup.
 pub struct DeltaColFile {
     _file: File,
     mmap:  Mmap,
     pub count: usize,
-    /// `(first_value, byte_offset)` for each block.
-    block_index: Vec<(u64, u64)>,
-    /// `start_positions[i]` = logical index of the first entry in block `i`.
-    ///
-    /// ECOCOL02: computed as `i * DELTA_BLOCK_SIZE` (no I/O).
-    /// ECOCOL03: read directly from the 24-byte block index entries (no I/O).
+    block_count: usize,
+    /// Byte offset within `mmap` where the block index section begins.
+    idx_offset: usize,
+    /// Bytes per block index entry: 16 for ECOCOL02, 24 for ECOCOL03.
+    entry_bytes: usize,
+    /// Logical start position of each block (ECOCOL03 only).
+    /// For ECOCOL02 this Vec is empty; `block_start_pos(i) = i * DELTA_BLOCK_SIZE`.
     start_positions: Vec<usize>,
-    /// True when all blocks are exactly DELTA_BLOCK_SIZE (except the last),
-    /// allowing `pos / DELTA_BLOCK_SIZE` as a fast O(1) block lookup.
+    /// True when all blocks are exactly DELTA_BLOCK_SIZE (ECOCOL02).
     fixed_size: bool,
 }
 
@@ -273,45 +278,67 @@ impl DeltaColFile {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated block index"));
         }
 
-        let mut block_index      = Vec::with_capacity(block_count);
-        let mut start_positions  = Vec::with_capacity(block_count);
-
-        for i in 0..block_count {
-            let base_off  = idx_offset + i * entry_bytes;
-            let first_val = u64::from_le_bytes(mmap[base_off     ..base_off+8 ].try_into().unwrap());
-            let byte_off  = u64::from_le_bytes(mmap[base_off+8   ..base_off+16].try_into().unwrap());
-            block_index.push((first_val, byte_off));
-
-            if is_v3 {
-                // start_pos stored explicitly — no extra I/O, no mmap touching.
-                let sp = u64::from_le_bytes(mmap[base_off+16..base_off+24].try_into().unwrap());
-                start_positions.push(sp as usize);
-            } else {
-                // ECOCOL02: fixed-size blocks, start_pos is trivially i * BLOCK_SIZE.
-                start_positions.push(i * DELTA_BLOCK_SIZE);
-            }
-        }
+        // ECOCOL03: load start_positions for random block lookup (block_for_pos).
+        // ECOCOL02: start_positions not needed — computed as i * DELTA_BLOCK_SIZE.
+        let start_positions: Vec<usize> = if is_v3 {
+            (0..block_count).map(|i| {
+                let off = idx_offset + i * 24 + 16;
+                u64::from_le_bytes(mmap[off..off+8].try_into().unwrap()) as usize
+            }).collect()
+        } else {
+            Vec::new()
+        };
 
         Ok(Self {
             _file: file,
             mmap,
             count,
-            block_index,
+            block_count,
+            idx_offset,
+            entry_bytes,
             start_positions,
             fixed_size: !is_v3,
         })
     }
 
+    // ── Block index accessors (read directly from mmap, no Vec copy) ─────────────
+
+    /// `first_value` field of block `block_idx` from the mmap block index.
+    #[inline]
+    fn block_first_value(&self, block_idx: usize) -> u64 {
+        let off = self.idx_offset + block_idx * self.entry_bytes;
+        u64::from_le_bytes(self.mmap[off..off+8].try_into().unwrap())
+    }
+
+    /// `byte_offset` field of block `block_idx` from the mmap block index.
+    #[inline]
+    fn block_byte_off(&self, block_idx: usize) -> usize {
+        let off = self.idx_offset + block_idx * self.entry_bytes;
+        u64::from_le_bytes(self.mmap[off+8..off+16].try_into().unwrap()) as usize
+    }
+
+    /// Logical start position (entry index) of block `block_idx`.
+    /// ECOCOL02: O(1) multiply.  ECOCOL03: Vec lookup.
+    #[inline]
+    fn block_start_pos(&self, block_idx: usize) -> usize {
+        if self.fixed_size {
+            block_idx * DELTA_BLOCK_SIZE
+        } else {
+            self.start_positions[block_idx]
+        }
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────────
+
     /// Decompress the block at `block_idx` into `out`.
     pub fn decompress_block(&self, block_idx: usize, out: &mut Vec<u64>) {
-        let offset = self.block_index[block_idx].1 as usize;
-        decode_block(&self.mmap, offset, out);
+        decode_block(&self.mmap, self.block_byte_off(block_idx), out);
     }
 
     /// Find `(block_idx, offset_within_block)` for logical position `pos`.
     ///
     /// ECOCOL02 (fixed-size): O(1) division.
-    /// ECOCOL03 (variable-size): O(log block_count) binary search.
+    /// ECOCOL03 (variable-size): O(log block_count) binary search in `start_positions`.
     #[inline]
     fn block_for_pos(&self, pos: usize) -> (usize, usize) {
         if self.fixed_size {
@@ -333,29 +360,74 @@ impl DeltaColFile {
     }
 
     /// Return the index of the first block whose `first_value > target`.
+    ///
+    /// Reads O(log block_count) entries from the mmap block index region —
+    /// all cache-resident after the first query that touches that key range.
     pub fn block_upper_bound(&self, target: u64) -> usize {
-        self.block_index.partition_point(|&(fv, _)| fv <= target)
+        let (mut lo, mut hi) = (0, self.block_count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.block_first_value(mid) <= target { lo = mid + 1; } else { hi = mid; }
+        }
+        lo
     }
 
     /// Find the position of the first value `>= target` (lower bound).
+    ///
+    /// O(log block_count) mmap reads to locate the block, then one block
+    /// decompress + linear scan within the block (~256 entries).
+    /// This is the preferred binary search entry point for DeltaColumnar columns;
+    /// it performs one block decompress instead of one per binary search probe.
+    /// Find the position of the first value `>= target` (lower bound).
+    ///
+    /// ## Algorithm
+    ///
+    /// Uses a two-step block search:
+    /// 1. Binary-search the block index for the first block whose `first_value >= target`
+    ///    (call it `blk_lb`).  Only O(log block_count) mmap reads — no decompression.
+    /// 2. Decompress the preceding block (`blk_lb - 1`), which may straddle the target
+    ///    boundary, and linear-scan for the first entry >= target.
+    ///
+    /// If the preceding block contains no entry >= target (all entries < target),
+    /// the answer is `block_start_pos(blk_lb)` — the first position of `blk_lb`,
+    /// which opens with `first_value >= target`.
+    ///
+    /// ## Why not `block_upper_bound` (first block with first_value > target)?
+    ///
+    /// When `target` spans many consecutive blocks (e.g., 853 triples of the same
+    /// object ID fill 4 blocks that all start with that value), `block_upper_bound`
+    /// returns the first block *after* all of them.  Going back one block lands on
+    /// the *last* such block, skipping the earlier ones that also contain `target`.
+    /// Using `first_value < target` as the partition condition instead locates the
+    /// *first* block whose start is ≥ target, so we only need to search one block back.
     pub fn lower_bound(&self, target: u64) -> usize {
-        if self.block_index.is_empty() {
+        if self.block_count == 0 {
             return 0;
         }
-        let bub = self.block_upper_bound(target);
-        let block_start = if bub == 0 { 0 } else { bub - 1 };
+        // First block B where first_value[B] >= target.
+        let blk_lb = {
+            let (mut lo, mut hi) = (0, self.block_count);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.block_first_value(mid) < target { lo = mid + 1; } else { hi = mid; }
+            }
+            lo
+        };
+        // Decompress the block just before blk_lb — it may straddle the target boundary.
+        let block_start = blk_lb.saturating_sub(1);
 
         let mut buf = Vec::with_capacity(DELTA_BLOCK_SIZE);
         self.decompress_block(block_start, &mut buf);
 
-        let base_pos = self.start_positions[block_start];
+        let base_pos = self.block_start_pos(block_start);
         for (i, &v) in buf.iter().enumerate() {
             if v >= target {
                 return base_pos + i;
             }
         }
-        if block_start + 1 < self.start_positions.len() {
-            self.start_positions[block_start + 1]
+        // All entries in block_start < target; answer is start of blk_lb.
+        if blk_lb < self.block_count {
+            self.block_start_pos(blk_lb)
         } else {
             self.count
         }
@@ -380,14 +452,14 @@ pub struct DeltaColIter<'a> {
 
 impl<'a> DeltaColIter<'a> {
     fn new(col: &'a DeltaColFile, start_pos: usize) -> Self {
-        let (block_idx, buf_pos) = if start_pos < col.count && !col.block_index.is_empty() {
+        let (block_idx, buf_pos) = if start_pos < col.count && col.block_count > 0 {
             col.block_for_pos(start_pos)
         } else {
-            (col.block_index.len(), 0)
+            (col.block_count, 0)
         };
 
         let mut buf = Vec::with_capacity(DELTA_BLOCK_SIZE);
-        if block_idx < col.block_index.len() {
+        if block_idx < col.block_count {
             col.decompress_block(block_idx, &mut buf);
         }
 
@@ -406,7 +478,7 @@ impl<'a> Iterator for DeltaColIter<'a> {
         }
         if self.buf_pos >= self.buf.len() {
             self.block_idx += 1;
-            if self.block_idx >= self.col.block_index.len() {
+            if self.block_idx >= self.col.block_count {
                 return None;
             }
             self.col.decompress_block(self.block_idx, &mut self.buf);
