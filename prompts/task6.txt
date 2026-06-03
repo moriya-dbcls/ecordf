@@ -1,0 +1,114 @@
+# タスク6: path_cache.rs を新 CompoundPath 型に対応
+
+## 作業ディレクトリ
+/home/moriya/tmp/ecordf
+
+## 担当ファイル
+- src/path_cache.rs
+
+## 背景
+task7 が rdf_config.rs の CompoundPath 型を以下のように変更する:
+
+```rust
+// 変更前
+pub type CompoundPath = Vec<String>;
+
+// 変更後
+pub type CompoundPath = Vec<(String, Cardinality)>;
+
+// 追加される enum (rdf_config.rs に定義される)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Cardinality {
+    ExactlyOne,   // 記号なし
+    ZeroOrOne,    // ?
+    OneOrMore,    // +
+    ZeroOrMore,   // *
+}
+```
+
+path_cache.rs は `use crate::rdf_config::CompoundPath;` でこの型を使っているため、
+型変更に合わせて更新が必要。
+
+## 変更内容
+
+### 1. Cardinality の import 追加
+
+ファイル先頭の `use crate::rdf_config::CompoundPath;` を以下に変更:
+```rust
+use crate::rdf_config::{Cardinality, CompoundPath};
+```
+
+### 2. resolve_path 関数のシグネチャ変更
+
+現在:
+```rust
+fn resolve_path(path_iris: &[String], dict: &QueryDict) -> Option<Vec<TermId>> {
+    path_iris.iter().map(|iri| {
+        let key = iri.trim_matches(|c| c == '<' || c == '>');
+        dict.lookup(key)
+    }).collect()
+}
+```
+
+変更後 (タプルから IRI を取り出す):
+```rust
+fn resolve_path(path_iris: &[(String, Cardinality)], dict: &QueryDict) -> Option<Vec<TermId>> {
+    path_iris.iter().map(|(iri, _)| {
+        let key = iri.trim_matches(|c| c == '<' || c == '>');
+        dict.lookup(key)
+    }).collect()
+}
+```
+
+### 3. expand_subseqs のソート調整
+
+現在:
+```rust
+result.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+```
+
+`Vec<(String, Cardinality)>` の比較は、Cardinality が `PartialOrd + Ord` を
+derive しているので `a.cmp(b)` はそのまま動く。変更不要。
+
+ただし `result.dedup()` も `PartialEq` が必要だが、
+`(String, Cardinality)` はどちらも `PartialEq` を持つので変更不要。
+
+### 4. トレースログの確認
+
+build メソッド内の `path = ?path_iris` のようなトレースログは、
+`Cardinality` に `Debug` が derive されているので自動的に動作する。
+変更不要。
+
+### 5. コンパイルエラーを修正
+
+上記以外にコンパイルエラーが出た箇所はすべて修正すること。
+典型的なパターン:
+- `for iri in path_iris` → `for (iri, _) in path_iris`
+- `path_iris[i].as_str()` → `path_iris[i].0.as_str()`
+- その他型不一致
+
+## ビルドと確認
+
+```bash
+cd /home/moriya/tmp/ecordf
+cargo build --release 2>&1 | tail -30
+cargo test 2>&1 | tail -20
+```
+
+(task3/task7 が並列で store.rs / rdf_config.rs を修正しているため、
+それらの変更が入るまで一時的にコンパイルエラーが残る場合がある。
+自分の担当ファイル src/path_cache.rs の変更を完成させて報告すること)
+
+## やらないこと
+- git push
+- サーバーの起動・停止
+- src/path_cache.rs 以外のソース変更
+
+## 報告先
+report/task6.md に追記(なければ新規作成):
+```
+## CompoundPath 型対応 (2026-06-03)
+- 変更: path_cache.rs を Vec<(String,Cardinality)> 型に対応
+- ビルド: 成功/失敗
+- テスト: 成功/失敗
+```

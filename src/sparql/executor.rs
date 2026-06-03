@@ -323,6 +323,10 @@ impl<'a> Executor<'a> {
             self.pushdown_limit.set(None);
         }
 
+        if let Some(fast_result) = self.try_count_distinct_cross_product(query, &plan) {
+            return fast_result;
+        }
+
         // 2. Execute
         let t_bgp = Instant::now();
         let mut bindings = self.execute_plan(&plan);
@@ -2253,6 +2257,64 @@ impl<'a> Executor<'a> {
             "bind_join done"
         );
         result
+    }
+
+    /// Fast path for `SELECT (COUNT(*) AS ?alias …) WHERE { pure cross-product }`.
+    ///
+    /// If the plan is a tree of `Join(Scan, Scan)` nodes with no `ScanBound`
+    fn try_count_distinct_cross_product(
+        &self,
+        query: &SelectQuery,
+        plan: &ExecutionPlan,
+    ) -> Option<ResultSet> {
+        if !query.group_by.is_empty() || !query.having.is_empty() || query.distinct {
+            return None;
+        }
+
+        // Projection must be exactly one COUNT(DISTINCT ?var) alias.
+        let (count_var, alias_name) = if let Projection::Variables(items) = &query.projection {
+            if items.len() != 1 { return None; }
+            match &items[0] {
+                SelectItem::Alias(Expression::Count { distinct: true, expr: Some(inner) }, name) => {
+                    if let Expression::Variable(v) = inner.as_ref() {
+                        (v.clone(), name.clone())
+                    } else { return None; }
+                }
+                _ => return None,
+            }
+        } else { return None; };
+
+        // Plan must decompose into independent Scan leaves.
+        let mut leaves: Vec<&ExecutionPlan> = Vec::new();
+        if !collect_cross_product_leaves(plan, &mut leaves) { return None; }
+        if leaves.len() < 2 { return None; }
+
+        // Find the unique leaf that produces count_var.
+        let var_leaf = leaves.into_iter().find(|leaf| {
+            if let ExecutionPlan::Scan { variables, .. } = leaf {
+                variables.iter().any(|(v, _)| v == &count_var)
+            } else { false }
+        })?;
+
+        let rs = self.execute_plan(var_leaf);
+        if rs.overflow { return None; }
+        let col = rs.variable_index(&count_var)?;
+        let distinct_count = rs.rows.iter()
+            .filter_map(|row| row.get(col).copied().flatten())
+            .collect::<HashSet<TermId>>()
+            .len();
+
+        tracing::debug!(
+            distinct_count,
+            var = count_var,
+            "cross-product COUNT(DISTINCT ?x): computed from single scan"
+        );
+
+        let n_str = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", distinct_count);
+        let n_id = self.dict.encode(&n_str);
+        let mut result = ResultSet::empty(vec![alias_name]);
+        result.rows.push(vec![Some(n_id)]);
+        Some(result)
     }
 
     /// Merge-scan join for PathPattern when the full path is in path_cache.
@@ -4497,6 +4559,84 @@ fn optimize_bgp_with_bound(
             let mut flat: Vec<&GraphPattern> = Vec::new();
             collect_join_patterns(pattern, &mut flat);
 
+            // ── BGP+PathPattern fusion ────────────────────────────────────────
+            // When the flat join list contains only Bgp and PathPattern nodes,
+            // merge all BGP triple patterns into one large Bgp so that
+            // optimize_triple_patterns can see the full set and pick a globally
+            // optimal join order.
+            //
+            // Safety condition: a PathPattern's output variable must not appear
+            // in any BGP triple (otherwise the BGP cannot execute before the
+            // PathPattern that produces it).
+            //
+            // This fixes the performance gap between:
+            //   U-1 ( []  syntax → one flat BGP from recursive parse_property_list)
+            //   U-2/U-3 ( _:label / ?var → fragmented BGPs split by PathPatterns)
+            let all_bgp_or_path = flat.iter().all(|p| {
+                matches!(p, GraphPattern::Bgp(_) | GraphPattern::PathPattern { .. })
+            });
+            let has_bgp  = flat.iter().any(|p| matches!(p, GraphPattern::Bgp(_)));
+            let has_path = flat.iter().any(|p| matches!(p, GraphPattern::PathPattern { .. }));
+
+            if all_bgp_or_path && has_bgp && has_path {
+                let mut all_triples: Vec<TriplePatternAst> = Vec::new();
+                let mut path_pats: Vec<&GraphPattern> = Vec::new();
+                for p in &flat {
+                    match p {
+                        GraphPattern::Bgp(triples) => all_triples.extend_from_slice(triples),
+                        pp => path_pats.push(pp),
+                    }
+                }
+
+                // Build set of all variable names that appear in BGP triples.
+                let bgp_vars: HashSet<&str> = all_triples.iter().flat_map(|t| {
+                    let mut v: Vec<&str> = Vec::new();
+                    if let Term::Variable(s) = &t.s { v.push(s.as_str()); }
+                    if let Term::Variable(s) = &t.p { v.push(s.as_str()); }
+                    if let Term::Variable(s) = &t.o { v.push(s.as_str()); }
+                    v
+                }).collect();
+
+                // Safety check: PathPattern outputs must not be consumed by BGP triples.
+                let safe = path_pats.iter().all(|pp| {
+                    if let GraphPattern::PathPattern { o, .. } = pp {
+                        if let Term::Variable(v) = o {
+                            return !bgp_vars.contains(v.as_str());
+                        }
+                    }
+                    true
+                });
+
+                if safe {
+                    tracing::debug!(
+                        bgp_triples = all_triples.len(),
+                        path_patterns = path_pats.len(),
+                        "optimize_bgp_with_bound: fusing BGPs across PathPatterns"
+                    );
+                    let merged_bgp = GraphPattern::Bgp(all_triples);
+                    let mut current_bound = bound.clone();
+                    let mut plans: Vec<ExecutionPlan> = Vec::new();
+
+                    plans.push(optimize_bgp_with_bound(
+                        &merged_bgp, index, dict, stats, &current_bound,
+                    ));
+                    current_bound.extend(pattern_bound_vars(&merged_bgp));
+
+                    for pp in path_pats {
+                        plans.push(optimize_bgp_with_bound(
+                            pp, index, dict, stats, &current_bound,
+                        ));
+                        current_bound.extend(pattern_bound_vars(pp));
+                    }
+
+                    return plans
+                        .into_iter()
+                        .reduce(|acc, p| ExecutionPlan::Join(Box::new(acc), Box::new(p)))
+                        .unwrap_or(ExecutionPlan::Empty);
+                }
+            }
+            // ── end BGP+PathPattern fusion ────────────────────────────────────
+
             // Self-contained patterns first (they provide binding to subsequent patterns).
             let mut ordered: Vec<&GraphPattern> = Vec::new();
             for p in &flat {
@@ -5551,5 +5691,37 @@ mod normalize_tests {
             GraphPattern::Join(_, _) => { /* correct — Extend boundary preserved */ }
             other => panic!("Expected Join to be preserved, got {:?}", other),
         }
+    }
+}
+
+// ── Cross-product plan analysis ────────────────────────────────────────────
+
+/// Recursively collect independent `Scan` leaves from a plan tree.
+///
+/// Returns `true` and populates `out` when every join in the tree is a pure
+/// Cartesian product — i.e. all non-leaf nodes are `Join(_, Scan)` with no
+/// `ScanBound`, `Filter`, or other correlated nodes.  Returns `false` and
+/// leaves `out` in an indeterminate state as soon as a correlated node is found.
+fn collect_cross_product_leaves<'a>(plan: &'a ExecutionPlan, out: &mut Vec<&'a ExecutionPlan>) -> bool {
+    match plan {
+        ExecutionPlan::Scan { .. } => {
+            out.push(plan);
+            true
+        }
+        ExecutionPlan::Join(left, right) => {
+            match right.as_ref() {
+                ExecutionPlan::Scan { .. } => {
+                    out.push(right.as_ref());
+                    collect_cross_product_leaves(left, out)
+                }
+                ExecutionPlan::Join(..) => {
+                    // Both subtrees must be cross-product plans.
+                    collect_cross_product_leaves(left, out)
+                        && collect_cross_product_leaves(right, out)
+                }
+                _ => false,  // ScanBound, Filter, ScanAst, PathPattern, etc.
+            }
+        }
+        _ => false,
     }
 }

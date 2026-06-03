@@ -12,7 +12,7 @@
 //!   text/tab-separated-values
 //!   text/csv
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -273,27 +273,29 @@ fn execute_query_with_cancel(
     cancel: Arc<AtomicBool>,
 ) -> Response {
     let t_req = Instant::now();
+    let hints = detect_bnode_hints(query);
 
     let result = match store.query_with_cancel(query, cancel) {
         Ok(r)  => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
 
-    build_query_response(store, result, format, t_req)
+    build_query_response(store, result, format, t_req, &hints)
 }
 
 fn execute_query(store: &Store, query: &str, format: &str) -> Response {
     let t_req = Instant::now();
+    let hints = detect_bnode_hints(query);
 
     let result = match store.query(query) {
         Ok(r)  => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
 
-    build_query_response(store, result, format, t_req)
+    build_query_response(store, result, format, t_req, &hints)
 }
 
-fn build_query_response(store: &Store, result: QueryResult, format: &str, t_req: Instant) -> Response {
+fn build_query_response(store: &Store, result: QueryResult, format: &str, t_req: Instant, hints: &[String]) -> Response {
 
     match &result {
         QueryResult::Select(rs) => {
@@ -318,7 +320,7 @@ fn build_query_response(store: &Store, result: QueryResult, format: &str, t_req:
 
             // ── Serialize: build JSON/XML/TSV bytes ───────────────────────────
             let t_ser = Instant::now();
-            let mut response = format_decoded(&decoded, rs, format);
+            let mut response = format_decoded(&decoded, rs, format, hints);
             let serialize_us = t_ser.elapsed().as_micros();
 
             let total_us = t_req.elapsed().as_micros();
@@ -363,34 +365,56 @@ fn format_decoded(
     decoded: &[DecodedRow],
     rs: &crate::sparql::ResultSet,
     format: &str,
+    hints: &[String],
 ) -> Response {
     match format.to_ascii_lowercase().as_str() {
         "xml" | "application/sparql-results+xml" => {
             let body = decoded_to_xml(decoded, rs);
-            (
+            let mut response = (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/sparql-results+xml; charset=utf-8")],
                 body,
-            ).into_response()
+            ).into_response();
+            if !hints.is_empty() {
+                let hint_str = hints.join("; ");
+                if let Ok(v) = header::HeaderValue::from_str(&hint_str) {
+                    response.headers_mut().insert("x-ecordf-hints", v);
+                }
+            }
+            response
         }
         "tsv" | "text/tab-separated-values" => {
             let body = decoded_to_tsv(decoded, rs);
-            (
+            let mut response = (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/tab-separated-values; charset=utf-8")],
                 body,
-            ).into_response()
+            ).into_response();
+            if !hints.is_empty() {
+                let hint_str = hints.join("; ");
+                if let Ok(v) = header::HeaderValue::from_str(&hint_str) {
+                    response.headers_mut().insert("x-ecordf-hints", v);
+                }
+            }
+            response
         }
         "csv" | "text/csv" => {
             let body = decoded_to_csv(decoded, rs);
-            (
+            let mut response = (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/csv; charset=utf-8")],
                 body,
-            ).into_response()
+            ).into_response();
+            if !hints.is_empty() {
+                let hint_str = hints.join("; ");
+                if let Ok(v) = header::HeaderValue::from_str(&hint_str) {
+                    response.headers_mut().insert("x-ecordf-hints", v);
+                }
+            }
+            response
         }
         _ => {
-            let body = decoded_to_json(decoded, rs);
+            let body = decoded_to_json(decoded, rs, hints);
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/sparql-results+json; charset=utf-8")],
@@ -425,7 +449,7 @@ fn format_ask(result: bool, format: &str) -> Response {
 }
 
 /// SPARQL Results JSON format (W3C standard) — uses pre-decoded strings.
-fn decoded_to_json(decoded: &[DecodedRow], rs: &crate::sparql::ResultSet) -> Value {
+fn decoded_to_json(decoded: &[DecodedRow], rs: &crate::sparql::ResultSet, hints: &[String]) -> Value {
     let vars: Vec<Value> = rs.variables.iter().map(|v| json!(v)).collect();
 
     let bindings: Vec<Value> = decoded.iter().map(|row| {
@@ -438,8 +462,13 @@ fn decoded_to_json(decoded: &[DecodedRow], rs: &crate::sparql::ResultSet) -> Val
         Value::Object(obj)
     }).collect();
 
+    let mut head = serde_json::Map::new();
+    head.insert("vars".into(), json!(vars));
+    if !hints.is_empty() {
+        head.insert("hints".into(), json!(hints));
+    }
     json!({
-        "head": { "vars": vars },
+        "head": head,
         "results": { "bindings": bindings }
     })
 }
@@ -595,6 +624,102 @@ fn csv_escape(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+fn collect_role_vars<'a>(
+    pat: &'a crate::sparql::ast::GraphPattern,
+    subj: &mut HashSet<&'a str>,
+    obj:  &mut HashSet<&'a str>,
+) {
+    use crate::sparql::ast::GraphPattern;
+    match pat {
+        GraphPattern::Bgp(triples) => {
+            for t in triples {
+                if let crate::sparql::ast::Term::Variable(v) = &t.s { subj.insert(v.as_str()); }
+                if let crate::sparql::ast::Term::Variable(v) = &t.o { obj.insert(v.as_str()); }
+            }
+        }
+        GraphPattern::PathPattern { s, o, .. } => {
+            if let crate::sparql::ast::Term::Variable(v) = s { subj.insert(v.as_str()); }
+            if let crate::sparql::ast::Term::Variable(v) = o { obj.insert(v.as_str()); }
+        }
+        GraphPattern::Join(a, b) | GraphPattern::Union(a, b) => {
+            collect_role_vars(a, subj, obj);
+            collect_role_vars(b, subj, obj);
+        }
+        GraphPattern::Optional(main, opt) => {
+            collect_role_vars(main, subj, obj);
+            collect_role_vars(opt, subj, obj);
+        }
+        GraphPattern::Filter(inner, _)
+        | GraphPattern::Extend(inner, _, _)
+        | GraphPattern::Graph(_, inner) => collect_role_vars(inner, subj, obj),
+        GraphPattern::Subquery(_) | GraphPattern::Values(_) | GraphPattern::Empty => {}
+    }
+}
+
+/// Detect intermediate "join node" variables that could be rewritten as
+/// `[]` blank node property lists.
+///
+/// A variable is a candidate if ALL of these hold:
+///   1. It appears as the *object* of at least one triple pattern.
+///   2. It appears as the *subject* of at least one triple or path pattern.
+///   3. It is NOT projected by SELECT, GROUP BY, or ORDER BY.
+pub fn detect_bnode_hints(query_str: &str) -> Vec<String> {
+    use crate::sparql::ast::{QueryForm, Projection, SelectItem, Expression};
+
+    let query = match crate::sparql::parse_query(query_str) {
+        Ok(q) => q,
+        _ => return vec![],
+    };
+    let sq = match query.form {
+        QueryForm::Select(sq) => sq,
+        _ => return vec![],
+    };
+
+    // Collect projected / visible variables
+    let mut projected: HashSet<String> = HashSet::new();
+    match &sq.projection {
+        Projection::Wildcard => return vec![],
+        Projection::Variables(items) => {
+            for item in items {
+                match item {
+                    SelectItem::Variable(v) => { projected.insert(v.clone()); }
+                    SelectItem::Alias(_, name) => { projected.insert(name.clone()); }
+                }
+            }
+        }
+    }
+    for gc in &sq.group_by {
+        if let Expression::Variable(v) = &gc.expr { projected.insert(v.clone()); }
+    }
+    for oc in &sq.order_by {
+        if let Expression::Variable(v) = &oc.expr { projected.insert(v.clone()); }
+    }
+
+    // Collect subject / object variable roles
+    let mut subj_vars: HashSet<&str> = HashSet::new();
+    let mut obj_vars:  HashSet<&str> = HashSet::new();
+    collect_role_vars(&sq.pattern, &mut subj_vars, &mut obj_vars);
+
+    // Candidates: appears as both subject and object, not projected
+    let mut candidates: Vec<String> = subj_vars
+        .iter()
+        .filter(|&&v| obj_vars.contains(v) && !projected.contains(v))
+        .map(|&v| v.to_string())
+        .collect();
+    candidates.sort();
+
+    if candidates.is_empty() {
+        return vec![];
+    }
+
+    let list = candidates.join(", ");
+    vec![format!(
+        "Intermediate join variable(s) not in SELECT/GROUP BY: {}. \
+         Rewriting as [] blank node property lists may allow better join optimization.",
+        list
+    )]
 }
 
 /// Start the HTTP server.

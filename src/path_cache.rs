@@ -44,7 +44,7 @@ use std::time::Instant;
 use crate::dict_builder::QueryDict;
 use crate::index::TripleIndex;
 use crate::predcache::PredCache;
-use crate::rdf_config::CompoundPath;
+use crate::rdf_config::{Cardinality, CompoundPath};
 use crate::triple::{TermId, TriplePattern, UNBOUND};
 
 // ── Types ─────────────────────────────────────────────────────────────────────

@@ -551,6 +551,10 @@ async fn main() -> anyhow::Result<()> {
                 query
             };
 
+            for hint in ecordf::server::detect_bnode_hints(&sparql) {
+                eprintln!("⚠ {}", hint);
+            }
+
             match store.query_to_table(&sparql) {
                 Ok(rows) => {
                     match format.as_str() {
