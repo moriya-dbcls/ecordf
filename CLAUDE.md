@@ -73,8 +73,9 @@ Claude Code（親タスク）は作業要件をタスク1〜7に切り分け、�
 `.claude/settings.json` の allowlist により、子タスクは `--dangerously-skip-permissions` 不要で主要操作を自動承認する。
 ```bash
 # メインリポジトリを直接編集（コピー不要）
-screen -dmS task5 bash -c "cd /opt/services/moriya/tmp/ecordf && claude < /tmp/prompt_task5.txt"
-screen -dmS task6 bash -c "cd /opt/services/moriya/tmp/ecordf && claude < /tmp/prompt_task6.txt"
+PROJECT_ROOT=$(git rev-parse --show-toplevel)
+screen -dmS task5 bash -c "cd $PROJECT_ROOT && claude < prompts/task5.txt"
+screen -dmS task6 bash -c "cd $PROJECT_ROOT && claude < prompts/task6.txt"
 ```
 
 ### 承認が必要な操作（子タスク→親タスクへの通知）
@@ -89,10 +90,10 @@ allowlist に含まれない操作（`git push`、システムパッケージイ
 親タスクが `report/need_approval.md` を確認し、ユーザーへ報告して対応する。
 
 ### プロンプトファイルに含める情報
-- 作業ディレクトリ（`/opt/services/moriya/tmp/ecordf`）
+- 作業ディレクトリ（プロジェクトルート）
 - 担当ファイル（CLAUDE.md のモジュール構成を参照）
 - 問題の詳細・修正方針
-- 報告先: `/opt/services/moriya/tmp/ecordf/report/task[N].md`
+- 報告先: `report/task[N].md`（プロジェクトルートからの相対パス）
 
 ### ポート確認
 サーバー（port=17878）の起動・再起動はユーザーが行う。空いていなければ報告する。
