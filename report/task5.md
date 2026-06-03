@@ -30,3 +30,9 @@ cargo test --lib       → test result: ok. 27 passed; 0 failed
 
 ## 完了日時
 2026-06-03
+
+## BGP融合最適化 (2026-06-03)
+- 変更: optimize_bgp_with_bound の Join アームに BGP+PathPattern 融合パス追加
+- ビルド: 成功 (警告のみ、エラーなし)
+- テスト: 成功 (27 passed; 0 failed)
+- 備考: U-2/U-3 クエリで分断されていた BGP を PathPattern 越しに統合し、U-1 相当のプランを生成するよう修正。安全条件チェック（PathPattern 出力変数が BGP トリプルに現れないこと）付き。

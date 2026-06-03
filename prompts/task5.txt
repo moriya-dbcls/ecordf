@@ -1,114 +1,169 @@
-# タスク5: COUNT(*) クロス積最適化の削除 + COUNT(DISTINCT ?x) 最適化の追加
+# タスク5: BGP+PathPattern 融合最適化
+
+## 作業ディレクトリ
+/opt/services/moriya/tmp/ecordf
+
+## 担当ファイル
+src/sparql/executor.rs
+
+## 背景・問題
+
+以下の3クエリ（data/test_sparql_query.txt の U-1, U-2, U-3）は意味的に等価だが実行速度が異なる。
+
+- U-1 ([] 匿名ブランクノード構文) が最速
+- U-2 (_:label ブランクノード)、U-3 (?変数) が同速で遅い
+
+### 原因
+
+`[]` 構文では `parse_property_list` が再帰的に同一ベクタへ書き込むため、
+9個のトリプルパターンが 1つのフラット BGP にまとまる。
+
+一方、U-2/U-3 では明示的な別文として書かれるため `parse_triples_block` が
+PathPattern を挟むたびに cur_triples をフラッシュし、BGP が分断される:
+
+  Bgp[2] → PathPattern → Bgp[2] → PathPattern → PathPattern → Bgp[5]
+
+`normalize_graph_pattern` の `extract_bgp_with_filters` は `PathPattern` に対して
+`None` を返すため、BGP 間の融合が阻まれる。結果として `optimize_triple_patterns`
+が 9 パターン全体を見られず、クロス BGP 最適化ができない。
+
+### 修正方針
+
+`optimize_bgp_with_bound` の `GraphPattern::Join` アームに BGP 融合パスを追加する。
+
+`collect_join_patterns` で得たフラットリストが「Bgp と PathPattern のみ」の場合:
+1. すべての Bgp トリプルを1つの大きな Bgp に統合
+2. PathPattern の出力変数がどの BGP トリプルにも現れないことを確認（安全条件）
+3. 安全なら「統合 Bgp を先に実行 → PathPattern 群を後で実行」の順に組み替える
+
+これにより U-2/U-3 も U-1 と同等のプランを得る。
+
+## 具体的な変更
+
+`src/sparql/executor.rs` の `optimize_bgp_with_bound` 関数、
+`GraphPattern::Join(_,_) =>` アームの先頭、`collect_join_patterns` の直後、
+既存の "Self-contained patterns first" コメントの直前に以下のコードを挿入する。
+
+挿入箇所の前後コンテキスト（old_string として使用）:
+
+```rust
+            let mut flat: Vec<&GraphPattern> = Vec::new();
+            collect_join_patterns(pattern, &mut flat);
+
+            // Self-contained patterns first (they provide binding to subsequent patterns).
+```
+
+この old_string を以下の new_string に置き換える:
+
+```rust
+            let mut flat: Vec<&GraphPattern> = Vec::new();
+            collect_join_patterns(pattern, &mut flat);
+
+            // ── BGP+PathPattern fusion ────────────────────────────────────────
+            // When the flat join list contains only Bgp and PathPattern nodes,
+            // merge all BGP triple patterns into one large Bgp so that
+            // optimize_triple_patterns can see the full set and pick a globally
+            // optimal join order.
+            //
+            // Safety condition: a PathPattern's output variable must not appear
+            // in any BGP triple (otherwise the BGP cannot execute before the
+            // PathPattern that produces it).
+            //
+            // This fixes the performance gap between:
+            //   U-1 ( []  syntax → one flat BGP from recursive parse_property_list)
+            //   U-2/U-3 ( _:label / ?var → fragmented BGPs split by PathPatterns)
+            let all_bgp_or_path = flat.iter().all(|p| {
+                matches!(p, GraphPattern::Bgp(_) | GraphPattern::PathPattern { .. })
+            });
+            let has_bgp  = flat.iter().any(|p| matches!(p, GraphPattern::Bgp(_)));
+            let has_path = flat.iter().any(|p| matches!(p, GraphPattern::PathPattern { .. }));
+
+            if all_bgp_or_path && has_bgp && has_path {
+                let mut all_triples: Vec<TriplePatternAst> = Vec::new();
+                let mut path_pats: Vec<&GraphPattern> = Vec::new();
+                for p in &flat {
+                    match p {
+                        GraphPattern::Bgp(triples) => all_triples.extend_from_slice(triples),
+                        pp => path_pats.push(pp),
+                    }
+                }
+
+                // Build set of all variable names that appear in BGP triples.
+                let bgp_vars: HashSet<&str> = all_triples.iter().flat_map(|t| {
+                    let mut v: Vec<&str> = Vec::new();
+                    if let Term::Variable(s) = &t.s { v.push(s.as_str()); }
+                    if let Term::Variable(s) = &t.p { v.push(s.as_str()); }
+                    if let Term::Variable(s) = &t.o { v.push(s.as_str()); }
+                    v
+                }).collect();
+
+                // Safety check: PathPattern outputs must not be consumed by BGP triples.
+                let safe = path_pats.iter().all(|pp| {
+                    if let GraphPattern::PathPattern { o, .. } = pp {
+                        if let Term::Variable(v) = o {
+                            return !bgp_vars.contains(v.as_str());
+                        }
+                    }
+                    true
+                });
+
+                if safe {
+                    tracing::debug!(
+                        bgp_triples = all_triples.len(),
+                        path_patterns = path_pats.len(),
+                        "optimize_bgp_with_bound: fusing BGPs across PathPatterns"
+                    );
+                    let merged_bgp = GraphPattern::Bgp(all_triples);
+                    let mut current_bound = bound.clone();
+                    let mut plans: Vec<ExecutionPlan> = Vec::new();
+
+                    plans.push(optimize_bgp_with_bound(
+                        &merged_bgp, index, dict, stats, &current_bound,
+                    ));
+                    current_bound.extend(pattern_bound_vars(&merged_bgp));
+
+                    for pp in path_pats {
+                        plans.push(optimize_bgp_with_bound(
+                            pp, index, dict, stats, &current_bound,
+                        ));
+                        current_bound.extend(pattern_bound_vars(pp));
+                    }
+
+                    return plans
+                        .into_iter()
+                        .reduce(|acc, p| ExecutionPlan::Join(Box::new(acc), Box::new(p)))
+                        .unwrap_or(ExecutionPlan::Empty);
+                }
+            }
+            // ── end BGP+PathPattern fusion ────────────────────────────────────
+
+            // Self-contained patterns first (they provide binding to subsequent patterns).
+```
+
+## ビルドと確認
+
+```bash
+cd /opt/services/moriya/tmp/ecordf
+cargo build --release 2>&1 | tail -30
+cargo test 2>&1 | tail -30
+```
+
+ビルドとテストが通れば完了。
 
 ## やらないこと
 - git push
-- サーバーの起動・停止
-- src/ 以外のファイル変更（report/ への書き込みは除く）
+- サーバーの起動・停止・再起動
+- src/sparql/executor.rs 以外のソースファイルの変更
+- ビルド・テスト以外のコマンド実行
 
-## 背景
-現在 `src/sparql/executor.rs` に `try_count_cross_product` メソッドがある。
-これは独立スキャンのクロス積 `COUNT(*)` を積算で計算するが、
-結果がトリプル総数（約797M）を大きく超える（3.2×10^20）ため意味がない。
-クロス積 `COUNT(*)` はエラーのままにしておく方が正しい。
+## 報告先
+作業結果を report/task5.md に追記する（既存内容は消さずに末尾に追加）。
+以下の形式で記録すること:
 
-一方、`COUNT(DISTINCT ?x)` はクロス積でも意味がある：
-- `?x` が独立スキャン A から来るなら COUNT(DISTINCT ?x) = A での distinct(?x) 件数
-- 例: `SELECT (COUNT(DISTINCT ?pep) AS ?n) WHERE { ?pep a X . ?pe a Y . }` → N(distinct_pep in X scan)
-
-## 作業内容
-
-### 1. `try_count_cross_product` を削除
-- メソッド本体を削除（または空にして None を返すだけにする）
-- `execute_select` 内の呼び出し部分も削除
-
-### 2. `try_count_distinct_cross_product` を追加
-以下のメソッドを `try_count_cross_product` の近くに追加:
-
-```rust
-fn try_count_distinct_cross_product(
-    &self,
-    query: &SelectQuery,
-    plan: &ExecutionPlan,
-) -> Option<ResultSet> {
-    // ガード: GROUP BY なし、HAVING なし、DISTINCT なし
-    if !query.group_by.is_empty() || !query.having.is_empty() || query.distinct {
-        return None;
-    }
-
-    // projection が COUNT(DISTINCT ?var) 1つだけか確認
-    let (count_var, alias_name) = if let Projection::Variables(items) = &query.projection {
-        if items.len() != 1 { return None; }
-        match &items[0] {
-            SelectItem::Alias(
-                Expression::Count { distinct: true, expr: Some(inner) },
-                name,
-            ) => {
-                if let Expression::Variable(v) = inner.as_ref() {
-                    (v.clone(), name.clone())
-                } else {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    } else {
-        return None;
-    };
-
-    // plan を独立スキャンに分解（クロス積かどうか確認）
-    let mut leaves: Vec<&ExecutionPlan> = Vec::new();
-    if !collect_cross_product_leaves(plan, &mut leaves) { return None; }
-    if leaves.len() < 2 { return None; }
-
-    // count_var を持つ葉を探す
-    let var_leaf = leaves.into_iter().find(|leaf| {
-        if let ExecutionPlan::Scan { variables, .. } = leaf {
-            variables.iter().any(|(v, _)| v == &count_var)
-        } else {
-            false
-        }
-    })?;
-
-    // その葉だけ実行して distinct 件数をカウント
-    let rs = self.execute_plan(var_leaf);
-    if rs.overflow { return None; }
-    let col = rs.variable_index(&count_var)?;
-    let distinct_count = rs
-        .rows
-        .iter()
-        .filter_map(|row| row.get(col).copied().flatten())
-        .collect::<HashSet<TermId>>()
-        .len();
-
-    tracing::debug!(
-        distinct_count,
-        var = %count_var,
-        "cross-product COUNT(DISTINCT ?x): computed from single-scan distinct"
-    );
-
-    let n_str = format!(
-        "\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>",
-        distinct_count
-    );
-    let n_id = self.dict.encode(&n_str);
-    let mut result = ResultSet::empty(vec![alias_name]);
-    result.rows.push(vec![Some(n_id)]);
-    Some(result)
-}
 ```
-
-### 3. `execute_select` 内のフック更新
-`try_count_cross_product` の呼び出しを削除し、代わりに:
-```rust
-if let Some(fast_result) = self.try_count_distinct_cross_product(query, &plan) {
-    return fast_result;
-}
+## BGP融合最適化 (2026-06-03)
+- 変更: optimize_bgp_with_bound の Join アームに BGP+PathPattern 融合パス追加
+- ビルド: 成功/失敗
+- テスト: 成功/失敗
+- 備考: (あれば)
 ```
-
-## 手順
-1. `src/sparql/executor.rs` を編集
-2. `cargo build --release`
-3. `cargo test --lib`
-
-## 完了報告
-`report/task5.md` に変更内容・ビルド結果を記録してください。
