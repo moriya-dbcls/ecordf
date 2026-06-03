@@ -1,30 +1,31 @@
-# タスク5: cross-product COUNT の u64 オーバーフロー修正
+# タスク5: COUNT(*) クロス積最適化の削除 + COUNT(DISTINCT ?x) 最適化
 
-## 状況
-修正は既に適用済みでした。
+## 作業内容 (2026-06-03 更新)
 
-## 修正箇所
-`src/sparql/executor.rs` の `try_count_cross_product` メソッド（行 2305, 2309）
+### 変更ファイル
+- `src/sparql/executor.rs`
 
-```rust
-// 修正後（確認済み）
-let mut product: u128 = 1;
-...
-product = product.saturating_mul(rs.rows.len() as u128);
-```
+### 変更の詳細
 
-`u64` ではなく `u128` を使用しており、大規模クロス積でサチュレーションして
-`u64::MAX` が返る問題は解消されています。
+**1. `try_count_cross_product` メソッド削除**
+- メソッド本体を削除。クロス積 `COUNT(*)` は巨大な積算値（〜3.2×10^20）を返すため意味がない。通常パスに fallback させることが正しい。
+
+**2. `execute_select` 内の呼び出しブロック削除**
+- `try_count_cross_product` の呼び出しとコメントブロック（8行）を削除。
+
+**3. `try_count_distinct_cross_product` は既に実装済みだった**
+- 作業開始時点で既にメソッドが存在し、`execute_select` からも呼ばれていた。
+- 実装内容はタスク仕様と一致しているため変更なし。
+- 動作: `SELECT (COUNT(DISTINCT ?pep) AS ?n) WHERE { ?pep a X . ?pe a Y . }` → X スキャンの distinct(?pep) 件数を高速返却。
 
 ## ビルド結果
 ```
-Finished `release` profile [optimized] target(s) in 1m 06s
+cargo build --release  → Finished (警告のみ、エラーなし)
 ```
-警告1件（未使用 import、既存）。エラーなし。
 
 ## テスト結果
 ```
-test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+cargo test --lib       → test result: ok. 27 passed; 0 failed
 ```
 
 ## 完了日時

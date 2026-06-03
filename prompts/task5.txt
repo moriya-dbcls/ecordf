@@ -1,39 +1,114 @@
-# タスク5: cross-product COUNT の u64 オーバーフロー修正
-
-## 作業ディレクトリ
-プロジェクトルート（このファイルがある場所）
+# タスク5: COUNT(*) クロス積最適化の削除 + COUNT(DISTINCT ?x) 最適化の追加
 
 ## やらないこと
 - git push
-- サービスの起動・再起動
-- src/ 以外のファイルの変更（report/ への報告は除く）
+- サーバーの起動・停止
+- src/ 以外のファイル変更（report/ への書き込みは除く）
 
-## 問題
-`src/sparql/executor.rs` の `try_count_cross_product` メソッドで
-積の計算に `u64` を使っているため、大規模クロス積でサチュレーションし
-`u64::MAX (18446744073709551615)` が返る。
+## 背景
+現在 `src/sparql/executor.rs` に `try_count_cross_product` メソッドがある。
+これは独立スキャンのクロス積 `COUNT(*)` を積算で計算するが、
+結果がトリプル総数（約797M）を大きく超える（3.2×10^20）ため意味がない。
+クロス積 `COUNT(*)` はエラーのままにしておく方が正しい。
 
-## 修正内容
-`try_count_cross_product` 内の積計算を `u128` に変更するだけ:
+一方、`COUNT(DISTINCT ?x)` はクロス積でも意味がある：
+- `?x` が独立スキャン A から来るなら COUNT(DISTINCT ?x) = A での distinct(?x) 件数
+- 例: `SELECT (COUNT(DISTINCT ?pep) AS ?n) WHERE { ?pep a X . ?pe a Y . }` → N(distinct_pep in X scan)
+
+## 作業内容
+
+### 1. `try_count_cross_product` を削除
+- メソッド本体を削除（または空にして None を返すだけにする）
+- `execute_select` 内の呼び出し部分も削除
+
+### 2. `try_count_distinct_cross_product` を追加
+以下のメソッドを `try_count_cross_product` の近くに追加:
 
 ```rust
-// 変更前
-let mut product: u64 = 1;
-...
-product = product.saturating_mul(rs.rows.len() as u64);
+fn try_count_distinct_cross_product(
+    &self,
+    query: &SelectQuery,
+    plan: &ExecutionPlan,
+) -> Option<ResultSet> {
+    // ガード: GROUP BY なし、HAVING なし、DISTINCT なし
+    if !query.group_by.is_empty() || !query.having.is_empty() || query.distinct {
+        return None;
+    }
 
-// 変更後
-let mut product: u128 = 1;
-...
-product = product.saturating_mul(rs.rows.len() as u128);
+    // projection が COUNT(DISTINCT ?var) 1つだけか確認
+    let (count_var, alias_name) = if let Projection::Variables(items) = &query.projection {
+        if items.len() != 1 { return None; }
+        match &items[0] {
+            SelectItem::Alias(
+                Expression::Count { distinct: true, expr: Some(inner) },
+                name,
+            ) => {
+                if let Expression::Variable(v) = inner.as_ref() {
+                    (v.clone(), name.clone())
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+
+    // plan を独立スキャンに分解（クロス積かどうか確認）
+    let mut leaves: Vec<&ExecutionPlan> = Vec::new();
+    if !collect_cross_product_leaves(plan, &mut leaves) { return None; }
+    if leaves.len() < 2 { return None; }
+
+    // count_var を持つ葉を探す
+    let var_leaf = leaves.into_iter().find(|leaf| {
+        if let ExecutionPlan::Scan { variables, .. } = leaf {
+            variables.iter().any(|(v, _)| v == &count_var)
+        } else {
+            false
+        }
+    })?;
+
+    // その葉だけ実行して distinct 件数をカウント
+    let rs = self.execute_plan(var_leaf);
+    if rs.overflow { return None; }
+    let col = rs.variable_index(&count_var)?;
+    let distinct_count = rs
+        .rows
+        .iter()
+        .filter_map(|row| row.get(col).copied().flatten())
+        .collect::<HashSet<TermId>>()
+        .len();
+
+    tracing::debug!(
+        distinct_count,
+        var = %count_var,
+        "cross-product COUNT(DISTINCT ?x): computed from single-scan distinct"
+    );
+
+    let n_str = format!(
+        "\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+        distinct_count
+    );
+    let n_id = self.dict.encode(&n_str);
+    let mut result = ResultSet::empty(vec![alias_name]);
+    result.rows.push(vec![Some(n_id)]);
+    Some(result)
+}
 ```
 
-（`n_str` の format! はそのまま。`u128` の Display は自動で正しい数値を出力する）
+### 3. `execute_select` 内のフック更新
+`try_count_cross_product` の呼び出しを削除し、代わりに:
+```rust
+if let Some(fast_result) = self.try_count_distinct_cross_product(query, &plan) {
+    return fast_result;
+}
+```
 
 ## 手順
-1. `src/sparql/executor.rs` を編集（`try_count_cross_product` を検索）
-2. `cargo build --release` でビルド確認
-3. `cargo test --lib` でテスト確認
+1. `src/sparql/executor.rs` を編集
+2. `cargo build --release`
+3. `cargo test --lib`
 
 ## 完了報告
-`report/task5.md` に修正箇所・ビルド結果を記録して終了してください。
+`report/task5.md` に変更内容・ビルド結果を記録してください。
