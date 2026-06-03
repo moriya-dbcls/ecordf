@@ -25,7 +25,7 @@ use crate::loader::{collect_strings_from_inputs, collect_strings_parallel,
 use crate::path_cache::PathCache;
 use crate::pred_partition::{pred_parts_dir, PredPartitions};
 use crate::predcache::PredCache;
-use crate::rdf_config;
+use crate::rdf_config::{self, CompoundPath};
 use crate::type_cache::TypeCache;
 use crate::sparql::{parse_query, Executor, ResultSet};
 use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
@@ -662,7 +662,7 @@ impl Store {
     /// `budget_mb = 0` or empty `compound_paths` is a no-op.
     pub fn build_path_cache_from_compounds(
         &mut self,
-        compound_paths: &[Vec<String>],
+        compound_paths: &[CompoundPath],
         budget_mb: u64,
     ) {
         if budget_mb == 0 || compound_paths.is_empty() {

@@ -1,3 +1,9 @@
+## Cardinality 追加 (2026-06-03)
+- 変更: rdf_config.rs に Cardinality enum 追加、CompoundPath 型変更 (Vec<String> → Vec<(String, Cardinality)>)
+- 変更: main.rs の型注釈・ループ更新 (for (iri, _card) in path)
+- ビルド: 成功
+- テスト: 成功 (27 passed)
+
 ## ヒント提案機能 (2026-06-03)
 - 変更: server.rs に detect_bnode_hints + collect_role_vars 追加
 - 変更: execute_query / execute_query_with_cancel / build_query_response / format_decoded / decoded_to_json にヒント伝播

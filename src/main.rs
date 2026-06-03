@@ -417,7 +417,7 @@ async fn main() -> anyhow::Result<()> {
             // Load compound paths once — used for both pred_cache priority and
             // path_cache materialisation below.  Network I/O (GitHub fetches)
             // happens here; skipped if no rdf_configs are configured.
-            let compound_paths: Vec<Vec<String>> = if !effective_rdf_configs.is_empty() {
+            let compound_paths: Vec<ecordf::rdf_config::CompoundPath> = if !effective_rdf_configs.is_empty() {
                 eprintln!("Loading rdf-config from {} spec(s)...", effective_rdf_configs.len());
                 let paths = ecordf::rdf_config::load_compound_paths(&effective_rdf_configs);
                 eprintln!("  {} compound path(s) found.", paths.len());
@@ -434,7 +434,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut seen = std::collections::HashSet::new();
                 let mut iris = Vec::new();
                 for path in &compound_paths {
-                    for iri in path {
+                    for (iri, _card) in path {
                         if seen.insert(iri.as_str()) {
                             iris.push(iri.clone());
                         }

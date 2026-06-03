@@ -44,7 +44,7 @@ use std::time::Instant;
 use crate::dict_builder::QueryDict;
 use crate::index::TripleIndex;
 use crate::predcache::PredCache;
-use crate::rdf_config::CompoundPath;
+use crate::rdf_config::{Cardinality, CompoundPath};
 use crate::triple::{TermId, TriplePattern, UNBOUND};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -288,8 +288,8 @@ fn expand_subseqs(paths: &[CompoundPath]) -> Vec<CompoundPath> {
 ///
 /// Returns `None` if any IRI is not in the dictionary (i.e. never appears in
 /// the store — this path won't produce any results anyway).
-fn resolve_path(path_iris: &[String], dict: &QueryDict) -> Option<Vec<TermId>> {
-    path_iris.iter().map(|iri| {
+fn resolve_path(path_iris: &[(String, Cardinality)], dict: &QueryDict) -> Option<Vec<TermId>> {
+    path_iris.iter().map(|(iri, _)| {
         // IRIs from rdf_config come as `<…>` — strip angle brackets for lookup
         let key = iri.trim_matches(|c| c == '<' || c == '>');
         dict.lookup(key)
@@ -424,18 +424,22 @@ mod tests {
         assert_eq!(result_sorted, expected);
     }
 
+    fn e(s: &str) -> (String, Cardinality) {
+        (s.to_string(), Cardinality::ExactlyOne)
+    }
+
     #[test]
     fn test_expand_subseqs_basic() {
         let paths = vec![
-            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            vec![e("A"), e("B"), e("C")],
         ];
         let expanded = expand_subseqs(&paths);
         // Expected (length-2 first, then length-3):
         // ["A","B"], ["B","C"], ["A","B","C"]
         assert_eq!(expanded, vec![
-            vec!["A".to_string(), "B".to_string()],
-            vec!["B".to_string(), "C".to_string()],
-            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            vec![e("A"), e("B")],
+            vec![e("B"), e("C")],
+            vec![e("A"), e("B"), e("C")],
         ]);
     }
 
@@ -443,12 +447,12 @@ mod tests {
     fn test_expand_subseqs_dedup() {
         // Two paths share a suffix — ["B","C"] should appear only once.
         let paths = vec![
-            vec!["A".to_string(), "B".to_string(), "C".to_string()],
-            vec!["X".to_string(), "B".to_string(), "C".to_string()],
+            vec![e("A"), e("B"), e("C")],
+            vec![e("X"), e("B"), e("C")],
         ];
         let expanded = expand_subseqs(&paths);
         let bc_count = expanded.iter()
-            .filter(|p| p.as_slice() == ["B".to_string(), "C".to_string()])
+            .filter(|p| p.as_slice() == [e("B"), e("C")])
             .count();
         assert_eq!(bc_count, 1, "['B','C'] should appear exactly once after dedup");
     }
@@ -457,7 +461,7 @@ mod tests {
     fn test_expand_subseqs_four_hop() {
         // 4-hop path → 3 length-2, 2 length-3, 1 length-4 = 6 sub-sequences
         let paths = vec![
-            vec!["A".to_string(), "B".to_string(), "C".to_string(), "D".to_string()],
+            vec![e("A"), e("B"), e("C"), e("D")],
         ];
         let expanded = expand_subseqs(&paths);
         assert_eq!(expanded.len(), 6);

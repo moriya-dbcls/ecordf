@@ -1,0 +1,156 @@
+# タスク7: rdf_config.rs に Cardinality を追加 + main.rs 対応
+
+## 作業ディレクトリ
+/home/moriya/tmp/ecordf
+
+## 担当ファイル
+- src/rdf_config.rs
+- src/main.rs
+
+## 背景
+rdf-config の model.yaml では述語キーに以下のカーディナリティ記号が付く:
+  - 記号なし: 必ず1つ (ExactlyOne)
+  - `?`      : 0または1つ (ZeroOrOne)
+  - `+`      : 1つ以上    (OneOrMore)
+  - `*`      : 0個以上    (ZeroOrMore)
+
+現在はこれらを strip して捨てているが、クエリ最適化・キャッシュ優先度制御のために
+保持する必要がある。
+
+## 変更内容
+
+### 1. src/rdf_config.rs
+
+#### 1-a. Cardinality enum を追加 (CompoundPath の型定義の直前)
+
+```rust
+/// Cardinality of a predicate as declared in rdf-config model.yaml.
+///
+/// - `ExactlyOne` — no suffix: exactly one value per subject
+/// - `ZeroOrOne`  — `?` suffix: zero or one value per subject (optional)
+/// - `OneOrMore`  — `+` suffix: one or more values per subject (required, multi)
+/// - `ZeroOrMore` — `*` suffix: zero or more values (optional, multi)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Cardinality {
+    ExactlyOne,
+    ZeroOrOne,
+    OneOrMore,
+    ZeroOrMore,
+}
+```
+
+#### 1-b. CompoundPath 型変更
+
+現在:
+```rust
+pub type CompoundPath = Vec<String>;
+```
+
+変更後:
+```rust
+pub type CompoundPath = Vec<(String, Cardinality)>;
+```
+
+#### 1-c. walk_property_item でカーディナリティを保持
+
+現在の該当箇所 (strip して捨てている部分):
+```rust
+        // Strip cardinality markers before IRI resolution.
+        let pred_str = pred_str_raw.trim_end_matches(|c| c == '+' || c == '*' || c == '?');
+        let resolved = resolve_iri(pred_str, prefixes);
+
+        let mut new_path: Vec<String> = current_path.to_vec();
+        new_path.push(resolved);
+```
+
+変更後:
+```rust
+        // Parse and strip cardinality marker before IRI resolution.
+        let cardinality = match pred_str_raw.chars().last() {
+            Some('+') => Cardinality::OneOrMore,
+            Some('*') => Cardinality::ZeroOrMore,
+            Some('?') => Cardinality::ZeroOrOne,
+            _         => Cardinality::ExactlyOne,
+        };
+        let pred_str = pred_str_raw.trim_end_matches(|c| c == '+' || c == '*' || c == '?');
+        let resolved = resolve_iri(pred_str, prefixes);
+
+        let mut new_path: Vec<(String, Cardinality)> = current_path.to_vec();
+        new_path.push((resolved, cardinality));
+```
+
+#### 1-d. テストの修正
+
+`test_cardinality_suffix_stripped` テストは現在
+「記号が IRI に混入していないこと」を確認している。
+型が変わるので、テストをアップデートして
+`(iri, cardinality)` タプルから `.0` で IRI を取り出して検証するよう修正する。
+
+具体的には `path.iter().all(|iri| ...)` を
+`path.iter().all(|(iri, _)| ...)` に変える。
+
+### 2. src/main.rs
+
+#### 2-a. 型注釈の更新
+
+現在 (420行付近):
+```rust
+let compound_paths: Vec<Vec<String>> = if !effective_rdf_configs.is_empty() {
+```
+
+変更後:
+```rust
+let compound_paths: Vec<ecordf::rdf_config::CompoundPath> = if !effective_rdf_configs.is_empty() {
+```
+
+#### 2-b. priority_iris 収集ループの更新
+
+現在 (436-443行付近):
+```rust
+            for path in &compound_paths {
+                for iri in path {
+                    if seen.insert(iri.as_str()) {
+                        iris.push(iri.clone());
+                    }
+                }
+            }
+```
+
+変更後:
+```rust
+            for path in &compound_paths {
+                for (iri, _card) in path {
+                    if seen.insert(iri.as_str()) {
+                        iris.push(iri.clone());
+                    }
+                }
+            }
+```
+
+## ビルドと確認
+
+```bash
+cd /home/moriya/tmp/ecordf
+cargo build --release 2>&1 | tail -30
+cargo test 2>&1 | tail -20
+```
+
+ビルドエラーが出る場合は修正して通す。
+(task3/task6 が並列で path_cache.rs / store.rs を修正するため、それらのファイルが
+一時的にコンパイルエラーになっているかもしれないが、rdf_config.rs / main.rs の
+変更自体は独立しているので cargo build がどこで止まるかを確認すること)
+
+## やらないこと
+- git push
+- サーバーの起動・停止
+- src/rdf_config.rs と src/main.rs 以外のソース変更
+
+## 報告先
+report/task7.md に追記:
+```
+## Cardinality 追加 (2026-06-03)
+- 変更: rdf_config.rs に Cardinality enum 追加、CompoundPath 型変更
+- 変更: main.rs の型注釈・ループ更新
+- ビルド: 成功/失敗
+- テスト: 成功/失敗
+```
