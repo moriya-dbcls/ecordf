@@ -25,11 +25,19 @@ cargo build --release --no-default-features  # gzip なし
 # SPARQL クエリ
 ./target/release/ecordf query --dir ./store "SELECT ..."
 
-# HTTP サーバー起動
-./target/release/ecordf serve --dir ./store --port 17878
+# HTTP サーバー起動（親タスクが担当）
+RUST_LOG=ecordf=debug ./target/release/ecordf serve --dir ./data/jpost \
+  2>debug.log.$(date +%y%m%d.%H) &
+ln -sf debug.log.$(date +%y%m%d.%H) debug.log   # 最新ログへのシンボリックリンク
 ```
-- ただし、サーバーの起動、再起動はユーザが行うものとするため、再起動が必要な場合は連絡する。
-- また、起動は完了まで時間がかかることがあるため、debug.logに"Server ready"があるかを１分毎に確認して作業を進める。
+
+### サーバー管理ルール（親タスク = タスク0 が担当）
+- **起動・再起動は親タスクが行う**。ユーザから「再起動して」と言われた場合、または
+  ビルド後の動作確認が必要な場合は、上記コマンドで起動する。
+- ポート 17878 が使用中なら既存プロセスを確認（`ps aux | grep ecordf`）し、
+  停止してから再起動する。
+- 起動後は `debug.log` に **"Server ready"** が出るまで 1 分ごとに確認してから作業を進める。
+- ストアディレクトリは `./data/jpost`（プロジェクトルートからの相対パス）。
 
 ## モジュール構成と担当タスク
 
@@ -70,17 +78,18 @@ Claude Code（親タスク）は作業要件をタスク1〜7に切り分け、�
 - タスク番号が異なる場合のみ並列化する（担当ファイルが重複しないため競合しない）。
 
 ### screen 起動方法
-`.claude/settings.json` の allowlist により、子タスクは `--dangerously-skip-permissions` 不要で主要操作を自動承認する。
+子タスクは放置で動作するため `--dangerously-skip-permissions` を使う。
+**やってはいけない操作**（git push、サービス再起動等）は allowlist ではなくプロンプト指示で制御する。
+
 ```bash
-# メインリポジトリを直接編集（コピー不要）
 PROJECT_ROOT=$(git rev-parse --show-toplevel)
-screen -dmS task5 bash -c "cd $PROJECT_ROOT && claude < prompts/task5.txt"
-screen -dmS task6 bash -c "cd $PROJECT_ROOT && claude < prompts/task6.txt"
+screen -dmS task5 bash -c "cd $PROJECT_ROOT && claude --dangerously-skip-permissions < prompts/task5.txt"
+screen -dmS task6 bash -c "cd $PROJECT_ROOT && claude --dangerously-skip-permissions < prompts/task6.txt"
 ```
 
 ### 承認が必要な操作（子タスク→親タスクへの通知）
-allowlist に含まれない操作（`git push`、システムパッケージインストール等）が必要な場合、
-子タスクは作業を中断し `report/need_approval.md` へ以下の形式で書き込む：
+プロンプトで「やらないこと」を明示する。それでも承認が必要な事態が発生した場合は、
+子タスクは作業を中断し `report/need_approval.md` へ書き込んで終了する：
 ```markdown
 ## [タスク番号] 承認要請
 - 操作: `git push origin main`
@@ -95,9 +104,12 @@ allowlist に含まれない操作（`git push`、システムパッケージイ
 - 問題の詳細・修正方針
 - 報告先: `report/task[N].md`（プロジェクトルートからの相対パス）
 
-### ポート確認
-サーバー（port=17878）の起動・再起動はユーザーが行う。空いていなければ報告する。
-また、親タスクはクエリの実行、ログの解析などを行い判断と報告を行う。
+### 親タスク（タスク0）の役割
+- `src/` 以下のコードは **直接編集しない**。変更は子タスクに prompts/task[N].txt で委譲。
+- 担当できる作業: 分析・クエリ実行・debug.log 解析・report/ 取りまとめ・
+  CLAUDE.md / prompts/ 編集・git add/commit・サーバー起動停止。
+- **子タスクは `--dangerously-skip-permissions` を必ず付ける**（非対話で放置するため）。
+- prompts/task[N].txt には「やらないこと」（git push・サーバー操作等）を明記する。
 
 ## 主要な型
 
@@ -166,7 +178,7 @@ rdf_configs = [...]           # rdf-config の URL またはパス
 - CONSTRUCT クエリ未実装
 - SPARQL UPDATE（INSERT/DELETE）未実装
 - SERVICE（フェデレーション）未実装
-- GROUP BY の大規模中間結果（5M行以上）ではストリーミング集計が未実装
+- GROUP BY の大規模中間結果でのストリーミング集計は部分実装（COUNT DISTINCT は未対応）
 - 1クエリの内部並列化未実装（クエリ間並列は実装済み）
 
 ## クロスモジュール変更の例

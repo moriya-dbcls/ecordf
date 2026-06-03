@@ -1,0 +1,39 @@
+# タスク5: cross-product COUNT の u64 オーバーフロー修正
+
+## 作業ディレクトリ
+プロジェクトルート（このファイルがある場所）
+
+## やらないこと
+- git push
+- サービスの起動・再起動
+- src/ 以外のファイルの変更（report/ への報告は除く）
+
+## 問題
+`src/sparql/executor.rs` の `try_count_cross_product` メソッドで
+積の計算に `u64` を使っているため、大規模クロス積でサチュレーションし
+`u64::MAX (18446744073709551615)` が返る。
+
+## 修正内容
+`try_count_cross_product` 内の積計算を `u128` に変更するだけ:
+
+```rust
+// 変更前
+let mut product: u64 = 1;
+...
+product = product.saturating_mul(rs.rows.len() as u64);
+
+// 変更後
+let mut product: u128 = 1;
+...
+product = product.saturating_mul(rs.rows.len() as u128);
+```
+
+（`n_str` の format! はそのまま。`u128` の Display は自動で正しい数値を出力する）
+
+## 手順
+1. `src/sparql/executor.rs` を編集（`try_count_cross_product` を検索）
+2. `cargo build --release` でビルド確認
+3. `cargo test --lib` でテスト確認
+
+## 完了報告
+`report/task5.md` に修正箇所・ビルド結果を記録して終了してください。
