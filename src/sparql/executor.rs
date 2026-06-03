@@ -371,11 +371,26 @@ impl<'a> Executor<'a> {
         let bgp_rows = bindings.rows.len();
 
         // 4. Apply HAVING
-        for having in &query.having {
-            bindings.rows.retain(|row| {
-                let b = row_to_binding(&bindings.variables, row);
-                self.eval_bool(having, &b).unwrap_or(false)
-            });
+        // After GROUP BY, aggregate expressions in HAVING (e.g. COUNT(?pe)) are no
+        // longer directly evaluable because the raw variable ?pe is gone.  Rewrite
+        // them to their aliased variable names from the projection before evaluating.
+        if !query.having.is_empty() {
+            let aliases: Vec<(Expression, String)> =
+                if let Projection::Variables(items) = &query.projection {
+                    items.iter().filter_map(|item| {
+                        if let SelectItem::Alias(expr, name) = item {
+                            Some((expr.clone(), name.clone()))
+                        } else { None }
+                    }).collect()
+                } else { Vec::new() };
+
+            for having in &query.having {
+                let rewritten = rewrite_having_agg(having.clone(), &aliases);
+                bindings.rows.retain(|row| {
+                    let b = row_to_binding(&bindings.variables, row);
+                    self.eval_bool(&rewritten, &b).unwrap_or(false)
+                });
+            }
         }
 
         // 5. Apply ORDER BY
@@ -400,36 +415,40 @@ impl<'a> Executor<'a> {
             tracing::debug!(orderby_us = t.elapsed().as_micros(), rows = bindings.rows.len(), "ORDER BY");
         }
 
-        // 6. Apply DISTINCT before LIMIT (SPARQL 1.1 §18.2.5: DISTINCT/REDUCED are applied
-        //    before slicing with OFFSET/LIMIT — doing it after would give wrong row counts).
+        // 6. Project output variables (before DISTINCT so deduplication operates on
+        //    the projected variables only, as required by SPARQL 1.1 §18.2.5).
+        //    ORDER BY is applied before projection (step 5) so that ORDER BY can still
+        //    reference non-projected variables (e.g. SELECT ?x ORDER BY ?y).
+        let mut result = self.project(&bindings, &query.projection);
+
+        // 7. Apply DISTINCT after projection (SPARQL 1.1 §18.2.5: Project → Distinct → Slice).
+        //    Uses HashSet retain instead of sort+dedup to preserve ORDER BY ordering.
         if query.distinct {
             let t = Instant::now();
-            let before = bindings.rows.len();
-            bindings.rows.sort_unstable();
-            bindings.rows.dedup();
+            let before = result.rows.len();
+            let mut seen: HashSet<Vec<Option<TermId>>> = HashSet::with_capacity(before);
+            result.rows.retain(|row| seen.insert(row.clone()));
             tracing::debug!(
                 distinct_us = t.elapsed().as_micros(),
                 rows_in = before,
-                rows_out = bindings.rows.len(),
+                rows_out = result.rows.len(),
                 "DISTINCT"
             );
         }
 
-        // 7. OFFSET + LIMIT
+        // 8. OFFSET + LIMIT (after DISTINCT so row counts are correct)
         if let Some(off) = query.offset {
-            if off as usize >= bindings.rows.len() {
-                bindings.rows.clear();
+            if off as usize >= result.rows.len() {
+                result.rows.clear();
             } else {
-                bindings.rows.drain(0..off as usize);
+                result.rows.drain(0..off as usize);
             }
         }
         if let Some(lim) = query.limit {
-            bindings.rows.truncate(lim as usize);
+            result.rows.truncate(lim as usize);
         }
 
-        // 8. Project output variables
         let post_us = t_post.elapsed().as_micros();
-        let result = self.project(&bindings, &query.projection);
         tracing::debug!(
             plan_us,
             bgp_us,
@@ -552,10 +571,10 @@ impl<'a> Executor<'a> {
                     // Sequential POS read cost on HDD: ~200 ns per triple.
                     // HDD sequential ~120 MB/s, 24 bytes/triple → 24/120e6 = 200 ns.
                     const POS_READ_NS: u64 = 200;
-                    // RAM binary-search cost when pred_cache is loaded.
-                    // log2(11.8M) ≈ 23 comparisons × ~5 ns/cmp × 2 (range query) ≈ 230 ns.
-                    // Use 2000 ns (2 µs) as a conservative upper bound including overhead.
-                    const CACHE_SEEK_NS: u64 = 2_000;
+                    // RAM binary-search cost when pred_cache is loaded (path NOT in path_cache).
+                    // Empirical (faldo 2-hop, 11.8M pairs, 188MB): ~50ms per probe due
+                    // to TLB/page-cache misses on the large sorted array.
+                    const CACHE_SEEK_NS: u64 = 50_000_000;
 
                     let n = left_rs.rows.len() as u64;
                     let path_steps = path_step_count(path).max(1) as u64;
@@ -692,6 +711,17 @@ impl<'a> Executor<'a> {
                         let right_rs = self.execute_plan_with_ctx(right, outer);
                         if right_rs.overflow { return right_rs; }
                         return self.hash_join(left_rs, right_rs);
+                    }
+                    // When the full path is in path_cache, use a single linear scan
+                    // (merge scan) instead of N binary searches.
+                    // Empirical: 263 probes × 52ms (page-fault penalty) = 13.7s with
+                    // bind_join; merge scan reads 188MB sequentially ≈ 94ms.
+                    if path_cached {
+                        tracing::debug!(
+                            left_rows = n,
+                            "Join PathPattern: path_cache merge scan"
+                        );
+                        return self.path_cache_merge_join(left_rs, right, outer);
                     }
                     tracing::debug!(
                         left_rows = n,
@@ -1723,7 +1753,7 @@ impl<'a> Executor<'a> {
         let free_var_name = &free_vars[0].0;
 
         // Collect (S → [O]) pairs for matching subjects.
-        // Prefer pred_cache: binary search per subject → O(N×log M) RAM.
+        // Prefer pred_cache: merge scan (sort subjects + two-pointer) → O(N log N + M) RAM.
         // Fall back to sequential POS scan → O(pred_range) HDD.
         // Build (S → [O]) mapping from the best available source:
         // pred_cache (RAM) → pred_partitions (mmap) → index scan (HDD).
@@ -1736,11 +1766,21 @@ impl<'a> Executor<'a> {
                 mode = "pred_cache_join",
                 "bind_join join: using cached predicate"
             );
-            for &s in &subjects {
-                let lo = cached.partition_point(|&(cs, _)| cs < s);
-                let hi = cached[lo..].partition_point(|&(cs, _)| cs == s) + lo;
-                if lo < hi {
-                    let objs: Vec<TermId> = cached[lo..hi].iter().map(|&(_, o)| o).collect();
+            // Merge-join: sort subjects then scan pred_cache sequentially.
+            // Binary search: O(N × log M) with random access → cache-miss heavy for large M.
+            // Merge join: O(N log N + N + M) with sequential access → prefetcher-friendly.
+            // For M ≥ 1M pairs the sequential scan is ~10–20× faster due to cache behaviour.
+            let mut subjects_sorted: Vec<TermId> = subjects.iter().copied().collect();
+            subjects_sorted.sort_unstable();
+            let mut ci = 0usize;
+            for &s in &subjects_sorted {
+                // Skip past pred_cache entries whose subject < s.
+                while ci < cached.len() && cached[ci].0 < s { ci += 1; }
+                if ci >= cached.len() { break; }
+                if cached[ci].0 == s {
+                    let start = ci;
+                    while ci < cached.len() && cached[ci].0 == s { ci += 1; }
+                    let objs: Vec<TermId> = cached[start..ci].iter().map(|&(_, o)| o).collect();
                     s_to_objects.insert(s, objs);
                 }
             }
@@ -2215,6 +2255,128 @@ impl<'a> Executor<'a> {
         result
     }
 
+    /// Merge-scan join for PathPattern when the full path is in path_cache.
+    ///
+    /// Instead of N binary searches (one per left row) — each causing TLB/page-cache
+    /// misses across the 188 MB sorted array — this reads the cached pairs exactly once
+    /// in sequential order and matches them against a HashMap of source TermIds from left.
+    ///
+    /// Complexity: O(N_left + M_cache) instead of O(N_left × log M_cache).
+    /// Empirical speedup for faldo 2-hop (N=263, M=11.8M): 13.7 s → ~100 ms.
+    fn path_cache_merge_join(
+        &self,
+        left: ResultSet,
+        right_plan: &ExecutionPlan,
+        outer: &Binding,
+    ) -> ResultSet {
+        let t0 = std::time::Instant::now();
+
+        let (path_s_term, path, path_o_term) = match right_plan {
+            ExecutionPlan::PathPattern { s, path, o } => (s, path, o),
+            _ => return self.bind_join(left, right_plan, outer),
+        };
+
+        // Resolve path → TermIds for cache lookup (Sequence of IRI steps only).
+        let path_ids_opt: Option<Vec<TermId>> = match path {
+            PropertyPath::Sequence(steps) => steps.iter().map(|s| {
+                if let PropertyPath::Iri(iri) = s { self.dict.lookup(iri) } else { None }
+            }).collect(),
+            PropertyPath::Iri(iri) => self.dict.lookup(iri).map(|id| vec![id]),
+            _ => None,
+        };
+        let path_ids = match path_ids_opt {
+            Some(ids) => ids,
+            None => return self.bind_join(left, right_plan, outer),
+        };
+
+        let cached = match self.path_cache.get(&path_ids) {
+            Some(c) => c,
+            None => return self.bind_join(left, right_plan, outer),
+        };
+
+        // path_s must be a Variable present in left.
+        let s_var_name: String = match path_s_term {
+            Term::Variable(v) => v.clone(),
+            _ => return self.bind_join(left, right_plan, outer),
+        };
+        let s_col = match left.variable_index(&s_var_name) {
+            Some(col) => col,
+            None => return self.bind_join(left, right_plan, outer),
+        };
+
+        // Resolve path_o after applying outer bindings.
+        let path_o_sub = self.substitute_term(path_o_term, outer);
+        let (o_var_name, o_filter, o_left_col): (Option<String>, Option<TermId>, Option<usize>) =
+            match &path_o_sub {
+                Term::Variable(v) => {
+                    let o_col = left.variable_index(v.as_str());
+                    (Some(v.clone()), None, o_col)
+                }
+                t => match self.encode_term(t) {
+                    Some(oid) => (None, Some(oid), None),
+                    None => return ResultSet::empty(left.variables.clone()),
+                },
+            };
+
+        // Build src_id → list of left-row indices (O(N_left)).
+        let mut src_to_rows: HashMap<TermId, Vec<usize>> = HashMap::new();
+        for (row_idx, row) in left.rows.iter().enumerate() {
+            if let Some(Some(sid)) = row.get(s_col) {
+                src_to_rows.entry(*sid).or_default().push(row_idx);
+            }
+        }
+
+        // Output variable list: left vars + new path_o var (if free).
+        let mut out_vars: Vec<String> = left.variables.clone();
+        if let Some(ref ov) = o_var_name {
+            if o_left_col.is_none() && !out_vars.contains(ov) {
+                out_vars.push(ov.clone());
+            }
+        }
+        let mut result = ResultSet::empty(out_vars.clone());
+        let out_s_col = result.variable_index(&s_var_name);
+        let out_o_col = o_var_name.as_deref().and_then(|ov| result.variable_index(ov));
+
+        // Single sequential scan through all cached pairs (O(M_cache)).
+        for &(src, dst) in cached.iter() {
+            if let Some(oid) = o_filter { if dst != oid { continue; } }
+            let row_indices = match src_to_rows.get(&src) {
+                Some(r) => r,
+                None => continue,
+            };
+            for &row_idx in row_indices {
+                let left_row = &left.rows[row_idx];
+                if let Some(o_lc) = o_left_col {
+                    if left_row.get(o_lc).copied().flatten() != Some(dst) { continue; }
+                }
+                let mut row = vec![None; result.variables.len()];
+                for (li, lv) in left.variables.iter().enumerate() {
+                    if let Some(oi) = result.variable_index(lv) {
+                        row[oi] = left_row.get(li).copied().flatten();
+                    }
+                }
+                if let Some(sc) = out_s_col { row[sc] = Some(src); }
+                if let Some(oc) = out_o_col { row[oc] = Some(dst); }
+                result.rows.push(row);
+                if result.rows.len() >= self.config.max_intermediate_rows {
+                    result.overflow = true;
+                    return result;
+                }
+                if self.is_limit_reached(result.rows.len()) { return result; }
+            }
+        }
+
+        tracing::debug!(
+            left_rows = left.rows.len(),
+            cached_pairs = cached.len(),
+            out_rows = result.rows.len(),
+            elapsed_us = t0.elapsed().as_micros(),
+            "path_cache_merge_join done"
+        );
+        result
+    }
+
+
     /// Substitute a Term: if it's a Variable bound in `outer`, return an Iri term
     /// with the decoded string.  Used for path pattern endpoints in bind-join context.
     fn substitute_term(&self, term: &Term, outer: &Binding) -> Term {
@@ -2317,53 +2479,175 @@ impl<'a> Executor<'a> {
     // ── Aggregation ───────────────────────────────────────────────────────────
 
     fn apply_group_by(&self, rs: &ResultSet, query: &SelectQuery) -> ResultSet {
-        // Group rows by GROUP BY key
-        let mut groups: HashMap<Vec<Option<TermId>>, Vec<Vec<Option<TermId>>>> = HashMap::new();
+        // Pre-compute GROUP BY column indices — used by both fast and slow path.
+        let gb_col_indices: Vec<Option<usize>> = query.group_by.iter()
+            .map(|gc| if let Expression::Variable(v) = &gc.expr { rs.variable_index(v) } else { None })
+            .collect();
 
-        for row in &rs.rows {
-            let key: Vec<Option<TermId>> = query.group_by.iter()
-                .filter_map(|gc| {
-                    if let Expression::Variable(v) = &gc.expr {
-                        rs.variable_index(v).map(|i| row[i])
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            groups.entry(key).or_default().push(row.clone());
+        // Determine output variables and per-column aggregate kind.
+        //
+        // Fast path (streaming accumulator) avoids storing all rows per group
+        // and eliminates per-row row_to_binding calls.  It handles the most
+        // common GROUP BY patterns: COUNT(*), COUNT(?v), COUNT(DISTINCT ?v)
+        // where the inner expression is a simple variable.
+        //
+        // Slow path (row-storage) is used when an output column requires
+        // general expression evaluation (SUM, AVG, GroupConcat, etc.).
+        #[derive(Clone)]
+        enum ColKind {
+            GbKey(usize),          // GROUP BY variable at key index i
+            CountStar,             // COUNT(*)
+            Count(usize),          // COUNT(?v): column index in rs
+            CountDistinct(usize),  // COUNT(DISTINCT ?v): column index in rs
+            Complex,               // needs general eval_aggregate (row storage required)
         }
 
-        // Determine output variables from SELECT projection
         let mut out_vars: Vec<String> = Vec::new();
+        let mut col_kinds: Vec<ColKind> = Vec::new();
+
         if let Projection::Variables(items) = &query.projection {
             for item in items {
                 match item {
-                    SelectItem::Variable(v) => out_vars.push(v.clone()),
-                    SelectItem::Alias(_, name) => out_vars.push(name.clone()),
+                    SelectItem::Variable(v) => {
+                        out_vars.push(v.clone());
+                        let gb_i = query.group_by.iter().position(|gc| {
+                            matches!(&gc.expr, Expression::Variable(gv) if gv == v)
+                        }).unwrap_or(0);
+                        col_kinds.push(ColKind::GbKey(gb_i));
+                    }
+                    SelectItem::Alias(expr, name) => {
+                        out_vars.push(name.clone());
+                        let kind = match expr {
+                            Expression::Count { distinct: false, expr: None } =>
+                                ColKind::CountStar,
+                            Expression::Count { distinct: false, expr: Some(inner) } => {
+                                if let Expression::Variable(v) = inner.as_ref() {
+                                    if let Some(ci) = rs.variable_index(v) {
+                                        ColKind::Count(ci)
+                                    } else { ColKind::Complex }
+                                } else { ColKind::Complex }
+                            }
+                            Expression::Count { distinct: true, expr: Some(inner) } => {
+                                if let Expression::Variable(v) = inner.as_ref() {
+                                    if let Some(ci) = rs.variable_index(v) {
+                                        ColKind::CountDistinct(ci)
+                                    } else { ColKind::Complex }
+                                } else { ColKind::Complex }
+                            }
+                            _ => ColKind::Complex,
+                        };
+                        col_kinds.push(kind);
+                    }
                 }
             }
         }
 
+        let can_stream = col_kinds.iter().all(|k| !matches!(k, ColKind::Complex));
+
+        if can_stream {
+            // ── Fast path: streaming accumulators ─────────────────────────────
+            // One pass over rows; no row cloning, no row_to_binding.
+            // Per group, keep: HashSet<TermId> for CountDistinct, usize for Count.
+            enum Acc { Count(usize), Distinct(HashSet<TermId>) }
+
+            let mut groups: HashMap<Vec<Option<TermId>>, Vec<Acc>> =
+                HashMap::with_capacity(rs.rows.len().min(1 << 16));
+
+            for row in &rs.rows {
+                let key: Vec<Option<TermId>> = gb_col_indices.iter()
+                    .map(|ci| ci.and_then(|i| row.get(i).copied().flatten()))
+                    .collect();
+
+                let accs = groups.entry(key).or_insert_with(|| {
+                    col_kinds.iter().filter_map(|k| match k {
+                        ColKind::CountStar | ColKind::Count(_) => Some(Acc::Count(0)),
+                        ColKind::CountDistinct(_) => Some(Acc::Distinct(HashSet::new())),
+                        ColKind::GbKey(_) | ColKind::Complex => None,
+                    }).collect()
+                });
+
+                // acc_idx skips GbKey columns (they have no accumulator).
+                let mut acc_idx = 0;
+                for kind in &col_kinds {
+                    match kind {
+                        ColKind::GbKey(_) => {}
+                        ColKind::CountStar => {
+                            if let Acc::Count(c) = &mut accs[acc_idx] { *c += 1; }
+                            acc_idx += 1;
+                        }
+                        ColKind::Count(ci) => {
+                            if let Acc::Count(c) = &mut accs[acc_idx] {
+                                if row.get(*ci).copied().flatten().is_some() { *c += 1; }
+                            }
+                            acc_idx += 1;
+                        }
+                        ColKind::CountDistinct(ci) => {
+                            if let Acc::Distinct(set) = &mut accs[acc_idx] {
+                                if let Some(id) = row.get(*ci).copied().flatten() {
+                                    set.insert(id);
+                                }
+                            }
+                            acc_idx += 1;
+                        }
+                        ColKind::Complex => {}
+                    }
+                }
+            }
+
+            let out_len = out_vars.len();
+            let mut result = ResultSet::empty(out_vars);
+            result.overflow = rs.overflow;
+
+            for (key, accs) in groups {
+                let mut out_row = vec![None; out_len];
+                let mut acc_idx = 0;
+                for (out_i, kind) in col_kinds.iter().enumerate() {
+                    out_row[out_i] = match kind {
+                        ColKind::GbKey(ki) => key.get(*ki).copied().flatten(),
+                        ColKind::CountStar | ColKind::Count(_) => {
+                            let n = if let Acc::Count(c) = &accs[acc_idx] { *c } else { 0 };
+                            acc_idx += 1;
+                            let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n);
+                            Some(self.dict.encode(&s))
+                        }
+                        ColKind::CountDistinct(_) => {
+                            let n = if let Acc::Distinct(set) = &accs[acc_idx] { set.len() } else { 0 };
+                            acc_idx += 1;
+                            let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n);
+                            Some(self.dict.encode(&s))
+                        }
+                        ColKind::Complex => None,
+                    };
+                }
+                result.rows.push(out_row);
+            }
+            return result;
+        }
+
+        // ── Slow path: store rows per group, then compute aggregates ──────────
+        let mut groups: HashMap<Vec<Option<TermId>>, Vec<Vec<Option<TermId>>>> = HashMap::new();
+
+        for row in &rs.rows {
+            let key: Vec<Option<TermId>> = gb_col_indices.iter()
+                .map(|ci| ci.and_then(|i| row.get(i).copied().flatten()))
+                .collect();
+            groups.entry(key).or_default().push(row.clone());
+        }
+
         let mut result = ResultSet::empty(out_vars.clone());
-        result.overflow = rs.overflow; // propagate truncation flag
+        result.overflow = rs.overflow;
 
         for (key, group_rows) in groups {
             let mut row = vec![None; out_vars.len()];
 
-            // Build a binding from the GROUP BY key variables so that scalar
-            // alias expressions (e.g. REPLACE(STR(?ontology), …)) can be evaluated
-            // even when the variable is not explicitly listed in the SELECT projection.
             let key_binding: Binding = query.group_by.iter().zip(key.iter())
                 .filter_map(|(gc, val)| {
                     if let Expression::Variable(v) = &gc.expr {
                         val.map(|id| (v.clone(), id))
-                    } else {
-                        None
-                    }
+                    } else { None }
                 })
                 .collect();
 
-            // Fill group-by variables that appear in the output projection
             for (i, gc) in query.group_by.iter().enumerate() {
                 if let Expression::Variable(v) = &gc.expr {
                     if let Some(out_i) = result.variable_index(v) {
@@ -2372,16 +2656,12 @@ impl<'a> Executor<'a> {
                 }
             }
 
-            // Compute aliases: use eval_aggregate for real aggregates, eval_term for scalars.
             if let Projection::Variables(items) = &query.projection {
                 for (out_i, item) in items.iter().enumerate() {
                     if let SelectItem::Alias(expr, _) = item {
                         row[out_i] = if is_aggregate_expr(expr) {
                             self.eval_aggregate(expr, &group_rows, rs)
                         } else {
-                            // Scalar expression (e.g. REPLACE, STR, CONCAT, …):
-                            // evaluate using the GROUP BY key binding so that GROUP BY
-                            // variables are available even if not in the SELECT projection.
                             self.eval_term(expr, &key_binding)
                         };
                     }
@@ -4692,6 +4972,75 @@ fn compare_order_keys(a: &str, b: &str) -> std::cmp::Ordering {
     match (a.parse::<f64>(), b.parse::<f64>()) {
         (Ok(na), Ok(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
         _ => a.cmp(b),
+    }
+}
+
+/// Rewrite aggregate sub-expressions in a HAVING condition to the alias variable
+/// they were projected under.  After GROUP BY the aggregate columns are already
+/// bound under their alias names (e.g. `?n_evidence`), so `COUNT(?pe)` in HAVING
+/// must be resolved to `?n_evidence` before eval_bool can compare the value.
+fn rewrite_having_agg(expr: Expression, aliases: &[(Expression, String)]) -> Expression {
+    if is_aggregate_expr(&expr) {
+        for (agg_expr, alias_name) in aliases {
+            if *agg_expr == expr {
+                return Expression::Variable(alias_name.clone());
+            }
+        }
+        return expr;
+    }
+    match expr {
+        Expression::And(a, b) => Expression::And(
+            Box::new(rewrite_having_agg(*a, aliases)),
+            Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        Expression::Or(a, b) => Expression::Or(
+            Box::new(rewrite_having_agg(*a, aliases)),
+            Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        Expression::Not(a) => Expression::Not(
+            Box::new(rewrite_having_agg(*a, aliases)),
+        ),
+        Expression::Eq(a, b) => Expression::Eq(
+            Box::new(rewrite_having_agg(*a, aliases)),
+            Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        Expression::Ne(a, b) => Expression::Ne(
+            Box::new(rewrite_having_agg(*a, aliases)),
+            Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        Expression::Lt(a, b) => Expression::Lt(
+            Box::new(rewrite_having_agg(*a, aliases)),
+            Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        Expression::Le(a, b) => Expression::Le(
+            Box::new(rewrite_having_agg(*a, aliases)),
+            Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        Expression::Gt(a, b) => Expression::Gt(
+            Box::new(rewrite_having_agg(*a, aliases)),
+            Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        Expression::Ge(a, b) => Expression::Ge(
+            Box::new(rewrite_having_agg(*a, aliases)),
+            Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        Expression::Add(a, b) => Expression::Add(
+            Box::new(rewrite_having_agg(*a, aliases)),
+            Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        Expression::Sub(a, b) => Expression::Sub(
+            Box::new(rewrite_having_agg(*a, aliases)),
+            Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        Expression::Mul(a, b) => Expression::Mul(
+            Box::new(rewrite_having_agg(*a, aliases)),
+            Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        Expression::Div(a, b) => Expression::Div(
+            Box::new(rewrite_having_agg(*a, aliases)),
+            Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        other => other,
     }
 }
 
