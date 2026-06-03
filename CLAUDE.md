@@ -70,11 +70,23 @@ Claude Code（親タスク）は作業要件をタスク1〜7に切り分け、�
 - タスク番号が異なる場合のみ並列化する（担当ファイルが重複しないため競合しない）。
 
 ### screen 起動方法
+`.claude/settings.json` の allowlist により、子タスクは `--dangerously-skip-permissions` 不要で主要操作を自動承認する。
 ```bash
 # メインリポジトリを直接編集（コピー不要）
-screen -dmS task5 bash -c "cd /opt/services/moriya/tmp/ecordf && claude --dangerously-skip-permissions < /tmp/prompt_task5.txt"
-screen -dmS task6 bash -c "cd /opt/services/moriya/tmp/ecordf && claude --dangerously-skip-permissions < /tmp/prompt_task6.txt"
+screen -dmS task5 bash -c "cd /opt/services/moriya/tmp/ecordf && claude < /tmp/prompt_task5.txt"
+screen -dmS task6 bash -c "cd /opt/services/moriya/tmp/ecordf && claude < /tmp/prompt_task6.txt"
 ```
+
+### 承認が必要な操作（子タスク→親タスクへの通知）
+allowlist に含まれない操作（`git push`、システムパッケージインストール等）が必要な場合、
+子タスクは作業を中断し `report/need_approval.md` へ以下の形式で書き込む：
+```markdown
+## [タスク番号] 承認要請
+- 操作: `git push origin main`
+- 理由: リモートへの反映が必要
+- 作業状況: executor.rs の修正完了、コミット済み
+```
+親タスクが `report/need_approval.md` を確認し、ユーザーへ報告して対応する。
 
 ### プロンプトファイルに含める情報
 - 作業ディレクトリ（`/opt/services/moriya/tmp/ecordf`）
