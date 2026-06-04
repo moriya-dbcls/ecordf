@@ -151,6 +151,43 @@ p2a_buf_mb = 512
 # CLI フラグ --auto-compress-cols でも指定可能（フラグが優先）。
 auto_compress_cols = false
 
+# デルタ圧縮に続けて Zstd ブロック圧縮（ECOCOL04）を自動適用するか。
+#
+# true にすると compress-cols 完了後に recompress-zstd を実行し、
+# .dz ファイルを .zst に変換したうえで .dz を削除する。
+# auto_compress_cols = true のときのみ ecordf build 時に有効。
+# compress-cols コマンドでは --zstd フラグとしても指定できる。
+#
+# ECOCOL04 は delta 符号化後に Zstd ブロック圧縮を重ねたフォーマット。
+# JPostDB (797M トリプル) の実測圧縮率:
+#   spo.c0: 829 MB → 136 MB (6.1×)
+#   spo.c1: 5831 MB → 283 MB (20.6×)   ← ランダムに見える列でも大幅圧縮
+#   spo.c2: 5918 MB → 1712 MB (3.5×)
+#   pos.c0: 77 MB → 2 MB (33.8×)
+#   全体: 23 GB → 5.9 GB (3.9×)
+#
+# 推奨環境:
+#
+#   HDD（7200 rpm 等）             → true を強く推奨
+#     .dz よりさらに 2–20× 圧縮。I/O が律速なため読み出し時間を直接短縮。
+#     Zstd 展開は 1–3 GB/s で HDD 帯域 (100–200 MB/s) を大幅に上回る。
+#
+#   SATA SSD（帯域 ≤ 500 MB/s）   → true を推奨
+#     ディスク節約に加え、I/O 削減がクエリ速度に寄与する。
+#     展開コスト（+1–3%/query）は軽微。
+#
+#   NVMe SSD（帯域 3 GB/s 以上）  → 任意
+#     ディスク節約目的なら true。クエリ速度への影響は ±2% 程度。
+#     CPU ゆとりがあれば true、レイテンシ最優先なら false。
+#
+#   大容量 RAM（データほぼ全量がページキャッシュに乗る環境）
+#                                  → false を推奨
+#     ページキャッシュ済みなら Zstd 展開コスト（~50 µs/チャンク）が
+#     相対的に割高になり、raw .c0 の方が速い場合がある。
+#
+# デフォルト false（後から ecordf compress-cols --zstd で適用可）。
+auto_compress_zstd = false
+
 # ── Query execution tunables ──────────────────────────────────────────────────
 
 [query]

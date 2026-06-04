@@ -201,6 +201,26 @@ pub struct BuildConfig {
     /// Overridable with `--auto-compress-cols` on the command line.
     pub auto_compress_cols: bool,
 
+    /// Automatically run Zstd recompression (`recompress-zstd`) after delta compression.
+    ///
+    /// When `true`, EcoRDF converts `.dz` files to `.zst` (ECOCOL04 format: delta +
+    /// Zstd block compression) immediately after `compress-cols` completes, then
+    /// deletes the `.dz` files.  Requires `auto_compress_cols = true` to take effect
+    /// during `ecordf build`; can also be triggered standalone via
+    /// `ecordf compress-cols --zstd --dir <store>`.
+    ///
+    /// ## いつ `true` にするか（推奨環境）
+    ///
+    /// | 環境 | 推奨値 | 理由 |
+    /// |------|--------|------|
+    /// | HDD（7200 rpm 等） | **`true` を強く推奨** | .dz よりさらに 2–20× 圧縮（spo.c1 では 20×）。I/O 削減がクエリ速度に直結 |
+    /// | SATA SSD（書き込み帯域 ≤ 500 MB/s）| **`true` を推奨** | ディスク節約 + I/O ボトルネック解消。Zstd 展開コストは軽微 |
+    /// | NVMe SSD（帯域 3 GB/s 以上）| **任意** | ディスク節約目的なら `true`。CPU オーバーヘッド（+1–3%/query）が許容できるか次第 |
+    /// | データが全て OS ページキャッシュに乗る大容量 RAM 環境 | **`false` を推奨** | ページキャッシュ済みなら Zstd 展開コスト（~50 µs/chunk）が相対的に割高 |
+    ///
+    /// デフォルト `false`。既存ストアへの後付け適用: `ecordf compress-cols --zstd --dir <store>`
+    pub auto_compress_zstd: bool,
+
     /// Per-file buffer size for Phase 2a string collection (MB).
     ///
     /// Larger values reduce the number of p2a chunk files, speeding up the
@@ -216,6 +236,7 @@ impl Default for BuildConfig {
             dict_chunk_mb: 200,
             parallel_threads: 0,
             auto_compress_cols: false,
+            auto_compress_zstd: false,
             p2a_buf_mb: 64,
         }
     }
