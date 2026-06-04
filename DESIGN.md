@@ -184,26 +184,87 @@ iter3 (疾患関連あり):  [P00533, P01116, P04637, ...]
 
 ## インデックス構成
 
-SPO/POS/OSP の3インデックスを採用。各インデックスは**列指向フォーマット**（3カラム分離ファイル）に加え、スパースな in-memory SkipIndex と、POS 専用の PredicateIndex を持ちます。
+SPO/POS/OSP の3インデックスを基本とし、オプションで PSO/SOP/OPS の追加インデックスを持ちます。各インデックスは**列指向フォーマット**（3カラム分離ファイル）に加え、スパースな in-memory SkipIndex と、POS 専用の PredicateIndex を持ちます。
 
 ```
 SPO索引:  主語でソート → 特定エンティティの全述語・目的語を高速取得
-  spo.c0  (Subject列:   u64 × N)
-  spo.c1  (Predicate列: u64 × N)
-  spo.c2  (Object列:    u64 × N)
-  spo.skip (SkipIndex: 8B × ⌈N/512⌉)
+  spo.c0.zst / spo.c1.zst / spo.c2.zst  (ECOCOL04: delta+Zstd)
+  spo.c0.skip (SkipIndex: 8B × ⌈N/512⌉)
 
 POS索引:  述語でソート → 生命科学クエリの大半（型・関係の絞り込み）
-  pos.c0, pos.c1, pos.c2, pos.skip
+  pos.c0.zst, pos.c1.zst, pos.c2.zst, pos.skip
   pos.pidx (PredicateIndex: 24B × 述語数)
 
 OSP索引:  目的語でソート → 値や概念からの逆引き
-  osp.c0, osp.c1, osp.c2, osp.skip
+  osp.c0.zst, osp.c1.zst, osp.c2.zst, osp.skip
+
+PSO/SOP/OPS索引: オプション（ファイルが存在する場合のみロード）
+  PSO: ?s p o の主語・述語同時束縛をより効率的に処理
+  SOP: ?s ?p o の主語・目的語同時束縛をより効率的に処理
+  OPS: ?s p o の目的語・述語同時束縛に特化（POS の代替）
 
 GSPO索引 (gspo.bin): グラフ+SPO → Named Graphs / N-Quads 対応（存在する場合のみ）
 ```
 
 各カラムは `u64` 配列を memmap2 でマップし、クエリ時は `scan()` / `scan_graph()` で範囲走査します（GSPO は先頭に `g: u64` を加えた 4カラム）。
+
+インデックスファイルの優先順位（`IndexFile::open`）:
+```
+1. .c0.zst / .c1.zst / .c2.zst  (ECOCOL04: delta+Zstd)  ← 最優先
+2. .c0.dz  / .c1.dz  / .c2.dz   (ECOCOL02/03: delta)
+3. .c0     / .c1     / .c2       (ECOCOL01: raw)
+```
+
+### カラム圧縮フォーマット（col_delta.rs）
+
+各カラムファイルは3世代のフォーマットを経て進化しています。
+
+| フォーマット | ファイル拡張子 | magic | 説明 |
+|------------|-------------|-------|------|
+| ECOCOL01 | `.c0` / `.c1` / `.c2` | `ECOCOL01` | 生の u64 配列（memmap 直読） |
+| ECOCOL02 | `.c0.dz` | `ECOCOL02` | デルタ符号化ブロック（256値/ブロック、固定長） |
+| ECOCOL03 | `.c0.dz` | `ECOCOL03` | デルタ符号化ブロック（述語境界でブロック分割、可変長） |
+| ECOCOL04 | `.c0.zst` | `ECOCOL04` | デルタ符号化後に Zstd ブロック圧縮（64ブロック=16384値/Zstdチャンク） |
+
+**ECOCOL02 のデルタ符号化:**
+
+各ブロック内の最大デルタ幅に応じて最小ビット幅を選択します。
+
+```
+ENC_ALL_SAME (0): 全値が同じ  → 1バイト/ブロック (256× 圧縮)
+ENC_U8       (1): delta ≤ 255 → 1バイト/値
+ENC_U16      (2): delta ≤ 65535 → 2バイト/値
+ENC_U32      (3): delta ≤ 2^32-1 → 4バイト/値
+ENC_U64      (4): それ以外 → 8バイト/値（生値格納）
+```
+
+**c2 列が圧縮されにくい理由とECOCOL04 の効果:**
+
+c2 列（3番目のソートキー）はグループ境界でリセットが生じます。
+例: SPO 順では同一 (s,p) グループ内は昇順ですが、次の (s,p) グループの先頭値は
+前グループの最終値より小さいことがあります。`v - base` が折り返し演算になり
+`delta > u32::MAX` → `ENC_U64`（8バイト/値）となります。
+
+ECOCOL04 は delta 符号化後のバイト列を Zstd で再圧縮します。
+TermId は最大 254M（< 2^28）なので上位4バイトが常にゼロ（またはほぼゼロ）です。
+Zstd はこの0バイトパターンを効率良く検出し約2:1の圧縮を達成します。
+さらに述語列（c0）など元から小さいデルタを持つ列では10-30倍の圧縮に達します。
+
+**ECOCOL04 ファイルフォーマット:**
+
+```text
+offset  0: magic               [u8; 8] = b"ECOCOL04"
+offset  8: count               u64     (総 u64 値数)
+offset 16: block_count         u64     (デルタブロック数 = ceil(count / 256))
+offset 24: blocks_per_chunk    u64     (Zstd チャンクあたりのブロック数, デフォルト 64)
+offset 32: chunk_count         u64     (ceil(block_count / blocks_per_chunk))
+offset 40: idx_offset          u64     (チャンクインデックスのバイトオフセット)
+offset 48: ── Zstd チャンク (可変長) ─────────────────────────────────
+  各チャンク: 独立した Zstd フレーム
+    中身 = ECOCOL02 形式のデルタブロック × blocks_per_chunk 個のバイト列
+at idx_offset:
+  [(first_value: u64, byte_offset: u64, compressed_size: u32, n_blocks: u32) × chunk_count]
+```
 
 ### SkipIndex — スパース1次キャッシュ
 
@@ -238,13 +299,29 @@ POS インデックスの各述語について `[lo, hi)` のエントリ範囲�
 
 POS スキャン時に述語が定数であれば、PredicateIndex を参照して **c0 全体を走査せずに** 正確な `[lo, hi)` 範囲を取得できます（SkipIndex の upper-bound ではなく exact range）。
 
-**ディスク使用量の概算:**
+**ディスク使用量の概算（ECOCOL04 / SPO+POS+OSP のみ）:**
 
-| トリプル数 | SPO+POS+OSP（c0〜c2×3）| GSPO付き | 辞書込み目安 |
-|-----------|----------------------|---------|------------|
-| 1,000万   | 720 MB               | 1.0 GB  | ～800 MB   |
-| 1億       | 7.2 GB               | 10.4 GB | ～9 GB     |
-| 10億      | 72 GB                | 104 GB  | ～90 GB    |
+| トリプル数 | インデックス（.zst）| 辞書（dict_sorted.bin）| GSPO付き | 合計目安 |
+|-----------|-------------------|----------------------|---------|--------|
+| 1,000万   | ~100 MB           | ~200 MB              | +180 MB | ～500 MB |
+| 1億       | ~1 GB             | ~2 GB                | +1.8 GB | ～5 GB   |
+| 8億       | ~5.9 GB           | ~13 GB               | +24 GB  | ～44 GB  |
+| 10億      | ~7 GB             | ~16 GB               | +30 GB  | ～55 GB  |
+
+JPostDB（797M トリプル）での実測値:
+
+| ファイル | サイズ |
+|---------|------|
+| spo.c0.zst | 136 MB |
+| spo.c1.zst | 283 MB (delta のみでは 5.8 GB → 20.6× 圧縮) |
+| spo.c2.zst | 1.7 GB |
+| pos.c0.zst | 2 MB (33.8×) |
+| pos.c1.zst | 220 MB |
+| pos.c2.zst | 1.7 GB |
+| osp 3列計 | 1.9 GB |
+| dict_sorted.bin | 13 GB |
+| gspo.bin | 24 GB |
+| **合計** | **44 GB** (元 raw 108 GB から 59% 削減) |
 
 ---
 
@@ -279,9 +356,9 @@ pub fn encode(&self, s: &str) -> u64 { ... }
 
 ---
 
-## 起動時キャッシュ — PredCache と PathCache
+## 起動時キャッシュ — PredCache・PathCache・TypeCache
 
-HDD ランダム I/O のコストが高い環境では、頻用述語の全ペアをあらかじめ RAM に読み込んでおくことでクエリ時の POS スキャンを完全に回避できます。EcoRDF は2種類の起動時キャッシュを提供します。
+HDD ランダム I/O のコストが高い環境では、頻用述語の全ペアをあらかじめ RAM に読み込んでおくことでクエリ時の POS スキャンを完全に回避できます。EcoRDF は3種類の起動時キャッシュを提供します。
 
 ### PredCache — 単述語ペアキャッシュ (`predcache.rs`)
 
@@ -334,6 +411,35 @@ SPARQL クエリ時:
 
 設定: `model.rdf_configs` / `model.path_cache_mb`（ecordf.toml）または `--rdf-config` / `--path-cache-mb`（CLI）。
 
+### TypeCache — rdf:type クラス帰属キャッシュ (`type_cache.rs`)
+
+`rdf:type` トリプルを RoaringTreemap（u64 対応の圧縮ビットマップ）として保持します。
+各クラスについて「このクラスのインスタンスである TermId の集合」を RAM に持ち、
+`?x a SomeClass` フィルタを O(1) lookup に変換します。
+
+```
+jpost:Peptide         → RoaringTreemap { 3.7M subjects }  ~2-4 MB
+jpost:PeptideEvidence → RoaringTreemap { 9.3M subjects }  ~5-9 MB
+jpost:PSM             → RoaringTreemap { 10.5M subjects } ~5-10 MB
+```
+
+設定: `server.type_cache_mb`（デフォルト 256 MB）。
+
+### キャッシュの永続化
+
+PathCache と TypeCache はビルドに時間がかかるため、初回起動時にストアディレクトリへ
+バイナリファイルとして保存し、2回目以降は高速ロードします。
+
+| キャッシュ | ファイル | 初回ビルド時間 | 2回目以降ロード |
+|----------|---------|------------|-------------|
+| PathCache | `path_cache.bin` | ~23s (JPostDB 16パス) | ~3s |
+| TypeCache | `type_cache.bin` | ~24s (235クラス) | ~1s |
+| PredCache | なし（毎回ビルド） | ~72s | ~72s (永続化の効果なし) |
+
+PredCache は非圧縮で 6.4GB と大きく、ファイルからの読み込みがビルドより遅いため
+永続化を行いません。インデックスが更新された場合（`ecordf build` 再実行後）、
+参照インデックスファイル（`spo.c0` 等）の mtime と比較し自動的に再ビルドします。
+
 ### 3層のコスト選択ロジック
 
 `executor.rs` の JOIN 選択は、キャッシュ状態を踏まえて3層に分岐します：
@@ -342,13 +448,22 @@ SPARQL クエリ時:
 path_cached = PathCache にパス全体がある？
 all_cached  = path_cached || (全ステップが PredCache にある？)
 
-seek_ns = all_cached ? 2,000 ns (RAM binary search)
-                     : 150,000,000 ns (HDD SPO ランダムシーク)
+seek_ns = all_cached ? 50,000,000 ns (RAM binary search; 188MB 配列は L3 に収まらず DRAM アクセス)
+                     : 150,000,000 ns (HDD/SSD SPO ランダムシーク)
 
 bind_join_cost = N_groups × path_steps × seek_ns
 hash_join_cost = first_pred_range × 200 ns  (HDD seq read 120 MB/s)
 
-use_hash = (scan_cost < bind_cost) && !path_cached
+use_hash = (scan_cost < bind_cost)
+
+if path_cached && N_left < 100_000:
+    → path_cache_merge_join（binary search 戦略: N×log M アクセス）
+elif path_cached && N_left >= 100_000:
+    → path_cache_merge_join（linear scan 戦略: M アクセス）
+elif use_hash:
+    → filtered hash_join
+else:
+    → bind_join
 ```
 
 さらに `use_hash` かつ右辺が 2-hop 以上の Sequence パスの場合、**フィルタリング hash join** を適用します（次節）。
@@ -386,6 +501,8 @@ use_hash = (scan_cost < bind_cost) && !path_cached
 | OPTIONAL | left outer join |
 | UNION | 列スキーマを合わせてマージ |
 | FILTER (REGEX, STR, LANG, DATATYPE, 比較, 論理演算) | `eval_bool` / `eval_string` |
+| **FILTER (IN / NOT IN)** | `Expression::In` / `NotIn`; eval_bool で TermId または文字列比較 |
+| **FILTER EXISTS { } / NOT EXISTS { }** | `Expression::Exists` / `NotExists`; サブパターンを outer binding で実行（相関評価）|
 | BIND | `ExecutionPlan::Extend` |
 | VALUES | インライン値表 |
 | GROUP BY / HAVING / 集計 (COUNT, SUM, MIN, MAX, AVG, GROUP_CONCAT, SAMPLE) | `apply_group_by` |
@@ -410,6 +527,8 @@ use_hash = (scan_cost < bind_cost) && !path_cached
 | SPARQL UPDATE (INSERT/DELETE) | 未実装 |
 | SERVICE (フェデレーション) | 未実装 |
 | Leapfrog の多変数完全実装 | 共有変数が2つ以上のとき hash join にフォールバック |
+| FILTER NOT EXISTS の最適化 | 現在は相関評価（全行についてサブパターンを逐次実行）。大規模データではアンチジョインへの変換が必要 |
+| STRDT / STRLANG / BNODE / RAND / UUID / SHA系ハッシュ | 未実装 |
 
 ---
 
@@ -563,8 +682,19 @@ ecordf/
 │   │                                         各レベルのバッチを Rayon で並列実行
 │   │                    dict_sorted.bin フォーマット: ESRT0001 magic
 │   ├── triple.rs      TermId = u64 / Triple (24B) / Quad (32B)、UNBOUND = u64::MAX
+│   ├── col_delta.rs   デルタ+Zstd列圧縮フォーマット
+│   │                    ECOCOL02: デルタ符号化ブロック (256値/ブロック、固定長)
+│   │                    ECOCOL03: 述語境界アライン版（pos.c1等で効率向上）
+│   │                    ECOCOL04: delta + Zstd ブロック圧縮 (.c0.zst/.c1.zst/.c2.zst)
+│   │                      64ブロック(16384値)を Zstd フレームに圧縮
+│   │                      TermId の上位バイトが常に0であることを Zstd が検出 → 2-20× 追加圧縮
+│   │                    DeltaColFile::open — magic 検出でフォーマット自動判別
+│   │                    encode_column / encode_column_pred_aligned / encode_column_zstd
+│   │                    delta_path(p) → p+".dz"  /  zstd_path(p) → p+".zst"
 │   ├── index.rs       memmap2ベースの列指向ソート済み整数配列
 │   │                    ─ 列指向フォーマット (c0/c1/c2): 各列が独立した mmap ファイル
+│   │                       優先順位: .zst (ECOCOL04) > .dz (ECOCOL02/03) > raw (.c0)
+│   │                    ─ PSO/SOP/OPS: Option<IndexFile>（ファイル不在なら None）
 │   │                    ─ SkipIndex: SKIP_STRIDE=512 のスパース anchor 配列
 │   │                        `.skip` ファイルに永続化; 初回ビルドは c0 全スキャン
 │   │                        バイナリサーチ後の絞り込み範囲 ≤ 512 エントリ (1 OS ページ)
@@ -580,13 +710,14 @@ ecordf/
 │   │                    estimate (SP/PO/P/SPO ファンアウト推定)
 │   ├── predcache.rs   述語キャッシュ: PredCache / PredPairs
 │   │                    build_sync  — 起動時同期ビルド (largest-first, per-pred cap)
-│   │                    build_background — バックグラウンドビルド (非推奨)
 │   │                    get(pred) → Option<PredPairs> — クエリ時プローブ
 │   │                    bytes_used() — 使用メモリ量
+│   │                    ※永続化なし（6.4GB 非圧縮はファイル読み込みよりビルドが速いため）
 │   ├── path_cache.rs  多ホップパスキャッシュ: PathCache / PathPairs
 │   │                    build(compound_paths, dict, index, budget) — 起動時実体化
 │   │                    get(pred_ids: &[TermId]) → Option<PathPairs>
 │   │                    bytes_used() / len()
+│   │                    save_to_file / load_from_file — 永続化 (path_cache.bin)
 │   ├── rdf_config.rs  rdf-config 統合: CompoundPath 抽出
 │   │                    load_compound_paths(specs) — ローカルパスまたは GitHub URL を受け付ける
 │   │                    prefix.yaml + model.yaml を解析してブランクノード経由パスを返す
@@ -630,11 +761,13 @@ ecordf/
 │   │                    Semaphore による同時クエリ数制限
 │   │                    JSON / XML / TSV / CSV レスポンス
 │   │                    CORS オプション対応
-│   └── main.rs        CLI: build / serve / query / stats
-│                        build: --resume-phase2 (中断再開)
+│   └── main.rs        CLI: build / serve / query / stats / compress-cols / recompress-zstd
+│                        build: --resume-phase2 / --auto-compress-cols / --auto-compress-zstd
 │                        serve: --host / --port / --cors / --config / --warmup-mb
 │                               --pred-cache-mb / --pred-cache-per-pred-cap-mb
 │                               --rdf-config / --path-cache-mb
+│                        compress-cols: --zstd (delta 後に Zstd も適用)
+│                        recompress-zstd: --ordering (特定 ordering のみ処理)
 │                        query: --config / "-" (stdin読み込み)
 ├── ecordf.toml        設定ファイルのサンプル（全パラメータ・説明付き）
 ├── DESIGN.md          本ドキュメント
@@ -764,17 +897,20 @@ $EDITOR ./uniprot-store/ecordf.toml
 | `build.chunk_size` | 5,000,000 | 外部ソートのトリプルチャンクサイズ（0=レガシー1パス） |
 | `build.dict_chunk_mb` | 200 | Phase 1 文字列バッファの RAM 上限（MiB） |
 | `build.parallel_threads` | 0 | 並列ロードスレッド数（0=全 CPU コア） |
+| `build.auto_compress_cols` | false | ビルド後に `compress-cols`（ECOCOL02/03 delta）を自動実行 |
+| `build.auto_compress_zstd` | false | `compress-cols` 後に `recompress-zstd`（ECOCOL04）を自動実行。HDD/SATA SSD 環境で推奨 |
 | `query.max_intermediate_rows` | 50,000,000 | 中間結果の行数上限（OOM防止） |
 | `query.bind_join_threshold` | 10,000 | bind_join / hash_join の切り替え閾値 |
 | `server.host` | `127.0.0.1` | バインドアドレス |
 | `server.port` | `7878` | TCPポート |
 | `server.cors_origins` | `""` | CORS設定（`"*"` or カンマ区切りオリジン） |
 | `server.max_concurrent_queries` | `0` | 同時クエリ数上限（0=無制限） |
-| `server.warmup_mb` | `0` | 起動直後にバックグラウンドでページキャッシュへ読み込む MB 数（0=無効）。`--warmup-mb` で上書き可 |
-| `server.pred_cache_mb` | `1024` | 述語キャッシュの RAM 予算（MiB）。0=無効。`--pred-cache-mb` で上書き可 |
-| `server.pred_cache_per_pred_cap_mb` | `0` | 述語ごとの上限（MiB）。0=`pred_cache_mb/2`。巨大述語が予算を占拠するのを防ぐ。`--pred-cache-per-pred-cap-mb` で上書き可 |
-| `model.rdf_configs` | `[]` | rdf-config ディレクトリまたは GitHub URL のリスト。PathCache の材料。`--rdf-config` で上書き可 |
-| `model.path_cache_mb` | `0` | パスキャッシュの RAM 予算（MiB）。0=無効。`--path-cache-mb` で上書き可 |
+| `server.warmup_mb` | `0` | 起動後バックグラウンドでページキャッシュへ読み込む MB 数 |
+| `server.pred_cache_mb` | `1024` | 述語キャッシュの RAM 予算（MiB）。0=無効 |
+| `server.pred_cache_per_pred_cap_mb` | `0` | 述語ごとの上限（0=`pred_cache_mb/2`） |
+| `server.type_cache_mb` | `256` | TypeCache (rdf:type RoaringTreemap) の RAM 予算（MiB）。0=無効 |
+| `model.rdf_configs` | `[]` | rdf-config ディレクトリまたは GitHub URL のリスト。PathCache の材料 |
+| `model.path_cache_mb` | `0` | パスキャッシュの RAM 予算（MiB）。0=無効 |
 
 ### HTTPサーバー
 
@@ -945,14 +1081,15 @@ executor.rs の `bind_join` 内 pred_partition パスで、機能的述語検出
 ## 今後の拡張候補
 
 1. **SPARQL UPDATE** — INSERT DATA / DELETE DATA / MODIFY
-2. **クエリ内部の並列化** — rayon による JOIN内部のスレッド並列化（クエリ間並列は実装済み、ファイルロードの並列化は実装済み）
-3. **Leapfrog 多変数完全実装** — 共有変数が2つ以上の場合もLeapfrogで処理
-4. **SPARQL Federation** — SERVICE句による外部エンドポイント連携
-5. **Block圧縮** — zstdでディスク使用量をさらに削減
-6. **CONSTRUCT** — RDFグラフを返すクエリ形式
-7. **クエリタイムアウト** — 長時間クエリを自動キャンセルする機能
-8. **HyperLogLog** — subject_count / object_count の近似カウント（現在は2パス全スキャン）
-9. **BOUND_VAR_FACTOR の自動調整** — 述語の distinctiveness から動的に推定倍率を計算
-10. **ReadonlyDict のキャッシュ戦略改善** — ホットキャッシュを LRU 化して偏りのあるアクセスパターンに対応
-11. **PathCache の自動 TermId 解決** — 現状は起動後に rdf_config を解析して IRI→TermId を引くが、辞書ミス時の fallback をより堅牢に
+2. **クエリ内部の並列化** — rayon による JOIN 内部のスレッド並列化（クエリ間並列は実装済み）
+3. **Leapfrog 多変数完全実装** — 共有変数が2つ以上の場合も Leapfrog で処理
+4. **SPARQL Federation** — SERVICE 句による外部エンドポイント連携
+5. **CONSTRUCT** — RDF グラフを返すクエリ形式
+6. **FILTER NOT EXISTS のアンチジョイン最適化** — 現在は相関評価。大規模データには LEFT ANTI JOIN への変換が必要
+7. **STRDT / STRLANG / BNODE / RAND / UUID / SHA 系** — 未実装の SPARQL 1.1 組み込み関数
+8. **dict_sorted.bin のブロック圧縮** — Zstd ブロック圧縮 + スキップインデックスで IRI/リテラル辞書を 3-5GB に圧縮（現在 13GB）。ランダムアクセス対応が必要
+9. **HyperLogLog** — subject_count / object_count の近似カウント（現在は2パス全スキャン）
+10. **BOUND_VAR_FACTOR の自動調整** — 述語の distinctiveness から動的に推定倍率を計算
+11. **ReadonlyDict のキャッシュ戦略改善** — ホットキャッシュを LRU 化して偏りのあるアクセスパターンに対応
 12. **フィルタリング hash join の対象拡大** — 現状は 2-hop Sequence のみ。3-hop 以上や Alternative パスにも適用を検討
+13. **ecordf build 時の path/type cache 事前ビルド** — `ecordf build` で rdf-config を指定すれば初回起動をさらに高速化できる
