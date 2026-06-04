@@ -40,12 +40,15 @@
 #   8 GB  RAM / any threads  →   5_000_000   (360 MB, very safe)
 #  16 GB  RAM / any threads  →  10_000_000   (720 MB)
 #  32 GB  RAM / any threads  →  20_000_000  (1440 MB)
-#  64 GB  RAM / 32 threads   →  50_000_000  (3600 MB)  ← recommended
+#  64 GB  RAM / 32 threads   →  50_000_000  (3600 MB)
 # 128 GB  RAM / any threads  → 100_000_000  (7200 MB)
+# 256 GB+ RAM / 32 threads   →  50_000_000  (3600 MB)  ← 50B 規模推奨
+#   ※ 50B トリプルで chunk_size=50M → インデックスチャンク数 ~1000/索引 → マージ2段
+#   ※ chunk_size=5M → チャンク数 ~10000/索引 → マージ3段 → I/O 1.5倍増
 #
 # Set to 0 to disable external sort entirely and load all triples into RAM
 # before sorting — use this only on machines with tens of GB of free memory.
-chunk_size = 5_000_000
+chunk_size = 50_000_000
 
 # RAM budget (in MiB) for the string-collection buffer used in Phase 1 of
 # the two-pass dictionary builder (active when chunk_size > 0).
@@ -72,9 +75,14 @@ chunk_size = 5_000_000
 #   8 GB  RAM /  8 threads  →   200  (1.6 GB, safe)
 #  16 GB  RAM / 16 threads  →   500  (8.0 GB)
 #  32 GB  RAM / 32 threads  →   750  (24.0 GB)
-#  64 GB  RAM / 32 threads  →  1200  (38.4 GB)  ← recommended
-# 128 GB  RAM / 32 threads  →  1500  (48.0 GB, leaves 74 GB headroom)
-dict_chunk_mb = 200
+#  64 GB  RAM / 32 threads  →  1200  (38.4 GB)
+# 128 GB  RAM / 32 threads  →  3000  (96.0 GB)
+# 256 GB  RAM / 32 threads  →  4000  (128 GB)  ← 50B 規模推奨
+#   ※ UniProt 全体 (~50億 unique term) → dict_sorted.bin ~400 GB
+#   ※ dict_chunk_mb=4000, 32 threads → per thread 125 MB → チャンク ~50/thread
+#     → 全チャンク ~1600 → マージ2段（1600 > MAX_FAN_IN=64）
+#   ※ dict_chunk_mb=200 のままだと ~16000 チャンク → マージ3段 → I/O 1.5倍
+dict_chunk_mb = 4000
 
 # Number of threads used during `ecordf build` for parallel file loading.
 #
@@ -89,6 +97,33 @@ dict_chunk_mb = 200
 #   N                   exactly N threads
 #
 parallel_threads = 0
+
+# Per-file buffer size (MiB) for Phase 2a string collection in streaming mode.
+#
+# Used only when the dictionary exceeds 1B unique terms (> 1B threshold triggers
+# streaming Phase 2).  Each input file is re-parsed and its unique strings are
+# written to a temporary p2a chunk file with this buffer.  Larger values reduce
+# the number of p2a chunks, speeding up the streaming join against dict_sorted.bin.
+#
+# Peak RAM added = p2a_buf_mb × parallel_threads  (on top of dict_chunk_mb)
+#
+#   p2a_buf_mb    32 threads    notes
+#   ----------    ----------    -----
+#    64            2.0 GB       default — fine for ≤ 1B triples
+#   128            4.1 GB
+#   256            8.2 GB
+#   512           16.4 GB       50B 規模の標準推奨
+#  2048           65.5 GB       入力ファイルが少ない（< 100 本）大容量機向け
+#
+# Hardware profiles for 50B-triple builds:
+#  128 GB RAM / 32 threads  →   256 (8 GB overhead)
+#  256 GB RAM / 32 threads  →   512 (16 GB overhead)  ← 推奨
+#  512 GB RAM / 32 threads  →  2048 (65 GB overhead)
+#
+# 事前に `ulimit -n 65536` を設定することで join バッチ数を削減できる:
+#   fd_limit=1024  → max_batch=320  → 5000ファイル÷320 = 16バッチ（dict 16回スキャン）
+#   fd_limit=65536 → max_batch=21824 → 5000ファイル = 1バッチ（dict 1回スキャン）
+p2a_buf_mb = 512
 
 # ビルド完了後にデルタ圧縮（compress-cols）を自動実行する。
 #
@@ -115,6 +150,43 @@ parallel_threads = 0
 #
 # CLI フラグ --auto-compress-cols でも指定可能（フラグが優先）。
 auto_compress_cols = false
+
+# デルタ圧縮に続けて Zstd ブロック圧縮（ECOCOL04）を自動適用するか。
+#
+# true にすると compress-cols 完了後に recompress-zstd を実行し、
+# .dz ファイルを .zst に変換したうえで .dz を削除する。
+# auto_compress_cols = true のときのみ ecordf build 時に有効。
+# compress-cols コマンドでは --zstd フラグとしても指定できる。
+#
+# ECOCOL04 は delta 符号化後に Zstd ブロック圧縮を重ねたフォーマット。
+# JPostDB (797M トリプル) の実測圧縮率:
+#   spo.c0: 829 MB → 136 MB (6.1×)
+#   spo.c1: 5831 MB → 283 MB (20.6×)   ← ランダムに見える列でも大幅圧縮
+#   spo.c2: 5918 MB → 1712 MB (3.5×)
+#   pos.c0: 77 MB → 2 MB (33.8×)
+#   全体: 23 GB → 5.9 GB (3.9×)
+#
+# 推奨環境:
+#
+#   HDD（7200 rpm 等）             → true を強く推奨
+#     .dz よりさらに 2–20× 圧縮。I/O が律速なため読み出し時間を直接短縮。
+#     Zstd 展開は 1–3 GB/s で HDD 帯域 (100–200 MB/s) を大幅に上回る。
+#
+#   SATA SSD（帯域 ≤ 500 MB/s）   → true を推奨
+#     ディスク節約に加え、I/O 削減がクエリ速度に寄与する。
+#     展開コスト（+1–3%/query）は軽微。
+#
+#   NVMe SSD（帯域 3 GB/s 以上）  → 任意
+#     ディスク節約目的なら true。クエリ速度への影響は ±2% 程度。
+#     CPU ゆとりがあれば true、レイテンシ最優先なら false。
+#
+#   大容量 RAM（データほぼ全量がページキャッシュに乗る環境）
+#                                  → false を推奨
+#     ページキャッシュ済みなら Zstd 展開コスト（~50 µs/チャンク）が
+#     相対的に割高になり、raw .c0 の方が速い場合がある。
+#
+# デフォルト false（後から ecordf compress-cols --zstd で適用可）。
+auto_compress_zstd = false
 
 # ── Query execution tunables ──────────────────────────────────────────────────
 
@@ -217,6 +289,7 @@ cors_origins = ""
 #   0            disabled — no warmup (default)
 #   4096         warm 4 GB; good starting point for medium stores
 #   16384        warm 16 GB; suitable for UniProt-scale datasets
+#   200000       warm 200 GB; 50B トリプル規模推奨（RAM が十分な場合）
 #
 # RAM note: warmed data goes into the OS page cache, NOT the process heap.
 # Process RSS barely changes.  The kernel will evict pages under memory
@@ -247,6 +320,7 @@ warmup_mb = 0
 #   0      — disabled; all POS scans hit the HDD (default for minimal RAM usage)
 #   1024   — covers faldo:begin + faldo:position on JPostDB (376 MB each with 50% cap)
 #   2048   — leaves room for more predicates while staying within typical server RAM
+#   8192   — 50B トリプル規模推奨（rdf-config 優先述語を広くカバー）
 #
 # See also: pred_cache_per_pred_cap_mb below.
 #

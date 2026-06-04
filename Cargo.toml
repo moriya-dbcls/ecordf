@@ -65,6 +65,9 @@ anyhow = "1"
 # RoaringTreemap supports u64 keys; RoaringBitmap covers u32 only.
 roaring = "0.10"
 
+# Zstd block compression for ECOCOL04
+zstd = "0.13"
+
 # Configuration file parsing
 toml = "0.8"
 

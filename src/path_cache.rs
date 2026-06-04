@@ -38,6 +38,9 @@
 //! individual HDD scans within a single hop.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read, Write, BufReader, BufWriter};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -248,6 +251,150 @@ impl PathCache {
             bytes_used: total_bytes,
         }
     }
+
+    /// Save this cache to a binary file (format: ECPATH02).
+    /// Logs a warning on error (non-fatal).
+    pub fn save_to_file(&self, path: &Path) {
+        let t0 = Instant::now();
+        let mb = self.bytes_used / (1024 * 1024);
+        let entries = &*self.entries;
+        let ok = write_atomic(path, |w| {
+            w.write_all(b"ECPATH02")?;
+            w.write_all(&(entries.len() as u64).to_le_bytes())?;
+            for (path_ids, pairs) in entries {
+                w.write_all(&(path_ids.len() as u64).to_le_bytes())?;
+                for &pred_id in path_ids {
+                    w.write_all(&pred_id.to_le_bytes())?;
+                }
+                write_pairs(w, &**pairs)?;
+            }
+            Ok(())
+        });
+        if ok {
+            tracing::info!(
+                path = %path.display(),
+                mb,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "cache: saved to file"
+            );
+        }
+    }
+
+    /// Load a previously saved cache.
+    /// Returns `None` if the file is missing, stale, or corrupt.
+    pub fn load_from_file(path: &Path, reference: &Path) -> Option<Self> {
+        if !is_fresh(path, reference) {
+            return None;
+        }
+        let result = (|| -> io::Result<Self> {
+            let file = File::open(path)?;
+            let mut reader = BufReader::new(file);
+            let mut magic = [0u8; 8];
+            reader.read_exact(&mut magic)?;
+            if &magic != b"ECPATH02" {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "path-cache magic mismatch"));
+            }
+            let mut buf8 = [0u8; 8];
+            reader.read_exact(&mut buf8)?;
+            let n = u64::from_le_bytes(buf8) as usize;
+            let mut entries: HashMap<Vec<TermId>, PathPairs> = HashMap::with_capacity(n);
+            let mut bytes_used = 0usize;
+            for _ in 0..n {
+                reader.read_exact(&mut buf8)?;
+                let l = u64::from_le_bytes(buf8) as usize;
+                let mut path_ids = Vec::with_capacity(l);
+                for _ in 0..l {
+                    reader.read_exact(&mut buf8)?;
+                    path_ids.push(u64::from_le_bytes(buf8));
+                }
+                reader.read_exact(&mut buf8)?;
+                let m = u64::from_le_bytes(buf8) as usize;
+                let pairs = read_pairs(&mut reader, m)?;
+                bytes_used += pairs.len() * 16;
+                entries.insert(path_ids, Arc::new(pairs));
+            }
+            Ok(Self { entries: Arc::new(entries), bytes_used })
+        })();
+        match result {
+            Ok(cache) => {
+                tracing::info!(
+                    path = %path.display(),
+                    n_entries = cache.entries.len(),
+                    mb = cache.bytes_used / (1024 * 1024),
+                    "cache: loaded from file"
+                );
+                Some(cache)
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), err = %e, "path-cache: load failed, will rebuild");
+                None
+            }
+        }
+    }
+}
+
+// ── Persistence helpers ───────────────────────────────────────────────────────
+
+fn is_fresh(cache_path: &Path, reference: &Path) -> bool {
+    let cache_mtime = std::fs::metadata(cache_path).and_then(|m| m.modified()).ok();
+    let ref_mtime   = std::fs::metadata(reference).and_then(|m| m.modified()).ok();
+    match (cache_mtime, ref_mtime) {
+        (Some(c), Some(r)) => c >= r,
+        (Some(_), None)    => true,
+        _                  => false,
+    }
+}
+
+fn write_pairs(writer: &mut impl Write, pairs: &[(u64, u64)]) -> io::Result<()> {
+    writer.write_all(&(pairs.len() as u64).to_le_bytes())?;
+    const CHUNK: usize = 256 * 1024;
+    for chunk in pairs.chunks(CHUNK) {
+        let mut buf = Vec::with_capacity(chunk.len() * 16);
+        for &(s, o) in chunk {
+            buf.extend_from_slice(&s.to_le_bytes());
+            buf.extend_from_slice(&o.to_le_bytes());
+        }
+        writer.write_all(&buf)?;
+    }
+    Ok(())
+}
+
+fn read_pairs(reader: &mut impl Read, n: usize) -> io::Result<Vec<(u64, u64)>> {
+    let mut pairs = Vec::with_capacity(n);
+    const CHUNK: usize = 256 * 1024;
+    let mut buf = vec![0u8; CHUNK * 16];
+    let mut remaining = n;
+    while remaining > 0 {
+        let batch = remaining.min(CHUNK);
+        reader.read_exact(&mut buf[..batch * 16])?;
+        for c in buf[..batch * 16].chunks_exact(16) {
+            let s = u64::from_le_bytes(c[0..8].try_into().unwrap());
+            let o = u64::from_le_bytes(c[8..16].try_into().unwrap());
+            pairs.push((s, o));
+        }
+        remaining -= batch;
+    }
+    Ok(pairs)
+}
+
+fn write_atomic(path: &Path, write_fn: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>) -> bool {
+    let tmp = path.with_extension("tmp");
+    let result = (|| -> io::Result<()> {
+        let file = File::create(&tmp)?;
+        let mut writer = BufWriter::new(file);
+        write_fn(&mut writer)?;
+        writer.flush()?;
+        writer.into_inner()?.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        tracing::warn!(path = %path.display(), err = %e, "cache save failed (non-fatal)");
+        let _ = std::fs::remove_file(&tmp);
+        false
+    } else {
+        true
+    }
 }
 
 // ── Sub-sequence expansion ────────────────────────────────────────────────────
@@ -288,8 +435,8 @@ fn expand_subseqs(paths: &[CompoundPath]) -> Vec<CompoundPath> {
 ///
 /// Returns `None` if any IRI is not in the dictionary (i.e. never appears in
 /// the store — this path won't produce any results anyway).
-fn resolve_path(path_iris: &[String], dict: &QueryDict) -> Option<Vec<TermId>> {
-    path_iris.iter().map(|iri| {
+fn resolve_path(path_iris: &[(String, Cardinality)], dict: &QueryDict) -> Option<Vec<TermId>> {
+    path_iris.iter().map(|(iri, _)| {
         // IRIs from rdf_config come as `<…>` — strip angle brackets for lookup
         let key = iri.trim_matches(|c| c == '<' || c == '>');
         dict.lookup(key)
@@ -424,18 +571,22 @@ mod tests {
         assert_eq!(result_sorted, expected);
     }
 
+    fn e(s: &str) -> (String, Cardinality) {
+        (s.to_string(), Cardinality::ExactlyOne)
+    }
+
     #[test]
     fn test_expand_subseqs_basic() {
         let paths = vec![
-            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            vec![e("A"), e("B"), e("C")],
         ];
         let expanded = expand_subseqs(&paths);
         // Expected (length-2 first, then length-3):
         // ["A","B"], ["B","C"], ["A","B","C"]
         assert_eq!(expanded, vec![
-            vec!["A".to_string(), "B".to_string()],
-            vec!["B".to_string(), "C".to_string()],
-            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            vec![e("A"), e("B")],
+            vec![e("B"), e("C")],
+            vec![e("A"), e("B"), e("C")],
         ]);
     }
 
@@ -443,12 +594,12 @@ mod tests {
     fn test_expand_subseqs_dedup() {
         // Two paths share a suffix — ["B","C"] should appear only once.
         let paths = vec![
-            vec!["A".to_string(), "B".to_string(), "C".to_string()],
-            vec!["X".to_string(), "B".to_string(), "C".to_string()],
+            vec![e("A"), e("B"), e("C")],
+            vec![e("X"), e("B"), e("C")],
         ];
         let expanded = expand_subseqs(&paths);
         let bc_count = expanded.iter()
-            .filter(|p| p.as_slice() == ["B".to_string(), "C".to_string()])
+            .filter(|p| p.as_slice() == [e("B"), e("C")])
             .count();
         assert_eq!(bc_count, 1, "['B','C'] should appear exactly once after dedup");
     }
@@ -457,7 +608,7 @@ mod tests {
     fn test_expand_subseqs_four_hop() {
         // 4-hop path → 3 length-2, 2 length-3, 1 length-4 = 6 sub-sequences
         let paths = vec![
-            vec!["A".to_string(), "B".to_string(), "C".to_string(), "D".to_string()],
+            vec![e("A"), e("B"), e("C"), e("D")],
         ];
         let expanded = expand_subseqs(&paths);
         assert_eq!(expanded.len(), 6);

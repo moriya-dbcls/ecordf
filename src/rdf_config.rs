@@ -18,9 +18,9 @@
 //!
 //! ## Extracted paths
 //!
-//! A **compound path** is a `Vec<String>` of fully-qualified IRIs (angle-bracket
-//! notation, e.g. `<http://biohackathon.org/resource/faldo#begin>`).  Paths of
-//! length ≥ 2 that go through blank nodes in the model are returned.
+//! A **compound path** is a `Vec<(String, Cardinality)>` where each element is a
+//! fully-qualified IRI (angle-bracket notation) paired with its declared cardinality.
+//! Paths of length ≥ 2 that go through blank nodes in the model are returned.
 //!
 //! Example: in UniProt's model.yaml the predicate chain
 //! `up:annotation → up:range → faldo:begin → faldo:position` is emitted as
@@ -36,8 +36,22 @@ use std::collections::HashMap;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-/// A fully-resolved compound path: each element is a `<IRI>` string.
-pub type CompoundPath = Vec<String>;
+/// Cardinality of a predicate as declared in rdf-config model.yaml.
+///
+/// - `ExactlyOne` — no suffix: exactly one value per subject
+/// - `ZeroOrOne`  — `?` suffix: zero or one value per subject (optional)
+/// - `OneOrMore`  — `+` suffix: one or more values per subject (required, multi)
+/// - `ZeroOrMore` — `*` suffix: zero or more values (optional, multi)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Cardinality {
+    ExactlyOne,
+    ZeroOrOne,
+    OneOrMore,
+    ZeroOrMore,
+}
+
+/// A fully-resolved compound path: each element is a `(<IRI>, Cardinality)` tuple.
+pub type CompoundPath = Vec<(String, Cardinality)>;
 
 /// Prefix map: `prefix_name` → `expansion_IRI`.
 /// Both with and without trailing `#` / `/` are normalised during lookup.
@@ -299,7 +313,7 @@ fn extract_compound_paths(
 /// scalar leaf or another property list).
 fn walk_property_list(
     node: &serde_yaml::Value,
-    current_path: &[String],
+    current_path: &[(String, Cardinality)],
     prefixes: &PrefixMap,
     out: &mut Vec<CompoundPath>,
 ) {
@@ -317,7 +331,7 @@ fn walk_property_list(
 /// - value: scalar leaf (object type) OR nested property list
 fn walk_property_item(
     item: &serde_yaml::Value,
-    current_path: &[String],
+    current_path: &[(String, Cardinality)],
     prefixes: &PrefixMap,
     out: &mut Vec<CompoundPath>,
 ) {
@@ -355,12 +369,18 @@ fn walk_property_item(
             // Variable name key — not a predicate, skip.
             continue;
         }
-        // Strip cardinality markers before IRI resolution.
+        // Parse and strip cardinality marker before IRI resolution.
+        let cardinality = match pred_str_raw.chars().last() {
+            Some('+') => Cardinality::OneOrMore,
+            Some('*') => Cardinality::ZeroOrMore,
+            Some('?') => Cardinality::ZeroOrOne,
+            _         => Cardinality::ExactlyOne,
+        };
         let pred_str = pred_str_raw.trim_end_matches(|c| c == '+' || c == '*' || c == '?');
         let resolved = resolve_iri(pred_str, prefixes);
 
-        let mut new_path: Vec<String> = current_path.to_vec();
-        new_path.push(resolved);
+        let mut new_path: Vec<(String, Cardinality)> = current_path.to_vec();
+        new_path.push((resolved, cardinality));
 
         // Emit path so far (even length-1, but we filter ≥ 2 later)
         if !new_path.is_empty() {
@@ -503,8 +523,8 @@ MyClass:
         let two_hop: Vec<_> = paths.iter().filter(|p| p.len() == 2).collect();
         assert!(
             two_hop.iter().any(|p|
-                p[0] == "<http://purl.uniprot.org/core/range>" &&
-                p[1] == "<http://biohackathon.org/resource/faldo#begin>"
+                p[0].0 == "<http://purl.uniprot.org/core/range>" &&
+                p[1].0 == "<http://biohackathon.org/resource/faldo#begin>"
             ),
             "expected [up:range, faldo:begin] in paths; got: {:?}", paths
         );
@@ -540,10 +560,10 @@ jpost: http://rdf.jpostdb.org/ontology/jpost.owl#
             "expected compound paths from sequence-format model.yaml, got none"
         );
         // faldo:location should appear in at least one path
-        let has_location = paths.iter().any(|p| p.iter().any(|iri| iri.contains("faldo#location")));
+        let has_location = paths.iter().any(|p| p.iter().any(|(iri, _)| iri.contains("faldo#location")));
         assert!(has_location, "expected faldo:location in some compound path; got: {:?}", paths);
         // faldo:begin should appear (without '+' contamination)
-        let has_begin = paths.iter().any(|p| p.iter().any(|iri| iri == "<http://biohackathon.org/resource/faldo#begin>"));
+        let has_begin = paths.iter().any(|p| p.iter().any(|(iri, _)| iri == "<http://biohackathon.org/resource/faldo#begin>"));
         assert!(has_begin, "expected bare faldo:begin IRI; got: {:?}", paths);
     }
 
@@ -564,7 +584,7 @@ jpost: http://rdf.jpostdb.org/ontology/jpost.owl#
         let base = "http://rdf.jpostdb.org/ontology/jpost.owl#";
         // All IRIs must be clean (no +, *, ? at end)
         for path in &paths {
-            for iri in path {
+            for (iri, _) in path {
                 assert!(
                     !iri.ends_with("+>") && !iri.ends_with("*>") && !iri.ends_with("?>"),
                     "cardinality suffix leaked into IRI: {}", iri
@@ -576,7 +596,7 @@ jpost: http://rdf.jpostdb.org/ontology/jpost.owl#
         assert!(two_hop > 0, "expected length-2 paths; got: {:?}", paths);
         // Check specific clean IRI
         assert!(
-            paths.iter().any(|p| p[0] == format!("<{}hasA>", base)),
+            paths.iter().any(|p| p[0].0 == format!("<{}hasA>", base)),
             "expected clean <jpost:hasA> IRI, got: {:?}", paths
         );
     }

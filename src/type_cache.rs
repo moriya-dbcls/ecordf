@@ -30,12 +30,48 @@
 //! ```
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read, Write, BufReader, BufWriter};
+use std::path::Path;
+use std::time::Instant;
 
 use roaring::RoaringTreemap;
 
 use crate::dict_builder::QueryDict;
 use crate::index::TripleIndex;
 use crate::triple::{TermId, TriplePattern, UNBOUND};
+
+// ── Persistence helpers ───────────────────────────────────────────────────────
+
+fn is_fresh(cache_path: &Path, reference: &Path) -> bool {
+    let cache_mtime = std::fs::metadata(cache_path).and_then(|m| m.modified()).ok();
+    let ref_mtime   = std::fs::metadata(reference).and_then(|m| m.modified()).ok();
+    match (cache_mtime, ref_mtime) {
+        (Some(c), Some(r)) => c >= r,
+        (Some(_), None)    => true,
+        _                  => false,
+    }
+}
+
+fn write_atomic(path: &Path, write_fn: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>) -> bool {
+    let tmp = path.with_extension("tmp");
+    let result = (|| -> io::Result<()> {
+        let file = File::create(&tmp)?;
+        let mut writer = BufWriter::new(file);
+        write_fn(&mut writer)?;
+        writer.flush()?;
+        writer.into_inner()?.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        tracing::warn!(path = %path.display(), err = %e, "cache save failed (non-fatal)");
+        let _ = std::fs::remove_file(&tmp);
+        false
+    } else {
+        true
+    }
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -194,5 +230,87 @@ impl TypeCache {
 
     pub fn bytes_used(&self) -> usize {
         self.bytes_used
+    }
+
+    /// Save this cache to a binary file (format: ECTYPE02).
+    /// Logs a warning on error (non-fatal).
+    pub fn save_to_file(&self, path: &Path) {
+        let t0 = Instant::now();
+        let mb = self.bytes_used / (1024 * 1024);
+        let ok = write_atomic(path, |w| {
+            w.write_all(b"ECTYPE02")?;
+            let rdf_type_id_raw = self.rdf_type_id.unwrap_or(u64::MAX);
+            w.write_all(&rdf_type_id_raw.to_le_bytes())?;
+            w.write_all(&(self.bytes_used as u64).to_le_bytes())?;
+            w.write_all(&(self.classes.len() as u64).to_le_bytes())?;
+            for (&class_id, bm) in &self.classes {
+                w.write_all(&class_id.to_le_bytes())?;
+                let bm_size = bm.serialized_size();
+                w.write_all(&(bm_size as u64).to_le_bytes())?;
+                bm.serialize_into(&mut *w)?;
+            }
+            Ok(())
+        });
+        if ok {
+            tracing::info!(
+                path = %path.display(),
+                mb,
+                elapsed_ms = t0.elapsed().as_millis(),
+                "cache: saved to file"
+            );
+        }
+    }
+
+    /// Load a previously saved cache.
+    /// Returns `None` if the file is missing, stale, or corrupt.
+    pub fn load_from_file(path: &Path, reference: &Path) -> Option<Self> {
+        if !is_fresh(path, reference) {
+            return None;
+        }
+        let result = (|| -> io::Result<Self> {
+            let file = File::open(path)?;
+            let mut reader = BufReader::new(file);
+            let mut magic = [0u8; 8];
+            reader.read_exact(&mut magic)?;
+            if &magic != b"ECTYPE02" {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "type-cache magic mismatch"));
+            }
+            let mut buf8 = [0u8; 8];
+            reader.read_exact(&mut buf8)?;
+            let rdf_type_id_raw = u64::from_le_bytes(buf8);
+            let rdf_type_id = if rdf_type_id_raw == u64::MAX { None } else { Some(rdf_type_id_raw) };
+            reader.read_exact(&mut buf8)?;
+            let _stored_bytes_used = u64::from_le_bytes(buf8);
+            reader.read_exact(&mut buf8)?;
+            let n = u64::from_le_bytes(buf8) as usize;
+            let mut classes: HashMap<TermId, RoaringTreemap> = HashMap::with_capacity(n);
+            for _ in 0..n {
+                reader.read_exact(&mut buf8)?;
+                let class_id = u64::from_le_bytes(buf8);
+                reader.read_exact(&mut buf8)?;
+                let b = u64::from_le_bytes(buf8) as usize;
+                let mut bm_bytes = vec![0u8; b];
+                reader.read_exact(&mut bm_bytes)?;
+                let bm = RoaringTreemap::deserialize_from(bm_bytes.as_slice())?;
+                classes.insert(class_id, bm);
+            }
+            let bytes_used: usize = classes.values().map(|bm| bm.serialized_size()).sum();
+            Ok(Self { rdf_type_id, classes, bytes_used })
+        })();
+        match result {
+            Ok(cache) => {
+                tracing::info!(
+                    path = %path.display(),
+                    n_entries = cache.classes.len(),
+                    mb = cache.bytes_used / (1024 * 1024),
+                    "cache: loaded from file"
+                );
+                Some(cache)
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), err = %e, "type-cache: load failed, will rebuild");
+                None
+            }
+        }
     }
 }

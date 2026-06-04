@@ -327,6 +327,41 @@ impl<'a> Executor<'a> {
             return fast_result;
         }
 
+        if let Some(fast_result) = self.try_count_star_cross_product(query, &plan) {
+            return fast_result;
+        }
+
+        if let Some(fast_result) = self.try_count_star_single_scan(query, &plan) {
+            return fast_result;
+        }
+
+        // ── Cross-product guard ────────────────────────────────────────────────
+        // Pure cross-product with no useful LIMIT → abort rather than scanning 100M+ rows.
+        // With LIMIT the cross-product is bounded and may be intentional.
+        {
+            let mut cp_leaves: Vec<&ExecutionPlan> = Vec::new();
+            let is_cross_product = collect_cross_product_leaves(&plan, &mut cp_leaves)
+                && cp_leaves.len() >= 2;
+            let limit_val = query.limit.unwrap_or(u64::MAX) as usize;
+            if is_cross_product && limit_val > self.config.max_intermediate_rows {
+                let out_vars = if let Projection::Variables(items) = &query.projection {
+                    items.iter().map(|i| match i {
+                        SelectItem::Variable(v) => v.clone(),
+                        SelectItem::Alias(_, n) => n.clone(),
+                    }).collect()
+                } else { vec![] };
+                let mut result = ResultSet::empty(out_vars);
+                result.overflow = true;
+                tracing::warn!(
+                    leaves = cp_leaves.len(),
+                    "cross-product query without LIMIT — aborting to prevent OOM"
+                );
+                return result;
+            }
+        }
+        // ── end cross-product guard ────────────────────────────────────────────
+
+
         // 2. Execute
         let t_bgp = Instant::now();
         let mut bindings = self.execute_plan(&plan);
@@ -402,21 +437,56 @@ impl<'a> Executor<'a> {
             let t = Instant::now();
             let vars = bindings.variables.clone();
             let order = query.order_by.clone();
-            bindings.rows.sort_by(|a, b| {
-                for cond in &order {
-                    let ba = row_to_binding(&vars, a);
-                    let bb = row_to_binding(&vars, b);
-                    let va = self.eval_order_key(&cond.expr, &ba);
-                    let vb = self.eval_order_key(&cond.expr, &bb);
-                    let cmp = compare_order_keys(&va, &vb);
-                    let cmp = if cond.direction == OrderDirection::Desc { cmp.reverse() } else { cmp };
-                    if cmp != std::cmp::Ordering::Equal {
-                        return cmp;
-                    }
+            let m = bindings.rows.len();
+
+            // Pre-compute sort keys once per row (avoids O(M log M) eval_order_key calls).
+            let keys: Vec<Vec<String>> = bindings.rows.iter().map(|row| {
+                let b = row_to_binding(&vars, row);
+                order.iter().map(|cond| self.eval_order_key(&cond.expr, &b)).collect()
+            }).collect();
+
+            let cmp_fn = |ai: &usize, bi: &usize| -> std::cmp::Ordering {
+                for (ki, cond) in order.iter().enumerate() {
+                    let va = keys[*ai].get(ki).map(|s| s.as_str()).unwrap_or("");
+                    let vb = keys[*bi].get(ki).map(|s| s.as_str()).unwrap_or("");
+                    let c = compare_order_keys(va, vb);
+                    let c = if cond.direction == OrderDirection::Desc { c.reverse() } else { c };
+                    if c != std::cmp::Ordering::Equal { return c; }
                 }
                 std::cmp::Ordering::Equal
-            });
-            tracing::debug!(orderby_us = t.elapsed().as_micros(), rows = bindings.rows.len(), "ORDER BY");
+            };
+
+            // Number of rows we actually need (LIMIT + OFFSET, capped at M).
+            let need = query.limit
+                .map(|lim| {
+                    (lim as usize)
+                        .saturating_add(query.offset.unwrap_or(0) as usize)
+                        .min(m)
+                })
+                .unwrap_or(m);
+
+            let mut indices: Vec<usize> = (0..m).collect();
+
+            // Partial sort when need << M (at most 1/4 of rows needed).
+            let partial = need > 0 && need < m / 4;
+            if partial {
+                indices.select_nth_unstable_by(need - 1, |a, b| cmp_fn(a, b));
+                indices[..need].sort_unstable_by(|a, b| cmp_fn(a, b));
+            } else {
+                indices.sort_unstable_by(|a, b| cmp_fn(a, b));
+            }
+
+            let old_rows = std::mem::take(&mut bindings.rows);
+            let take = if partial { need } else { m };
+            bindings.rows = indices[..take].iter().map(|&i| old_rows[i].clone()).collect();
+
+            tracing::debug!(
+                orderby_us = t.elapsed().as_micros(),
+                rows_in = m,
+                rows_out = bindings.rows.len(),
+                partial_sort = partial,
+                "ORDER BY"
+            );
         }
 
         // 6. Project output variables (before DISTINCT so deduplication operates on
@@ -597,6 +667,23 @@ impl<'a> Executor<'a> {
                     let path_cached = path_in_path_cache(path, &self.dict, &self.path_cache);
                     let all_cached  = path_cached
                         || path_all_iris_cached(path, &self.dict, &self.pred_cache);
+
+                    // Priority 0: path fully in path_cache AND N_left is small.
+                    // Binary search is O(N × log M): 263 × 23 × 100ns ≈ 0.6ms.
+                    // Any scan-based approach (eval_sequence_with_subject_filter or
+                    // linear scan) costs O(M_cache) ≈ 11.8M iterations ≈ 600ms+.
+                    // Insert BEFORE the cost-model / use_hash block so path_cache
+                    // takes priority for the small-N case.
+                    const PATH_CACHE_BSEARCH_THRESHOLD: u64 = 100_000;
+                    if path_cached && n < PATH_CACHE_BSEARCH_THRESHOLD {
+                        tracing::debug!(
+                            left_rows = n,
+                            cached_path = true,
+                            "Join PathPattern: path_cache binary search (small N_left)"
+                        );
+                        return self.path_cache_merge_join(left_rs, right, outer);
+                    }
+
                     let seek_ns = if all_cached { CACHE_SEEK_NS } else { SPO_SEEK_NS };
                     let bind_cost_ns = n * path_steps * seek_ns;
 
@@ -2317,6 +2404,94 @@ impl<'a> Executor<'a> {
         Some(result)
     }
 
+    /// Fast path for cross-product COUNT(*).
+    ///
+    /// Detects: SELECT (COUNT(*) AS ?alias) WHERE { pure cross-product of independent scans }
+    /// Computes: N1 × N2 × ... × Nk  without materialising the cross-product.
+    fn try_count_star_cross_product(
+        &self,
+        query: &SelectQuery,
+        plan: &ExecutionPlan,
+    ) -> Option<ResultSet> {
+        if !query.group_by.is_empty() || !query.having.is_empty()
+            || query.distinct || query.offset.is_some() {
+            return None;
+        }
+
+        let alias_name = if let Projection::Variables(items) = &query.projection {
+            if items.len() != 1 { return None; }
+            match &items[0] {
+                SelectItem::Alias(
+                    Expression::Count { distinct: false, expr: None },
+                    name,
+                ) => name.clone(),
+                _ => return None,
+            }
+        } else { return None; };
+
+        let mut leaves: Vec<&ExecutionPlan> = Vec::new();
+        if !collect_cross_product_leaves(plan, &mut leaves) { return None; }
+        if leaves.len() < 2 { return None; }
+
+        let mut product: u128 = 1;
+        for leaf in &leaves {
+            let ExecutionPlan::Scan { pattern, .. } = leaf else { return None; };
+            let n = self.index.estimate(pattern) as u128;
+            if n == 0 { product = 0; break; }
+            product = product.saturating_mul(n);
+        }
+
+        tracing::debug!(product, leaves = leaves.len(), "cross-product COUNT(*): computed analytically");
+
+        let n_str = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", product);
+        let n_id = self.dict.encode(&n_str);
+        let mut result = ResultSet::empty(vec![alias_name]);
+        result.rows.push(vec![Some(n_id)]);
+        Some(result)
+    }
+
+    /// Fast path for `SELECT (COUNT(*) AS ?alias) WHERE { single_triple_pattern }`.
+    ///
+    /// When the plan is a single `Scan` (no joins, no filters) and the projection
+    /// is exactly one COUNT(*) alias, compute the count via `index.estimate()`
+    /// — an O(log N) binary-search range count — instead of materialising and
+    /// counting all matching rows.
+    fn try_count_star_single_scan(
+        &self,
+        query: &SelectQuery,
+        plan: &ExecutionPlan,
+    ) -> Option<ResultSet> {
+        if !query.group_by.is_empty() || !query.having.is_empty()
+            || query.distinct || query.offset.is_some() {
+            return None;
+        }
+
+        let alias_name = if let Projection::Variables(items) = &query.projection {
+            if items.len() != 1 { return None; }
+            match &items[0] {
+                SelectItem::Alias(
+                    Expression::Count { distinct: false, expr: None },
+                    name,
+                ) => name.clone(),
+                _ => return None,
+            }
+        } else { return None; };
+
+        let pattern = match plan {
+            ExecutionPlan::Scan { pattern, .. } => pattern,
+            _ => return None,
+        };
+
+        let n = self.index.estimate(pattern);
+        tracing::debug!(n, "single-scan COUNT(*): computed via index.estimate");
+
+        let n_str = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n);
+        let n_id = self.dict.encode(&n_str);
+        let mut result = ResultSet::empty(vec![alias_name]);
+        result.rows.push(vec![Some(n_id)]);
+        Some(result)
+    }
+
     /// Merge-scan join for PathPattern when the full path is in path_cache.
     ///
     /// Instead of N binary searches (one per left row) — each causing TLB/page-cache
@@ -2388,6 +2563,7 @@ impl<'a> Executor<'a> {
             }
         }
 
+
         // Output variable list: left vars + new path_o var (if free).
         let mut out_vars: Vec<String> = left.variables.clone();
         if let Some(ref ov) = o_var_name {
@@ -2399,32 +2575,78 @@ impl<'a> Executor<'a> {
         let out_s_col = result.variable_index(&s_var_name);
         let out_o_col = o_var_name.as_deref().and_then(|ov| result.variable_index(ov));
 
-        // Single sequential scan through all cached pairs (O(M_cache)).
-        for &(src, dst) in cached.iter() {
-            if let Some(oid) = o_filter { if dst != oid { continue; } }
-            let row_indices = match src_to_rows.get(&src) {
-                Some(r) => r,
-                None => continue,
-            };
-            for &row_idx in row_indices {
-                let left_row = &left.rows[row_idx];
-                if let Some(o_lc) = o_left_col {
-                    if left_row.get(o_lc).copied().flatten() != Some(dst) { continue; }
-                }
-                let mut row = vec![None; result.variables.len()];
-                for (li, lv) in left.variables.iter().enumerate() {
-                    if let Some(oi) = result.variable_index(lv) {
-                        row[oi] = left_row.get(li).copied().flatten();
+        // Adaptive join strategy:
+        //   N_left small (< 100K): binary search per unique source value
+        //   N_left large (≥ 100K): HashMap + single linear scan of cache
+        const BINARY_SEARCH_THRESHOLD: usize = 100_000;
+
+        if left.rows.len() < BINARY_SEARCH_THRESHOLD {
+            let mut src_pairs: Vec<(TermId, usize)> = left.rows.iter().enumerate()
+                .filter_map(|(i, row)| row.get(s_col).copied().flatten().map(|s| (s, i)))
+                .collect();
+            src_pairs.sort_unstable_by_key(|&(s, _)| s);
+
+            let mut pi = 0;
+            while pi < src_pairs.len() {
+                let src = src_pairs[pi].0;
+                let end = pi + src_pairs[pi..].partition_point(|&(s, _)| s == src);
+                let row_slice = &src_pairs[pi..end];
+                pi = end;
+
+                let lo = cached.partition_point(|&(s, _)| s < src);
+                for &(s, dst) in &cached[lo..] {
+                    if s != src { break; }
+                    if let Some(oid) = o_filter { if dst != oid { continue; } }
+                    for &(_, row_idx) in row_slice {
+                        let left_row = &left.rows[row_idx];
+                        if let Some(o_lc) = o_left_col {
+                            if left_row.get(o_lc).copied().flatten() != Some(dst) { continue; }
+                        }
+                        let mut row = vec![None; result.variables.len()];
+                        for (li, lv) in left.variables.iter().enumerate() {
+                            if let Some(oi) = result.variable_index(lv) {
+                                row[oi] = left_row.get(li).copied().flatten();
+                            }
+                        }
+                        if let Some(sc) = out_s_col { row[sc] = Some(src); }
+                        if let Some(oc) = out_o_col { row[oc] = Some(dst); }
+                        result.rows.push(row);
+                        if result.rows.len() >= self.config.max_intermediate_rows {
+                            result.overflow = true;
+                            return result;
+                        }
+                        if self.is_limit_reached(result.rows.len()) { return result; }
                     }
                 }
-                if let Some(sc) = out_s_col { row[sc] = Some(src); }
-                if let Some(oc) = out_o_col { row[oc] = Some(dst); }
-                result.rows.push(row);
-                if result.rows.len() >= self.config.max_intermediate_rows {
-                    result.overflow = true;
-                    return result;
+            }
+        } else {
+            // Single sequential scan through all cached pairs (O(M_cache)).
+            for &(src, dst) in cached.iter() {
+                if let Some(oid) = o_filter { if dst != oid { continue; } }
+                let row_indices = match src_to_rows.get(&src) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                for &row_idx in row_indices {
+                    let left_row = &left.rows[row_idx];
+                    if let Some(o_lc) = o_left_col {
+                        if left_row.get(o_lc).copied().flatten() != Some(dst) { continue; }
+                    }
+                    let mut row = vec![None; result.variables.len()];
+                    for (li, lv) in left.variables.iter().enumerate() {
+                        if let Some(oi) = result.variable_index(lv) {
+                            row[oi] = left_row.get(li).copied().flatten();
+                        }
+                    }
+                    if let Some(sc) = out_s_col { row[sc] = Some(src); }
+                    if let Some(oc) = out_o_col { row[oc] = Some(dst); }
+                    result.rows.push(row);
+                    if result.rows.len() >= self.config.max_intermediate_rows {
+                        result.overflow = true;
+                        return result;
+                    }
+                    if self.is_limit_reached(result.rows.len()) { return result; }
                 }
-                if self.is_limit_reached(result.rows.len()) { return result; }
             }
         }
 
@@ -2433,6 +2655,7 @@ impl<'a> Executor<'a> {
             cached_pairs = cached.len(),
             out_rows = result.rows.len(),
             elapsed_us = t0.elapsed().as_micros(),
+            strategy = if left.rows.len() < BINARY_SEARCH_THRESHOLD { "binary_search" } else { "linear_scan" },
             "path_cache_merge_join done"
         );
         result
@@ -2602,6 +2825,220 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+        }
+
+        let can_stream = col_kinds.iter().all(|k| !matches!(k, ColKind::Complex));
+
+        // Sort-then-stream is optimal when there are no CountDistinct columns:
+        // the Vec<key> allocation (O(N) mallocs) dominates and sort removes it.
+        // When CountDistinct is present the HashSet operations dominate (~667 ns/insert)
+        // and the sort overhead (~4 s for 5.3 M elements) outweighs any key savings.
+        let has_distinct = col_kinds.iter().any(|k| matches!(k, ColKind::CountDistinct(_)));
+
+        if can_stream && !has_distinct {
+            // ── Fast path A: sort-then-stream (no CountDistinct) ───────────────
+            // New approach:
+            // 1. Extract all GROUP BY keys into one flat array (single allocation).
+            // 2. Sort row indices by key slice — O(N) when input is already ordered
+            //    by the GROUP BY variable (common when the outer-loop variable is
+            //    the GROUP BY key, e.g. D-1 where ?dataset drives the first scan).
+            // 3. Single sequential pass emitting each group when the key changes.
+            //    No HashMap, no per-row allocation, one HashSet active at a time.
+            enum Acc { Count(usize), Distinct(HashSet<TermId>) }
+
+            let key_width = gb_col_indices.len();
+
+            // One flat Vec<Option<TermId>> for all row keys (key_width entries per row).
+            let flat_keys: Vec<Option<TermId>> = rs.rows.iter().flat_map(|row| {
+                gb_col_indices.iter().map(move |&ci| {
+                    ci.and_then(|i| row.get(i).copied().flatten())
+                })
+            }).collect();
+
+            let mut indices: Vec<usize> = (0..rs.rows.len()).collect();
+            indices.sort_unstable_by(|&a, &b| {
+                let ka = &flat_keys[a * key_width .. (a + 1) * key_width];
+                let kb = &flat_keys[b * key_width .. (b + 1) * key_width];
+                ka.cmp(kb)
+            });
+
+            let make_accs = || col_kinds.iter().filter_map(|k| match k {
+                ColKind::CountStar | ColKind::Count(_) => Some(Acc::Count(0)),
+                ColKind::CountDistinct(_) => Some(Acc::Distinct(HashSet::new())),
+                ColKind::GbKey(_) | ColKind::Complex => None,
+            }).collect::<Vec<Acc>>();
+
+            let out_len = out_vars.len();
+            let mut result = ResultSet::empty(out_vars);
+            result.overflow = rs.overflow;
+
+            if indices.is_empty() { return result; }
+
+            let mut group_start = indices[0];
+            let mut accs = make_accs();
+
+            // Inline emit: build output row from current group's key + accs.
+            macro_rules! emit_group {
+                ($key_row:expr, $accs:expr) => {{
+                    let key = &flat_keys[$key_row * key_width .. ($key_row + 1) * key_width];
+                    let mut out_row = vec![None; out_len];
+                    let mut acc_idx = 0;
+                    for (out_i, kind) in col_kinds.iter().enumerate() {
+                        out_row[out_i] = match kind {
+                            ColKind::GbKey(ki) => key.get(*ki).copied().flatten(),
+                            ColKind::CountStar | ColKind::Count(_) => {
+                                let n = if let Acc::Count(c) = &$accs[acc_idx] { *c } else { 0 };
+                                acc_idx += 1;
+                                let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n);
+                                Some(self.dict.encode(&s))
+                            }
+                            ColKind::CountDistinct(_) => {
+                                let n = if let Acc::Distinct(set) = &$accs[acc_idx] { set.len() } else { 0 };
+                                acc_idx += 1;
+                                let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n);
+                                Some(self.dict.encode(&s))
+                            }
+                            ColKind::Complex => None,
+                        };
+                    }
+                    result.rows.push(out_row);
+                }};
+            }
+
+            for &row_idx in &indices {
+                let cur  = &flat_keys[row_idx   * key_width .. (row_idx   + 1) * key_width];
+                let prev = &flat_keys[group_start * key_width .. (group_start + 1) * key_width];
+                if cur != prev {
+                    emit_group!(group_start, accs);
+                    group_start = row_idx;
+                    accs = make_accs();
+                }
+
+                let row = &rs.rows[row_idx];
+                let mut acc_idx = 0;
+                for kind in &col_kinds {
+                    match kind {
+                        ColKind::GbKey(_) | ColKind::Complex => {}
+                        ColKind::CountStar => {
+                            if let Acc::Count(c) = &mut accs[acc_idx] { *c += 1; }
+                            acc_idx += 1;
+                        }
+                        ColKind::Count(ci) => {
+                            if let Acc::Count(c) = &mut accs[acc_idx] {
+                                if row.get(*ci).copied().flatten().is_some() { *c += 1; }
+                            }
+                            acc_idx += 1;
+                        }
+                        ColKind::CountDistinct(ci) => {
+                            if let Acc::Distinct(set) = &mut accs[acc_idx] {
+                                if let Some(id) = row.get(*ci).copied().flatten() {
+                                    set.insert(id);
+                                }
+                            }
+                            acc_idx += 1;
+                        }
+                    }
+                }
+            }
+            emit_group!(group_start, accs);  // final group
+            return result;
+        }
+
+        if can_stream && has_distinct {
+            // ── Fast path B: HashMap accumulator (with CountDistinct) ──────────
+            // HashSet.insert dominates (~667 ns/insert); sort overhead > key-alloc
+            // savings so we keep the HashMap path and only skip per-row key cloning
+            // via the shared flat_keys array (avoids per-row Vec<Option<TermId>> alloc).
+            enum Acc { Count(usize), Distinct(HashSet<TermId>) }
+
+            let key_width = gb_col_indices.len();
+            let flat_keys: Vec<Option<TermId>> = rs.rows.iter().flat_map(|row| {
+                gb_col_indices.iter().map(move |&ci| {
+                    ci.and_then(|i| row.get(i).copied().flatten())
+                })
+            }).collect();
+
+            // Use &[Option<TermId>] slice as logical key — but HashMap needs owned key.
+            // To avoid 5.3M Vec allocs, bucket rows by (row_index) using a pre-sized map.
+            // We still need one key Vec per GROUP (not per row): at most N_groups allocs.
+            let mut groups: HashMap<Vec<Option<TermId>>, Vec<Acc>> =
+                HashMap::with_capacity(1 << 10);
+
+            for (row_idx, row) in rs.rows.iter().enumerate() {
+                // Borrow key slice from flat_keys — compare without allocating.
+                let key_slice = &flat_keys[row_idx * key_width .. (row_idx + 1) * key_width];
+                // `entry` needs an owned key; use raw_entry to probe first.
+                let accs = groups.entry(key_slice.to_vec()).or_insert_with(|| {
+                    col_kinds.iter().filter_map(|k| match k {
+                        ColKind::CountStar | ColKind::Count(_) => Some(Acc::Count(0)),
+                        ColKind::CountDistinct(_) => Some(Acc::Distinct(HashSet::new())),
+                        ColKind::GbKey(_) | ColKind::Complex => None,
+                    }).collect()
+                });
+
+                let mut acc_idx = 0;
+                for kind in &col_kinds {
+                    match kind {
+                        ColKind::GbKey(_) | ColKind::Complex => {}
+                        ColKind::CountStar => {
+                            if let Acc::Count(c) = &mut accs[acc_idx] { *c += 1; }
+                            acc_idx += 1;
+                        }
+                        ColKind::Count(ci) => {
+                            if let Acc::Count(c) = &mut accs[acc_idx] {
+                                if row.get(*ci).copied().flatten().is_some() { *c += 1; }
+                            }
+                            acc_idx += 1;
+                        }
+                        ColKind::CountDistinct(ci) => {
+                            if let Acc::Distinct(set) = &mut accs[acc_idx] {
+                                if let Some(id) = row.get(*ci).copied().flatten() {
+                                    set.insert(id);
+                                }
+                            }
+                            acc_idx += 1;
+                        }
+                    }
+                }
+            }
+
+            let out_len = out_vars.len();
+            let mut result = ResultSet::empty(out_vars);
+            result.overflow = rs.overflow;
+            for (key, accs) in groups {
+                let mut out_row = vec![None; out_len];
+                let mut acc_idx = 0;
+                for (out_i, kind) in col_kinds.iter().enumerate() {
+                    out_row[out_i] = match kind {
+                        ColKind::GbKey(ki) => key.get(*ki).copied().flatten(),
+                        ColKind::CountStar | ColKind::Count(_) => {
+                            let n = if let Acc::Count(c) = &accs[acc_idx] { *c } else { 0 };
+                            acc_idx += 1;
+                            let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n);
+                            Some(self.dict.encode(&s))
+                        }
+                        ColKind::CountDistinct(_) => {
+                            let n = if let Acc::Distinct(set) = &accs[acc_idx] { set.len() } else { 0 };
+                            acc_idx += 1;
+                            let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n);
+                            Some(self.dict.encode(&s))
+                        }
+                        ColKind::Complex => None,
+                    };
+                }
+                result.rows.push(out_row);
+            }
+            return result;
+        }
+
+        // ── Slow path: store rows per group, then compute aggregates ──────────
+        let mut groups: HashMap<Vec<Option<TermId>>, Vec<Vec<Option<TermId>>>> = HashMap::new();
+
+        for row in &rs.rows {
+            let key: Vec<Option<TermId>> = gb_col_indices.iter()
+                .map(|ci| ci.and_then(|i| row.get(i).copied().flatten()))
+                .collect();
+            groups.entry(key).or_default().push(row.clone());
         }
 
         let can_stream = col_kinds.iter().all(|k| !matches!(k, ColKind::Complex));
@@ -3086,6 +3523,50 @@ impl<'a> Executor<'a> {
                 let va = self.eval_term(a, binding)?;
                 let vb = self.eval_term(b, binding)?;
                 Some(va == vb)
+            }
+            Expression::In(expr, list) => {
+                let left_id = self.eval_term(expr, binding);
+                let left_str = left_id
+                    .and_then(|id| Some(self.dict.decode(id)))
+                    .or_else(|| self.eval_string(expr, binding));
+
+                if left_id.is_none() && left_str.is_none() {
+                    return None;
+                }
+
+                for item in list {
+                    let right_id = self.eval_term(item, binding);
+                    let equal = match (left_id, right_id) {
+                        (Some(a), Some(b)) => {
+                            a == b || self.dict.decode(a) == self.dict.decode(b)
+                        }
+                        _ => {
+                            let ls = left_str.as_deref();
+                            let rs = right_id
+                                .map(|id| self.dict.decode(id))
+                                .or_else(|| self.eval_string(item, binding));
+                            matches!((ls, rs.as_deref()), (Some(a), Some(b)) if a == b)
+                        }
+                    };
+                    if equal {
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            }
+            Expression::NotIn(expr, list) => {
+                self.eval_bool(&Expression::In(expr.clone(), list.clone()), binding)
+                    .map(|v| !v)
+            }
+            Expression::Exists(pattern) => {
+                let plan = optimize_bgp(pattern, self.index, self.dict, self.stats);
+                let result = self.execute_plan_with_ctx(&plan, binding);
+                Some(!result.rows.is_empty())
+            }
+            Expression::NotExists(pattern) => {
+                let plan = optimize_bgp(pattern, self.index, self.dict, self.stats);
+                let result = self.execute_plan_with_ctx(&plan, binding);
+                Some(result.rows.is_empty())
             }
             _ => {
                 // For numeric expressions, non-zero = true
@@ -5301,6 +5782,14 @@ fn rewrite_having_agg(expr: Expression, aliases: &[(Expression, String)]) -> Exp
         Expression::Div(a, b) => Expression::Div(
             Box::new(rewrite_having_agg(*a, aliases)),
             Box::new(rewrite_having_agg(*b, aliases)),
+        ),
+        Expression::In(expr, list) => Expression::In(
+            Box::new(rewrite_having_agg(*expr, aliases)),
+            list.into_iter().map(|e| rewrite_having_agg(e, aliases)).collect(),
+        ),
+        Expression::NotIn(expr, list) => Expression::NotIn(
+            Box::new(rewrite_having_agg(*expr, aliases)),
+            list.into_iter().map(|e| rewrite_having_agg(e, aliases)).collect(),
         ),
         other => other,
     }

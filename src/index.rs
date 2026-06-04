@@ -50,7 +50,7 @@ use rayon;
 #[cfg(unix)]
 extern crate libc;
 
-use crate::col_delta::{delta_path, DeltaColFile};
+use crate::col_delta::{delta_path, zstd_path, DeltaColFile};
 use crate::triple::{IndexKind, Quad, TermId, Triple, TriplePattern, UNBOUND};
 
 /// Index file format version 2: term IDs are u64 (8 bytes each).
@@ -100,7 +100,7 @@ const SKIP_STRIDE_L2: usize = SKIP_STRIDE * SKIP_STRIDE; // 262 144
 //
 // `col_paths(dir/spo.bin)` → `[dir/spo.c0, dir/spo.c1, dir/spo.c2]`
 //
-fn col_paths(base: &Path) -> [PathBuf; 3] {
+pub fn col_paths(base: &Path) -> [PathBuf; 3] {
     let stem = base
         .file_stem()
         .expect("index path must have a filename")
@@ -1062,19 +1062,32 @@ impl IndexFile {
     // ── Construction ──────────────────────────────────────────────────────────
 
     /// Open an index, auto-detecting the format:
-    /// 1. Delta-encoded `.c0.dz` / `.c1.dz` / `.c2.dz` (ECOCOL02) — preferred.
-    /// 2. Uncompressed columnar `.c0` / `.c1` / `.c2` (ECOCOL01).
-    /// 3. Legacy interleaved `.bin` (ECOI0002) — fallback.
+    /// 1. Zstd-compressed `.c0.zst` / `.c1.zst` / `.c2.zst` (ECOCOL04) — highest priority.
+    /// 2. Delta-encoded `.c0.dz` / `.c1.dz` / `.c2.dz` (ECOCOL02/03).
+    /// 3. Uncompressed columnar `.c0` / `.c1` / `.c2` (ECOCOL01).
+    /// 4. Legacy interleaved `.bin` (ECOI0002) — fallback.
     pub fn open(path: &Path, kind: IndexKind) -> io::Result<Self> {
         let cpaths = col_paths(path);
+        // Priority 1: ECOCOL04 (.c0.zst / .c1.zst / .c2.zst)
+        let zstpaths: [PathBuf; 3] = [
+            zstd_path(&cpaths[0]),
+            zstd_path(&cpaths[1]),
+            zstd_path(&cpaths[2]),
+        ];
+        if zstpaths[0].exists() && zstpaths[1].exists() && zstpaths[2].exists() {
+            return Self::open_delta(&zstpaths, kind);
+        }
+        // Priority 2: ECOCOL02/03 (.c0.dz)
         let dzpaths: [PathBuf; 3] = [
             delta_path(&cpaths[0]),
             delta_path(&cpaths[1]),
             delta_path(&cpaths[2]),
         ];
         if dzpaths[0].exists() && dzpaths[1].exists() && dzpaths[2].exists() {
-            Self::open_delta(&dzpaths, kind)
-        } else if cpaths[0].exists() {
+            return Self::open_delta(&dzpaths, kind);
+        }
+        // Priority 3: raw columnar (.c0)
+        if cpaths[0].exists() {
             Self::open_columnar(&cpaths, kind)
         } else {
             Self::open_interleaved(path, kind)
@@ -2214,7 +2227,10 @@ pub struct TripleIndex {
 /// Returns `None` if neither the columnar nor legacy file exists.
 fn try_open_index(path: &Path, kind: IndexKind) -> io::Result<Option<IndexFile>> {
     let cpaths = col_paths(path);
-    if cpaths[0].exists() || path.exists() {
+    let zst_exists = zstd_path(&cpaths[0]).exists();
+    let dz_exists  = delta_path(&cpaths[0]).exists();
+    let raw_exists = cpaths[0].exists() || path.exists();
+    if zst_exists || dz_exists || raw_exists {
         Ok(Some(IndexFile::open(path, kind)?))
     } else {
         Ok(None)

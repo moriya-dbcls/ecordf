@@ -9,20 +9,20 @@ use std::collections::HashMap;
 
 // ── Top-level query ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub prefixes: HashMap<String, String>, // prefix → IRI
     pub form: QueryForm,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum QueryForm {
     Select(SelectQuery),
     Ask(AskQuery),
     Construct(ConstructQuery),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectQuery {
     pub distinct: bool,
     pub projection: Projection,
@@ -36,13 +36,13 @@ pub struct SelectQuery {
     pub values: Option<ValuesClause>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AskQuery {
     pub dataset: Vec<DatasetClause>,
     pub pattern: GraphPattern,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConstructQuery {
     pub template: Vec<TriplePatternAst>,
     pub dataset: Vec<DatasetClause>,
@@ -53,13 +53,13 @@ pub struct ConstructQuery {
 
 // ── Projection ────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Projection {
     Wildcard,                           // SELECT *
     Variables(Vec<SelectItem>),         // SELECT ?x (expr AS ?y) ...
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Variable(String),
     Alias(Expression, String), // (expr AS ?name)
@@ -67,7 +67,7 @@ pub enum SelectItem {
 
 // ── Dataset ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DatasetClause {
     pub named: bool,
     pub iri: String,
@@ -75,7 +75,7 @@ pub struct DatasetClause {
 
 // ── Graph Patterns ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GraphPattern {
     /// Basic Graph Pattern: a set of triple patterns
     Bgp(Vec<TriplePatternAst>),
@@ -112,7 +112,7 @@ pub enum GraphPattern {
 ///   PathElt          ::= PathPrimary PathMod?
 ///   PathMod          ::= '*' | '+' | '?'
 ///   PathPrimary      ::= iri | 'a' | '(' PathAlternative ')'
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PropertyPath {
     /// Simple predicate IRI (e.g. `rdfs:subClassOf`)
     Iri(String),
@@ -132,7 +132,7 @@ pub enum PropertyPath {
 
 // ── Triple Pattern (AST level, before dictionary encoding) ────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TriplePatternAst {
     pub s: Term,
     pub p: Term,
@@ -251,6 +251,14 @@ pub enum Expression {
     SameTerm(Box<Expression>, Box<Expression>),
     Iri2(Box<Expression>),   // IRI() / URI() function
 
+    // Set operations (SPARQL 1.1)
+    In(Box<Expression>, Vec<Expression>),
+    NotIn(Box<Expression>, Vec<Expression>),
+
+    // Existence tests (SPARQL 1.1)
+    Exists(Box<GraphPattern>),
+    NotExists(Box<GraphPattern>),
+
     // Aggregates
     Count { distinct: bool, expr: Option<Box<Expression>> },
     Sum { distinct: bool, expr: Box<Expression> },
@@ -263,13 +271,13 @@ pub enum Expression {
 
 // ── Modifiers ─────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GroupCondition {
     pub expr: Expression,
     pub alias: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrderCondition {
     pub direction: OrderDirection,
     pub expr: Expression,
@@ -283,7 +291,7 @@ pub enum OrderDirection {
 
 // ── VALUES clause ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ValuesClause {
     pub variables: Vec<String>,
     pub rows: Vec<Vec<Option<Term>>>, // None = UNDEF

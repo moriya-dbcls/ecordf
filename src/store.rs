@@ -25,7 +25,7 @@ use crate::loader::{collect_strings_from_inputs, collect_strings_parallel,
 use crate::path_cache::PathCache;
 use crate::pred_partition::{pred_parts_dir, PredPartitions};
 use crate::predcache::PredCache;
-use crate::rdf_config;
+use crate::rdf_config::{self, CompoundPath};
 use crate::type_cache::TypeCache;
 use crate::sparql::{parse_query, Executor, ResultSet};
 use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
@@ -303,6 +303,7 @@ impl Store {
                     config.build.chunk_size,
                     num_threads,
                     ram_budget_bytes,
+                    config.build.p2a_buf_mb,
                 )
             })?
         } else {
@@ -474,8 +475,25 @@ impl Store {
     /// `budget_mb = 0` is a no-op.
     pub fn build_type_cache(&mut self, budget_mb: u64) {
         if budget_mb == 0 { return; }
+        let cache_path = self.dir.join("type_cache.bin");
+        let ref_path   = self.find_reference_index_file();
+        if let Some(loaded) = TypeCache::load_from_file(&cache_path, &ref_path) {
+            self.type_cache = loaded;
+            tracing::info!(
+                classes = self.type_cache.len(),
+                mb_used = self.type_cache.bytes_used() / (1024 * 1024),
+                "type-cache: loaded from file"
+            );
+            eprintln!(
+                "Type cache ready: {} class(es), {} MB used.",
+                self.type_cache.len(),
+                self.type_cache.bytes_used() / (1024 * 1024),
+            );
+            return;
+        }
         let budget = (budget_mb as usize) * 1024 * 1024;
         self.type_cache = TypeCache::build(&*self.index, &self.dict, budget);
+        self.type_cache.save_to_file(&cache_path);
         tracing::info!(
             classes = self.type_cache.len(),
             mb_used = self.type_cache.bytes_used() / (1024 * 1024),
@@ -662,7 +680,7 @@ impl Store {
     /// `budget_mb = 0` or empty `compound_paths` is a no-op.
     pub fn build_path_cache_from_compounds(
         &mut self,
-        compound_paths: &[Vec<String>],
+        compound_paths: &[CompoundPath],
         budget_mb: u64,
     ) {
         if budget_mb == 0 || compound_paths.is_empty() {
@@ -671,8 +689,26 @@ impl Store {
             }
             return;
         }
+
+        let cache_path = self.dir.join("path_cache.bin");
+        let ref_path   = self.find_reference_index_file();
+        if let Some(loaded) = PathCache::load_from_file(&cache_path, &ref_path) {
+            self.path_cache = loaded;
+            tracing::info!(
+                paths = self.path_cache.len(),
+                mb_used = self.path_cache.bytes_used() / (1024 * 1024),
+                "path-cache: loaded from file"
+            );
+            eprintln!(
+                "Path cache ready: {} path(s), {} MB used.",
+                self.path_cache.len(),
+                self.path_cache.bytes_used() / (1024 * 1024),
+            );
+            return;
+        }
         let budget_bytes = (budget_mb as usize) * 1024 * 1024;
         self.path_cache = PathCache::build(compound_paths, &self.dict, &*self.index, &self.pred_cache, budget_bytes);
+        self.path_cache.save_to_file(&cache_path);
         tracing::info!(
             paths_cached = self.path_cache.len(),
             mb_used = self.path_cache.bytes_used() / (1024 * 1024),
@@ -872,6 +908,14 @@ impl Store {
             graph_count: self.index.graph_count(),
             dir: self.dir.clone(),
         }
+    }
+
+    fn find_reference_index_file(&self) -> std::path::PathBuf {
+        for name in &["spo.c0", "pos.c0", "spo.c0.dz", "pos.c0.dz", "dict_sorted.bin"] {
+            let p = self.dir.join(name);
+            if p.exists() { return p; }
+        }
+        self.dir.join("spo.c0")
     }
 }
 

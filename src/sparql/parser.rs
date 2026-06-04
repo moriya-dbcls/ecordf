@@ -1101,13 +1101,29 @@ impl<'a> Parser<'a> {
 
     fn parse_relational(&mut self) -> ParseResult<Expression> {
         let left = self.parse_additive()?;
-        match self.lexer.peek() {
+        match self.lexer.peek().clone() {
             Token::Eq  => { self.lexer.next(); Ok(Expression::Eq(Box::new(left), Box::new(self.parse_additive()?))) }
             Token::Ne  => { self.lexer.next(); Ok(Expression::Ne(Box::new(left), Box::new(self.parse_additive()?))) }
             Token::Lt  => { self.lexer.next(); Ok(Expression::Lt(Box::new(left), Box::new(self.parse_additive()?))) }
             Token::Le  => { self.lexer.next(); Ok(Expression::Le(Box::new(left), Box::new(self.parse_additive()?))) }
             Token::Gt  => { self.lexer.next(); Ok(Expression::Gt(Box::new(left), Box::new(self.parse_additive()?))) }
             Token::Ge  => { self.lexer.next(); Ok(Expression::Ge(Box::new(left), Box::new(self.parse_additive()?))) }
+            Token::Kw(k) if k.eq_ignore_ascii_case("in") => {
+                self.lexer.next();
+                let list = self.parse_expr_list()?;
+                Ok(Expression::In(Box::new(left), list))
+            }
+            Token::Kw(k) if k.eq_ignore_ascii_case("not") => {
+                self.lexer.next(); // consume "not"
+                match self.lexer.peek().clone() {
+                    Token::Kw(k2) if k2.eq_ignore_ascii_case("in") => {
+                        self.lexer.next(); // consume "in"
+                        let list = self.parse_expr_list()?;
+                        Ok(Expression::NotIn(Box::new(left), list))
+                    }
+                    _ => Err(ParseError(format!("expected IN after NOT"))),
+                }
+            }
             _ => Ok(left),
         }
     }
@@ -1372,6 +1388,21 @@ impl<'a> Parser<'a> {
             "sample" => self.parse_aggregate(|d, e| Expression::Sample { distinct: d, expr: Box::new(e) }),
             "group_concat" => self.parse_group_concat(),
 
+            "exists" => {
+                let pattern = self.parse_group_graph_pattern()?;
+                Ok(Expression::Exists(Box::new(pattern)))
+            }
+            "not" => {
+                match self.lexer.peek().clone() {
+                    Token::Kw(k) if k.eq_ignore_ascii_case("exists") => {
+                        self.lexer.next(); // consume "exists"
+                        let pattern = self.parse_group_graph_pattern()?;
+                        Ok(Expression::NotExists(Box::new(pattern)))
+                    }
+                    _ => Err(ParseError(format!("expected EXISTS after NOT"))),
+                }
+            }
+
             other => Err(ParseError(format!("unknown function: {}", other))),
         }
     }
@@ -1381,6 +1412,21 @@ impl<'a> Parser<'a> {
         let e = self.parse_expression()?;
         self.expect(Token::RParen)?;
         Ok(e)
+    }
+
+    fn parse_expr_list(&mut self) -> ParseResult<Vec<Expression>> {
+        self.expect(Token::LParen)?;
+        if matches!(self.lexer.peek(), Token::RParen) {
+            self.lexer.next();
+            return Ok(vec![]);
+        }
+        let mut list = vec![self.parse_expression()?];
+        while matches!(self.lexer.peek(), Token::Comma) {
+            self.lexer.next();
+            list.push(self.parse_expression()?);
+        }
+        self.expect(Token::RParen)?;
+        Ok(list)
     }
 
     fn parse_aggregate_count(&mut self) -> ParseResult<Expression> {
