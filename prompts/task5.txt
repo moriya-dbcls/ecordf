@@ -1,169 +1,219 @@
-# タスク5: BGP+PathPattern 融合最適化
+# タスク5: クエリエンジン最適化 (優先度①②)
 
 ## 作業ディレクトリ
-/opt/services/moriya/tmp/ecordf
+/home/moriya/tmp/ecordf
 
 ## 担当ファイル
 src/sparql/executor.rs
 
-## 背景・問題
+## 背景
+ベンチマーク結果から以下の問題が判明している:
+- G-1/F-2 類: 共有変数なしのクロス積クエリが 100M 行で打ち切られ **5分以上かかった上に誤答を返す**
+- ORDER BY + LIMIT クエリ: bgp_rows=12M でも全件ソートしており post_us=15-18s
 
-以下の3クエリ（data/test_sparql_query.txt の U-1, U-2, U-3）は意味的に等価だが実行速度が異なる。
+---
 
-- U-1 ([] 匿名ブランクノード構文) が最速
-- U-2 (_:label ブランクノード)、U-3 (?変数) が同速で遅い
+## 変更 1: クロス積の早期検出と正確な COUNT(*) 計算
 
-### 原因
+### 1-a. try_count_star_cross_product を追加
 
-`[]` 構文では `parse_property_list` が再帰的に同一ベクタへ書き込むため、
-9個のトリプルパターンが 1つのフラット BGP にまとまる。
+`try_count_distinct_cross_product` の近く（2262行付近）に新しいメソッドを追加する。
 
-一方、U-2/U-3 では明示的な別文として書かれるため `parse_triples_block` が
-PathPattern を挟むたびに cur_triples をフラッシュし、BGP が分断される:
-
-  Bgp[2] → PathPattern → Bgp[2] → PathPattern → PathPattern → Bgp[5]
-
-`normalize_graph_pattern` の `extract_bgp_with_filters` は `PathPattern` に対して
-`None` を返すため、BGP 間の融合が阻まれる。結果として `optimize_triple_patterns`
-が 9 パターン全体を見られず、クロス BGP 最適化ができない。
-
-### 修正方針
-
-`optimize_bgp_with_bound` の `GraphPattern::Join` アームに BGP 融合パスを追加する。
-
-`collect_join_patterns` で得たフラットリストが「Bgp と PathPattern のみ」の場合:
-1. すべての Bgp トリプルを1つの大きな Bgp に統合
-2. PathPattern の出力変数がどの BGP トリプルにも現れないことを確認（安全条件）
-3. 安全なら「統合 Bgp を先に実行 → PathPattern 群を後で実行」の順に組み替える
-
-これにより U-2/U-3 も U-1 と同等のプランを得る。
-
-## 具体的な変更
-
-`src/sparql/executor.rs` の `optimize_bgp_with_bound` 関数、
-`GraphPattern::Join(_,_) =>` アームの先頭、`collect_join_patterns` の直後、
-既存の "Self-contained patterns first" コメントの直前に以下のコードを挿入する。
-
-挿入箇所の前後コンテキスト（old_string として使用）:
+**目的**: `SELECT (COUNT(*) AS ?n) WHERE { ?a rdf:type X . ?b rdf:type Y . ?c rdf:type Z . }` のような
+共有変数なし（クロス積）の COUNT(*) クエリを、実際にクロス積を実体化せず
+各スキャンの行数の **積** として計算する。
 
 ```rust
-            let mut flat: Vec<&GraphPattern> = Vec::new();
-            collect_join_patterns(pattern, &mut flat);
+/// Fast path for cross-product COUNT(*).
+///
+/// Detects: SELECT (COUNT(*) AS ?alias) WHERE { pure cross-product of independent scans }
+/// Computes: N1 × N2 × ... × Nk  without materialising the cross-product.
+fn try_count_star_cross_product(
+    &self,
+    query: &SelectQuery,
+    plan: &ExecutionPlan,
+) -> Option<ResultSet> {
+    if !query.group_by.is_empty() || !query.having.is_empty()
+        || query.distinct || query.offset.is_some() {
+        return None;
+    }
 
-            // Self-contained patterns first (they provide binding to subsequent patterns).
+    let alias_name = if let Projection::Variables(items) = &query.projection {
+        if items.len() != 1 { return None; }
+        match &items[0] {
+            SelectItem::Alias(
+                Expression::Count { distinct: false, expr: None },
+                name,
+            ) => name.clone(),
+            _ => return None,
+        }
+    } else { return None; };
+
+    let mut leaves: Vec<&ExecutionPlan> = Vec::new();
+    if !collect_cross_product_leaves(plan, &mut leaves) { return None; }
+    if leaves.len() < 2 { return None; }
+
+    let mut product: u128 = 1;
+    for leaf in &leaves {
+        let ExecutionPlan::Scan { pattern, .. } = leaf else { return None; };
+        let n = self.index.estimate(pattern) as u128;
+        if n == 0 { product = 0; break; }
+        product = product.saturating_mul(n);
+    }
+
+    tracing::debug!(product, leaves = leaves.len(), "cross-product COUNT(*): computed analytically");
+
+    let n_str = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", product);
+    let n_id = self.dict.encode(&n_str);
+    let mut result = ResultSet::empty(vec![alias_name]);
+    result.rows.push(vec![Some(n_id)]);
+    Some(result)
+}
 ```
 
-この old_string を以下の new_string に置き換える:
+### 1-b. execute_select でクロス積を早期検出してエラー返却
+
+`execute_select` の `try_count_distinct_cross_product` の呼び出し（326行付近）の **直後** に以下を追加する:
 
 ```rust
-            let mut flat: Vec<&GraphPattern> = Vec::new();
-            collect_join_patterns(pattern, &mut flat);
+        if let Some(fast_result) = self.try_count_star_cross_product(query, &plan) {
+            return fast_result;
+        }
 
-            // ── BGP+PathPattern fusion ────────────────────────────────────────
-            // When the flat join list contains only Bgp and PathPattern nodes,
-            // merge all BGP triple patterns into one large Bgp so that
-            // optimize_triple_patterns can see the full set and pick a globally
-            // optimal join order.
-            //
-            // Safety condition: a PathPattern's output variable must not appear
-            // in any BGP triple (otherwise the BGP cannot execute before the
-            // PathPattern that produces it).
-            //
-            // This fixes the performance gap between:
-            //   U-1 ( []  syntax → one flat BGP from recursive parse_property_list)
-            //   U-2/U-3 ( _:label / ?var → fragmented BGPs split by PathPatterns)
-            let all_bgp_or_path = flat.iter().all(|p| {
-                matches!(p, GraphPattern::Bgp(_) | GraphPattern::PathPattern { .. })
-            });
-            let has_bgp  = flat.iter().any(|p| matches!(p, GraphPattern::Bgp(_)));
-            let has_path = flat.iter().any(|p| matches!(p, GraphPattern::PathPattern { .. }));
-
-            if all_bgp_or_path && has_bgp && has_path {
-                let mut all_triples: Vec<TriplePatternAst> = Vec::new();
-                let mut path_pats: Vec<&GraphPattern> = Vec::new();
-                for p in &flat {
-                    match p {
-                        GraphPattern::Bgp(triples) => all_triples.extend_from_slice(triples),
-                        pp => path_pats.push(pp),
-                    }
-                }
-
-                // Build set of all variable names that appear in BGP triples.
-                let bgp_vars: HashSet<&str> = all_triples.iter().flat_map(|t| {
-                    let mut v: Vec<&str> = Vec::new();
-                    if let Term::Variable(s) = &t.s { v.push(s.as_str()); }
-                    if let Term::Variable(s) = &t.p { v.push(s.as_str()); }
-                    if let Term::Variable(s) = &t.o { v.push(s.as_str()); }
-                    v
-                }).collect();
-
-                // Safety check: PathPattern outputs must not be consumed by BGP triples.
-                let safe = path_pats.iter().all(|pp| {
-                    if let GraphPattern::PathPattern { o, .. } = pp {
-                        if let Term::Variable(v) = o {
-                            return !bgp_vars.contains(v.as_str());
-                        }
-                    }
-                    true
-                });
-
-                if safe {
-                    tracing::debug!(
-                        bgp_triples = all_triples.len(),
-                        path_patterns = path_pats.len(),
-                        "optimize_bgp_with_bound: fusing BGPs across PathPatterns"
-                    );
-                    let merged_bgp = GraphPattern::Bgp(all_triples);
-                    let mut current_bound = bound.clone();
-                    let mut plans: Vec<ExecutionPlan> = Vec::new();
-
-                    plans.push(optimize_bgp_with_bound(
-                        &merged_bgp, index, dict, stats, &current_bound,
-                    ));
-                    current_bound.extend(pattern_bound_vars(&merged_bgp));
-
-                    for pp in path_pats {
-                        plans.push(optimize_bgp_with_bound(
-                            pp, index, dict, stats, &current_bound,
-                        ));
-                        current_bound.extend(pattern_bound_vars(pp));
-                    }
-
-                    return plans
-                        .into_iter()
-                        .reduce(|acc, p| ExecutionPlan::Join(Box::new(acc), Box::new(p)))
-                        .unwrap_or(ExecutionPlan::Empty);
-                }
+        // ── Cross-product guard ────────────────────────────────────────────────
+        // Pure cross-product with no useful LIMIT → abort rather than scanning 100M+ rows.
+        // With LIMIT the cross-product is bounded and may be intentional.
+        {
+            let mut cp_leaves: Vec<&ExecutionPlan> = Vec::new();
+            let is_cross_product = collect_cross_product_leaves(&plan, &mut cp_leaves)
+                && cp_leaves.len() >= 2;
+            let limit_val = query.limit.unwrap_or(u64::MAX) as usize;
+            if is_cross_product && limit_val > self.config.max_intermediate_rows {
+                let out_vars = if let Projection::Variables(items) = &query.projection {
+                    items.iter().map(|i| match i {
+                        SelectItem::Variable(v) => v.clone(),
+                        SelectItem::Alias(_, n) => n.clone(),
+                    }).collect()
+                } else { vec![] };
+                let mut result = ResultSet::empty(out_vars);
+                result.overflow = true;
+                tracing::warn!(
+                    leaves = cp_leaves.len(),
+                    "cross-product query without LIMIT — aborting to prevent OOM"
+                );
+                return result;
             }
-            // ── end BGP+PathPattern fusion ────────────────────────────────────
-
-            // Self-contained patterns first (they provide binding to subsequent patterns).
+        }
+        // ── end cross-product guard ────────────────────────────────────────────
 ```
+
+---
+
+## 変更 2: ORDER BY キー事前計算 + Top-N 部分ソート
+
+### 目的
+- **常に有効**: 現在 `sort_by` 内で `eval_order_key` が O(M log M) 回呼ばれる。キーを事前計算すれば O(M) 回で済む。
+- **LIMIT がある場合**: M >> N（例: M=12M, N=100）なら `select_nth_unstable_by` で O(M) にパーティション後、先頭 N 件のみ O(N log N) でソートする。
+
+### execute_select の ORDER BY ブロック（400行付近）を置き換える
+
+`compare_order_keys` の現在のシグネチャを確認して適切に使用すること。
+コンパイルエラーが出た場合は適宜修正する。
+
+**現在の OLD_STRING（grep で確認してから置き換えること）:**
+```rust
+        // 5. Apply ORDER BY
+        if !query.order_by.is_empty() {
+            let t = Instant::now();
+            let vars = bindings.variables.clone();
+            let order = query.order_by.clone();
+            bindings.rows.sort_by(|a, b| {
+```
+
+**変更後の NEW_STRING（全体）:**
+```rust
+        // 5. Apply ORDER BY
+        if !query.order_by.is_empty() {
+            let t = Instant::now();
+            let vars = bindings.variables.clone();
+            let order = query.order_by.clone();
+            let m = bindings.rows.len();
+
+            // Pre-compute sort keys once per row (avoids O(M log M) eval_order_key calls).
+            let keys: Vec<Vec<String>> = bindings.rows.iter().map(|row| {
+                let b = row_to_binding(&vars, row);
+                order.iter().map(|cond| self.eval_order_key(&cond.expr, &b)).collect()
+            }).collect();
+
+            let cmp_fn = |ai: &usize, bi: &usize| -> std::cmp::Ordering {
+                for (ki, cond) in order.iter().enumerate() {
+                    let va = keys[*ai].get(ki).map(|s| s.as_str()).unwrap_or("");
+                    let vb = keys[*bi].get(ki).map(|s| s.as_str()).unwrap_or("");
+                    let c = compare_order_keys(va, vb);
+                    let c = if cond.direction == OrderDirection::Desc { c.reverse() } else { c };
+                    if c != std::cmp::Ordering::Equal { return c; }
+                }
+                std::cmp::Ordering::Equal
+            };
+
+            // Number of rows we actually need (LIMIT + OFFSET, capped at M).
+            let need = query.limit
+                .map(|lim| {
+                    (lim as usize)
+                        .saturating_add(query.offset.unwrap_or(0) as usize)
+                        .min(m)
+                })
+                .unwrap_or(m);
+
+            let mut indices: Vec<usize> = (0..m).collect();
+
+            // Partial sort when need << M (at most 1/4 of rows needed).
+            let partial = need > 0 && need < m / 4;
+            if partial {
+                indices.select_nth_unstable_by(need - 1, |a, b| cmp_fn(a, b));
+                indices[..need].sort_unstable_by(|a, b| cmp_fn(a, b));
+            } else {
+                indices.sort_unstable_by(|a, b| cmp_fn(a, b));
+            }
+
+            let old_rows = std::mem::take(&mut bindings.rows);
+            let take = if partial { need } else { m };
+            bindings.rows = indices[..take].iter().map(|&i| old_rows[i].clone()).collect();
+
+            tracing::debug!(
+                orderby_us = t.elapsed().as_micros(),
+                rows_in = m,
+                rows_out = bindings.rows.len(),
+                partial_sort = partial,
+                "ORDER BY"
+            );
+        }
+```
+
+既存の `bindings.rows.sort_by(...)` から `tracing::debug!(orderby_us...` までの全ブロックを上記に置き換えること。
+
+---
 
 ## ビルドと確認
 
 ```bash
-cd /opt/services/moriya/tmp/ecordf
+cd /home/moriya/tmp/ecordf
 cargo build --release 2>&1 | tail -30
-cargo test 2>&1 | tail -30
+cargo test 2>&1 | tail -20
 ```
-
-ビルドとテストが通れば完了。
 
 ## やらないこと
 - git push
-- サーバーの起動・停止・再起動
-- src/sparql/executor.rs 以外のソースファイルの変更
-- ビルド・テスト以外のコマンド実行
+- サーバーの起動・停止
+- executor.rs 以外のソース変更
 
 ## 報告先
-作業結果を report/task5.md に追記する（既存内容は消さずに末尾に追加）。
-以下の形式で記録すること:
-
+report/task5.md に追記:
 ```
-## BGP融合最適化 (2026-06-03)
-- 変更: optimize_bgp_with_bound の Join アームに BGP+PathPattern 融合パス追加
+## クロス積早期検出 + TOP-N ソート (2026-06-04)
+- 変更: try_count_star_cross_product 追加
+- 変更: クロス積ガード追加（overflow=true で即返却）
+- 変更: ORDER BY キー事前計算 + partial sort (select_nth_unstable_by)
 - ビルド: 成功/失敗
 - テスト: 成功/失敗
-- 備考: (あれば)
 ```

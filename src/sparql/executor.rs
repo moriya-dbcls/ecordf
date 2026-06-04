@@ -327,6 +327,36 @@ impl<'a> Executor<'a> {
             return fast_result;
         }
 
+        if let Some(fast_result) = self.try_count_star_cross_product(query, &plan) {
+            return fast_result;
+        }
+
+        // ── Cross-product guard ────────────────────────────────────────────────
+        // Pure cross-product with no useful LIMIT → abort rather than scanning 100M+ rows.
+        // With LIMIT the cross-product is bounded and may be intentional.
+        {
+            let mut cp_leaves: Vec<&ExecutionPlan> = Vec::new();
+            let is_cross_product = collect_cross_product_leaves(&plan, &mut cp_leaves)
+                && cp_leaves.len() >= 2;
+            let limit_val = query.limit.unwrap_or(u64::MAX) as usize;
+            if is_cross_product && limit_val > self.config.max_intermediate_rows {
+                let out_vars = if let Projection::Variables(items) = &query.projection {
+                    items.iter().map(|i| match i {
+                        SelectItem::Variable(v) => v.clone(),
+                        SelectItem::Alias(_, n) => n.clone(),
+                    }).collect()
+                } else { vec![] };
+                let mut result = ResultSet::empty(out_vars);
+                result.overflow = true;
+                tracing::warn!(
+                    leaves = cp_leaves.len(),
+                    "cross-product query without LIMIT — aborting to prevent OOM"
+                );
+                return result;
+            }
+        }
+        // ── end cross-product guard ────────────────────────────────────────────
+
         // 2. Execute
         let t_bgp = Instant::now();
         let mut bindings = self.execute_plan(&plan);
@@ -402,21 +432,56 @@ impl<'a> Executor<'a> {
             let t = Instant::now();
             let vars = bindings.variables.clone();
             let order = query.order_by.clone();
-            bindings.rows.sort_by(|a, b| {
-                for cond in &order {
-                    let ba = row_to_binding(&vars, a);
-                    let bb = row_to_binding(&vars, b);
-                    let va = self.eval_order_key(&cond.expr, &ba);
-                    let vb = self.eval_order_key(&cond.expr, &bb);
-                    let cmp = compare_order_keys(&va, &vb);
-                    let cmp = if cond.direction == OrderDirection::Desc { cmp.reverse() } else { cmp };
-                    if cmp != std::cmp::Ordering::Equal {
-                        return cmp;
-                    }
+            let m = bindings.rows.len();
+
+            // Pre-compute sort keys once per row (avoids O(M log M) eval_order_key calls).
+            let keys: Vec<Vec<String>> = bindings.rows.iter().map(|row| {
+                let b = row_to_binding(&vars, row);
+                order.iter().map(|cond| self.eval_order_key(&cond.expr, &b)).collect()
+            }).collect();
+
+            let cmp_fn = |ai: &usize, bi: &usize| -> std::cmp::Ordering {
+                for (ki, cond) in order.iter().enumerate() {
+                    let va = keys[*ai].get(ki).map(|s| s.as_str()).unwrap_or("");
+                    let vb = keys[*bi].get(ki).map(|s| s.as_str()).unwrap_or("");
+                    let c = compare_order_keys(va, vb);
+                    let c = if cond.direction == OrderDirection::Desc { c.reverse() } else { c };
+                    if c != std::cmp::Ordering::Equal { return c; }
                 }
                 std::cmp::Ordering::Equal
-            });
-            tracing::debug!(orderby_us = t.elapsed().as_micros(), rows = bindings.rows.len(), "ORDER BY");
+            };
+
+            // Number of rows we actually need (LIMIT + OFFSET, capped at M).
+            let need = query.limit
+                .map(|lim| {
+                    (lim as usize)
+                        .saturating_add(query.offset.unwrap_or(0) as usize)
+                        .min(m)
+                })
+                .unwrap_or(m);
+
+            let mut indices: Vec<usize> = (0..m).collect();
+
+            // Partial sort when need << M (at most 1/4 of rows needed).
+            let partial = need > 0 && need < m / 4;
+            if partial {
+                indices.select_nth_unstable_by(need - 1, |a, b| cmp_fn(a, b));
+                indices[..need].sort_unstable_by(|a, b| cmp_fn(a, b));
+            } else {
+                indices.sort_unstable_by(|a, b| cmp_fn(a, b));
+            }
+
+            let old_rows = std::mem::take(&mut bindings.rows);
+            let take = if partial { need } else { m };
+            bindings.rows = indices[..take].iter().map(|&i| old_rows[i].clone()).collect();
+
+            tracing::debug!(
+                orderby_us = t.elapsed().as_micros(),
+                rows_in = m,
+                rows_out = bindings.rows.len(),
+                partial_sort = partial,
+                "ORDER BY"
+            );
         }
 
         // 6. Project output variables (before DISTINCT so deduplication operates on
@@ -2311,6 +2376,52 @@ impl<'a> Executor<'a> {
         );
 
         let n_str = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", distinct_count);
+        let n_id = self.dict.encode(&n_str);
+        let mut result = ResultSet::empty(vec![alias_name]);
+        result.rows.push(vec![Some(n_id)]);
+        Some(result)
+    }
+
+    /// Fast path for cross-product COUNT(*).
+    ///
+    /// Detects: SELECT (COUNT(*) AS ?alias) WHERE { pure cross-product of independent scans }
+    /// Computes: N1 × N2 × ... × Nk  without materialising the cross-product.
+    fn try_count_star_cross_product(
+        &self,
+        query: &SelectQuery,
+        plan: &ExecutionPlan,
+    ) -> Option<ResultSet> {
+        if !query.group_by.is_empty() || !query.having.is_empty()
+            || query.distinct || query.offset.is_some() {
+            return None;
+        }
+
+        let alias_name = if let Projection::Variables(items) = &query.projection {
+            if items.len() != 1 { return None; }
+            match &items[0] {
+                SelectItem::Alias(
+                    Expression::Count { distinct: false, expr: None },
+                    name,
+                ) => name.clone(),
+                _ => return None,
+            }
+        } else { return None; };
+
+        let mut leaves: Vec<&ExecutionPlan> = Vec::new();
+        if !collect_cross_product_leaves(plan, &mut leaves) { return None; }
+        if leaves.len() < 2 { return None; }
+
+        let mut product: u128 = 1;
+        for leaf in &leaves {
+            let ExecutionPlan::Scan { pattern, .. } = leaf else { return None; };
+            let n = self.index.estimate(pattern) as u128;
+            if n == 0 { product = 0; break; }
+            product = product.saturating_mul(n);
+        }
+
+        tracing::debug!(product, leaves = leaves.len(), "cross-product COUNT(*): computed analytically");
+
+        let n_str = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", product);
         let n_id = self.dict.encode(&n_str);
         let mut result = ResultSet::empty(vec![alias_name]);
         result.rows.push(vec![Some(n_id)]);

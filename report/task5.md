@@ -36,3 +36,10 @@ cargo test --lib       → test result: ok. 27 passed; 0 failed
 - ビルド: 成功 (警告のみ、エラーなし)
 - テスト: 成功 (27 passed; 0 failed)
 - 備考: U-2/U-3 クエリで分断されていた BGP を PathPattern 越しに統合し、U-1 相当のプランを生成するよう修正。安全条件チェック（PathPattern 出力変数が BGP トリプルに現れないこと）付き。
+
+## クロス積早期検出 + TOP-N ソート (2026-06-04)
+- 変更: try_count_star_cross_product 追加（COUNT(*) クロス積を積として解析的に計算）
+- 変更: クロス積ガード追加（overflow=true で即返却、LIMIT なし 100M+ 行を防止）
+- 変更: ORDER BY キー事前計算 + partial sort (select_nth_unstable_by)
+- ビルド: 成功
+- テスト: 成功 (27 passed; 0 failed)
