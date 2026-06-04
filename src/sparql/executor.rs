@@ -29,7 +29,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use rayon::prelude::*;
 use std::time::Instant;
 
 use crate::config::QueryConfig;
@@ -207,16 +208,16 @@ pub struct Executor<'a> {
     ///
     /// Uses `Cell` so it can be updated from `&self` context without changing
     /// function signatures across the recursive call tree.
-    pushdown_limit: std::cell::Cell<Option<usize>>,
+    pushdown_limit: AtomicUsize,
 }
 
 impl<'a> Executor<'a> {
     pub fn new(index: &'a TripleIndex, dict: &'a QueryDict) -> Self {
-        Self { index, dict, config: QueryConfig::default(), stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: std::cell::Cell::new(None) }
+        Self { index, dict, config: QueryConfig::default(), stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: AtomicUsize::new(usize::MAX) }
     }
 
     pub fn with_config(index: &'a TripleIndex, dict: &'a QueryDict, config: QueryConfig) -> Self {
-        Self { index, dict, config, stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: std::cell::Cell::new(None) }
+        Self { index, dict, config, stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: AtomicUsize::new(usize::MAX) }
     }
 
     pub fn with_config_and_stats(
@@ -225,10 +226,28 @@ impl<'a> Executor<'a> {
         config: QueryConfig,
         stats: Option<&'a StoreStatistics>,
     ) -> Self {
-        Self { index, dict, config, stats, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: std::cell::Cell::new(None) }
+        Self { index, dict, config, stats, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: AtomicUsize::new(usize::MAX) }
     }
 
     /// Builder: attach a TypeCache.
+    /// Create a lightweight executor fork for parallel branch execution.
+    /// Shares all indexes and caches (O(1) Arc clones); resets per-query local state.
+    fn fork(&self) -> Self {
+        Self {
+            index:               self.index,
+            dict:                self.dict,
+            config:              self.config.clone(),
+            stats:               self.stats,
+            pred_cache:          self.pred_cache.clone(),
+            path_cache:          self.path_cache.clone(),
+            type_cache:          self.type_cache.clone(),
+            pred_partitions:     self.pred_partitions.clone(),
+            cancel:              self.cancel.clone(),
+            scan_dontneed_bytes: 0,
+            pushdown_limit:      AtomicUsize::new(usize::MAX),
+        }
+    }
+
     pub fn with_type_cache(mut self, cache: TypeCache) -> Self {
         self.type_cache = cache;
         self
@@ -264,7 +283,8 @@ impl<'a> Executor<'a> {
     /// Returns `true` if the current BGP row count has reached the pushdown limit.
     #[inline]
     fn is_limit_reached(&self, rows: usize) -> bool {
-        matches!(self.pushdown_limit.get(), Some(lim) if rows >= lim)
+        let v = self.pushdown_limit.load(Ordering::Relaxed);
+        v != usize::MAX && rows >= v
     }
 
     /// Builder: attach a predicate cache.
@@ -314,13 +334,13 @@ impl<'a> Executor<'a> {
         if can_pushdown {
             if let Some(lim) = query.limit {
                 let budget = (lim as usize).saturating_add(query.offset.unwrap_or(0) as usize);
-                self.pushdown_limit.set(Some(budget));
+                self.pushdown_limit.store(budget, Ordering::Relaxed);
                 tracing::debug!(limit = lim, offset = ?query.offset, budget, "LIMIT pushdown enabled");
             } else {
-                self.pushdown_limit.set(None);
+                self.pushdown_limit.store(usize::MAX, Ordering::Relaxed);
             }
         } else {
-            self.pushdown_limit.set(None);
+            self.pushdown_limit.store(usize::MAX, Ordering::Relaxed);
         }
 
         if let Some(fast_result) = self.try_count_distinct_cross_product(query, &plan) {
@@ -365,7 +385,7 @@ impl<'a> Executor<'a> {
         // 2. Execute
         let t_bgp = Instant::now();
         let mut bindings = self.execute_plan(&plan);
-        self.pushdown_limit.set(None); // clear after BGP so later calls are unaffected
+        self.pushdown_limit.store(usize::MAX, Ordering::Relaxed); // clear after BGP so later calls are unaffected
 
         // Note: SPARQL LIMIT is "at most N rows", not "exactly N rows".
         // Returning fewer rows than LIMIT is valid when filter steps after the
@@ -473,7 +493,7 @@ impl<'a> Executor<'a> {
                 indices.select_nth_unstable_by(need - 1, |a, b| cmp_fn(a, b));
                 indices[..need].sort_unstable_by(|a, b| cmp_fn(a, b));
             } else {
-                indices.sort_unstable_by(|a, b| cmp_fn(a, b));
+                indices.par_sort_unstable_by(|a, b| cmp_fn(a, b));
             }
 
             let old_rows = std::mem::take(&mut bindings.rows);
@@ -888,7 +908,26 @@ impl<'a> Executor<'a> {
                 self.hash_join(left_rs, right_rs)
             }
             ExecutionPlan::LeapfrogJoin { patterns } => {
-                self.execute_leapfrog_join(patterns)
+                if outer.is_empty() {
+                    self.execute_leapfrog_join(patterns)
+                } else {
+                    let applied: Vec<(TriplePattern, Vec<(String, u8)>)> = patterns.iter()
+                        .map(|(pat, vars)| {
+                            let mut bp = *pat;
+                            for (name, pos) in vars.iter() {
+                                if let Some(&val) = outer.get(name.as_str()) {
+                                    match pos { 0 => bp.s = val, 1 => bp.p = val, _ => bp.o = val }
+                                }
+                            }
+                            let remaining_vars: Vec<(String, u8)> = vars.iter()
+                                .filter(|(n, _)| !outer.contains_key(n.as_str()))
+                                .cloned()
+                                .collect();
+                            (bp, remaining_vars)
+                        })
+                        .collect();
+                    self.execute_leapfrog_join(&applied)
+                }
             }
             ExecutionPlan::Optional(main, opt) => {
                 let main_rs = self.execute_plan_with_ctx(main, outer);
@@ -907,9 +946,21 @@ impl<'a> Executor<'a> {
                 self.left_join(main_rs, opt_rs)
             }
             ExecutionPlan::Union(left, right) => {
-                let mut left_rs = self.execute_plan_with_ctx(left, outer);
+                // Parallel execution when outer is empty (top-level UNION).
+                // When outer is non-empty the closure would need to capture &outer
+                // which has an unnameable lifetime; fall back to sequential in that case.
+                let (mut left_rs, right_rs) = if outer.is_empty() {
+                    let empty: Binding = HashMap::new();
+                    rayon::join(
+                        || self.fork().execute_plan_with_ctx(left,  &empty),
+                        || self.fork().execute_plan_with_ctx(right, &empty),
+                    )
+                } else {
+                    let lr = self.execute_plan_with_ctx(left,  outer);
+                    let rr = self.execute_plan_with_ctx(right, outer);
+                    (lr, rr)
+                };
                 if left_rs.overflow { return left_rs; }
-                let right_rs = self.execute_plan_with_ctx(right, outer);
                 // Propagate overflow from right branch
                 let right_overflow = right_rs.overflow;
                 let right_vars = right_rs.variables.clone();
@@ -964,9 +1015,9 @@ impl<'a> Executor<'a> {
                 //
                 // Save and restore the outer pushdown_limit so the subquery's own
                 // execute_select (which resets pushdown_limit) doesn't clear ours.
-                let saved = self.pushdown_limit.get();
+                let saved = self.pushdown_limit.load(Ordering::Relaxed);
                 let result = self.execute_select(sq);
-                self.pushdown_limit.set(saved);
+                self.pushdown_limit.store(saved, Ordering::Relaxed);
                 result
             }
             ExecutionPlan::NamedGraph { graph, inner } => {
@@ -1201,110 +1252,98 @@ impl<'a> Executor<'a> {
     /// For each shared variable, we collect all the sorted value lists from
     /// each pattern that binds that variable, then intersect them with leapfrog.
     fn execute_leapfrog_join(&self, patterns: &[(TriplePattern, Vec<(String, u8)>)]) -> ResultSet {
-        // For the simplest case (common in bio queries): 2+ patterns sharing one variable.
-        // We collect all candidate values for each shared variable via leapfrog intersection,
-        // then enumerate consistent bindings.
-
-        // Step 1: collect all variable positions across all patterns
-        let mut var_positions: HashMap<String, Vec<(usize, u8)>> = HashMap::new();
-        for (pi, (_, vars)) in patterns.iter().enumerate() {
-            for (varname, pos) in vars {
-                var_positions.entry(varname.clone()).or_default().push((pi, *pos));
+        // Collect all variable names in order of first appearance across patterns.
+        let mut seen_vars: HashSet<String> = HashSet::new();
+        let mut all_vars: Vec<String> = Vec::new();
+        for (_, vars) in patterns {
+            for (name, _) in vars {
+                if seen_vars.insert(name.clone()) {
+                    all_vars.push(name.clone());
+                }
             }
         }
 
-        // Step 2: find shared variables (appear in 2+ patterns) → leapfrog intersect
-        let shared_vars: Vec<_> = var_positions.iter()
-            .filter(|(_, positions)| positions.len() >= 2)
-            .map(|(v, _)| v.clone())
+        if all_vars.is_empty() || patterns.is_empty() {
+            return ResultSet::empty(all_vars);
+        }
+
+        // Determine the processing order for variables using cardinality-aware ordering.
+        let var_order = lft_var_order(patterns, &all_vars, self.index);
+
+        let mut rs = ResultSet::empty(all_vars);
+        let mut binding: HashMap<String, TermId> = HashMap::new();
+        self.lft_enumerate(patterns, &var_order, 0, &mut binding, &mut rs);
+        rs
+    }
+
+    /// Recursive depth-first enumeration for Leapfrog Triejoin.
+    ///
+    /// At each depth we process one variable from `var_order`. For that variable
+    /// we collect all "eligible" patterns (those whose other free variables are
+    /// already bound) and run a leapfrog intersection over them.  If no pattern
+    /// is eligible yet (isolated variable), we fall back to a union of all
+    /// candidate values from any pattern that mentions the variable.
+    fn lft_enumerate(
+        &self,
+        patterns: &[(TriplePattern, Vec<(String, u8)>)],
+        var_order: &[String],
+        depth: usize,
+        binding: &mut HashMap<String, TermId>,
+        rs: &mut ResultSet,
+    ) {
+        if depth == var_order.len() {
+            let row: Vec<Option<TermId>> = rs.variables.iter()
+                .map(|v| binding.get(v.as_str()).copied())
+                .collect();
+            rs.rows.push(row);
+            return;
+        }
+
+        let var = &var_order[depth];
+
+        // Collect sorted iterators from patterns where `var` is present and all
+        // other free variables are already in `binding`.
+        let eligible_iters: Vec<SortedIter> = patterns.iter()
+            .filter(|(_, vars)| {
+                vars.iter().any(|(n, _)| n == var) &&
+                vars.iter().filter(|(n, _)| n != var).all(|(n, _)| binding.contains_key(n.as_str()))
+            })
+            .map(|(pat, vars)| {
+                let bound_pat = apply_binding_to_pat(pat, vars, binding);
+                let var_pos = vars.iter().find(|(n, _)| n == var).unwrap().1;
+                let vals: Vec<TermId> = self.index.scan(&bound_pat)
+                    .map(|t| match var_pos { 0 => t.s, 1 => t.p, _ => t.o })
+                    .collect();
+                SortedIter::new(vals)
+            })
             .collect();
 
-        // Step 3: For the first shared variable, leapfrog intersect candidate values
-        // (Full multi-variable leapfrog is complex; we handle 1 shared var here,
-        //  falling back to hash join for the rest)
-        if shared_vars.is_empty() || patterns.len() <= 1 {
-            // No sharing → fall back to hash join of individual scans
-            let scan_plans: Vec<ExecutionPlan> = patterns.iter()
-                .map(|(pat, vars)| ExecutionPlan::Scan { pattern: *pat, variables: vars.clone() })
-                .collect();
-            let mut result = self.execute_plan(&scan_plans[0]);
-            for plan in &scan_plans[1..] {
-                let right = self.execute_plan(plan);
-                result = self.hash_join(result, right);
-            }
-            return result;
-        }
-
-        let join_var = &shared_vars[0];
-        let positions = &var_positions[join_var];
-
-        // Collect candidate values from the first two patterns
-        let iters: Vec<SortedIter> = positions.iter().take(4).map(|(pi, pos)| {
-            let pat = &patterns[*pi].0;
-            let vals: Vec<TermId> = self.index.scan(pat)
-                .map(|t| match pos { 0 => t.s, 1 => t.p, _ => t.o })
-                .collect();
-            SortedIter::new(vals)
-        }).collect();
-
-        let candidate_values = leapfrog_join(iters);
-
-        // Step 4: for each candidate value, enumerate consistent bindings
-        let all_vars: Vec<String> = {
-            let mut seen = std::collections::HashSet::new();
-            let mut v = Vec::new();
-            for (_, vars) in patterns {
-                for (name, _) in vars {
-                    if seen.insert(name.clone()) {
-                        v.push(name.clone());
+        let candidates: Vec<TermId> = if eligible_iters.is_empty() {
+            // Variable has no fully-bound context yet — collect all values from
+            // any pattern that mentions it, deduplicated (no intersection).
+            let mut set: HashSet<TermId> = HashSet::new();
+            for (pat, vars) in patterns.iter() {
+                if let Some((_, var_pos)) = vars.iter().find(|(n, _)| n == var) {
+                    for t in self.index.scan(pat) {
+                        let val = match var_pos { 0 => t.s, 1 => t.p, _ => t.o };
+                        set.insert(val);
                     }
                 }
             }
-            v
+            set.into_iter().collect()
+        } else {
+            leapfrog_join(eligible_iters)
         };
 
-        let mut rs = ResultSet::empty(all_vars.clone());
-
-        for val in candidate_values {
-            // For each candidate, scan each pattern with the join variable bound
-            let mut partial: Vec<Binding> = vec![{
-                let mut b = HashMap::new();
-                b.insert(join_var.clone(), val);
-                b
-            }];
-
-            for (pat, vars) in patterns {
-                // Bind the join variable if it appears in this pattern
-                let bound_pat = bind_pattern_with_binding(pat, vars, join_var, val);
-                let scan_rs = self.execute_scan(&bound_pat, vars);
-
-                // Hash join partial with this scan
-                let scan_bindings: Vec<Binding> = scan_rs.rows.iter()
-                    .map(|row| row_to_binding(&scan_rs.variables, row))
-                    .collect();
-
-                let mut new_partial = Vec::new();
-                for pb in &partial {
-                    for sb in &scan_bindings {
-                        if let Some(merged) = merge_bindings(pb, sb) {
-                            new_partial.push(merged);
-                        }
-                    }
-                }
-                partial = new_partial;
-                if partial.is_empty() { break; }
-            }
-
-            // Convert bindings to rows
-            for b in partial {
-                let row: Vec<Option<TermId>> = all_vars.iter()
-                    .map(|v| b.get(v).copied())
-                    .collect();
-                rs.rows.push(row);
+        for val in candidates {
+            binding.insert(var.clone(), val);
+            self.lft_enumerate(patterns, var_order, depth + 1, binding, rs);
+            binding.remove(var.as_str());
+            if rs.rows.len() >= self.config.max_intermediate_rows {
+                rs.overflow = true;
+                return;
             }
         }
-
-        rs
     }
 
     fn execute_values(&self, vc: &ValuesClause) -> ResultSet {
@@ -1390,40 +1429,53 @@ impl<'a> Executor<'a> {
             hash.entry(key).or_default().push(rr.clone());
         }
 
-        // Probe with left side
+        // Precompute column index mappings so the parallel closure avoids &result borrow.
         let out_len = out_vars.len();
-        for lr in &left.rows {
-            let key: Vec<Option<TermId>> = shared.iter().map(|(li, _)| lr[*li]).collect();
-            if let Some(matches) = hash.get(&key) {
-                for rr in matches {
-                    let mut row = vec![None; out_len];
-                    // Fill from left
-                    for (li, lv) in left.variables.iter().enumerate() {
-                        if let Some(oi) = result.variable_index(lv) {
-                            row[oi] = lr[li];
-                        }
-                    }
-                    // Fill from right (non-overlapping)
-                    for (ri, rv) in right.variables.iter().enumerate() {
-                        if let Some(oi) = result.variable_index(rv) {
-                            if row[oi].is_none() {
-                                row[oi] = rr[ri];
+        let left_col_map: Vec<Option<usize>> = left.variables.iter()
+            .map(|lv| out_vars.iter().position(|v| v == lv))
+            .collect();
+        let right_col_map: Vec<Option<usize>> = right.variables.iter()
+            .map(|rv| out_vars.iter().position(|v| v == rv))
+            .collect();
+        // For right side, track which columns are not already supplied by left.
+        let right_new_cols: Vec<(usize, usize)> = right.variables.iter().enumerate()
+            .filter(|(_, rv)| !left.variables.contains(rv))
+            .filter_map(|(ri, rv)| out_vars.iter().position(|v| v == rv).map(|oi| (ri, oi)))
+            .collect();
+
+        // Probe phase: parallel over left rows (hash is immutable → &hash is Sync).
+        let mut new_rows: Vec<Vec<Option<TermId>>> = left.rows.par_iter()
+            .flat_map(|lr| {
+                let key: Vec<Option<TermId>> = shared.iter().map(|(li, _)| lr[*li]).collect();
+                match hash.get(&key) {
+                    None => vec![],
+                    Some(matches) => matches.iter()
+                        .map(|rr| {
+                            let mut row = vec![None; out_len];
+                            for (li, oi_opt) in left_col_map.iter().enumerate() {
+                                if let Some(oi) = oi_opt {
+                                    row[*oi] = lr[li];
+                                }
                             }
-                        }
-                    }
-                    result.rows.push(row);
-                    if result.rows.len() >= self.config.max_intermediate_rows {
-                        tracing::warn!(
-                            rows = result.rows.len(),
-                            "hash_join: intermediate result exceeded limit, truncating"
-                        );
-                        result.overflow = true;
-                        return result;
-                    }
+                            for &(ri, oi) in &right_new_cols {
+                                if row[oi].is_none() {
+                                    row[oi] = rr[ri];
+                                }
+                            }
+                            row
+                        })
+                        .collect::<Vec<_>>(),
                 }
-            }
+            })
+            .collect();
+
+        // Overflow: truncate after parallel collect (no early-exit in par_iter).
+        let overflow = new_rows.len() >= self.config.max_intermediate_rows;
+        if overflow {
+            tracing::warn!(rows = new_rows.len(), "hash_join: intermediate result exceeded limit, truncating");
+            new_rows.truncate(self.config.max_intermediate_rows);
         }
-        result
+        ResultSet { variables: out_vars, rows: new_rows, overflow }
     }
 
     /// LEFT OUTER JOIN for OPTIONAL patterns.
@@ -1545,7 +1597,9 @@ impl<'a> Executor<'a> {
         outer: &Binding,
     ) -> Option<ResultSet> {
         // Conditions: pushdown active, one needed left var, right is a join ScanBound.
-        let push_limit = self.pushdown_limit.get()?;
+        let raw = self.pushdown_limit.load(Ordering::Relaxed);
+        if raw == usize::MAX { return None; }
+        let push_limit = raw;
 
         // Must have exactly one needed variable (the subject key).
         if needed.len() != 1 { return None; }
@@ -1912,7 +1966,10 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
-        } else if let Some(push_limit) = self.pushdown_limit.get().filter(|&lim| {
+        } else if let Some(push_limit) = {
+            let _v = self.pushdown_limit.load(Ordering::Relaxed);
+            if _v == usize::MAX { None } else { Some(_v) }
+        }.filter(|&lim| {
             // Use PSO early-termination when:
             //   1. LIMIT pushdown is active
             //   2. PSO index is available
@@ -2002,8 +2059,10 @@ impl<'a> Executor<'a> {
         // For 1:1 joins (G-6 dct:identifier, fanout=1):
         //   expansion_limit = 200 × 1 = 200 → same behaviour as before ✓
         let max_fanout = s_to_objects.values().map(|v| v.len()).max().unwrap_or(1).max(1);
-        let expansion_limit: Option<usize> = self.pushdown_limit.get()
-            .map(|lim| lim.saturating_mul(max_fanout));
+        let expansion_limit: Option<usize> = {
+            let _v = self.pushdown_limit.load(Ordering::Relaxed);
+            if _v == usize::MAX { None } else { Some(_v) }
+        }.map(|lim| lim.saturating_mul(max_fanout));
 
         tracing::debug!(
             max_fanout,
@@ -5341,6 +5400,49 @@ fn optimize_triple_patterns(
         ordered.push(best);
     }
 
+    // ── Leapfrog Triejoin path ─────────────────────────────────────────────────
+    // Emit LeapfrogJoin when 2+ patterns share at least one variable.
+    // LFT handles multi-variable intersection more efficiently than a
+    // left-deep hash-join tree by intersecting all shared variables
+    // simultaneously depth-first.
+    {
+        let mut var_pat_count: HashMap<&str, usize> = HashMap::new();
+        for pat in &ordered {
+            for term in [&pat.s, &pat.p, &pat.o] {
+                if let Term::Variable(v) | Term::BlankNode(v) = term {
+                    *var_pat_count.entry(v.as_str()).or_default() += 1;
+                }
+            }
+        }
+        let any_shared = var_pat_count.values().any(|&c| c >= 2);
+
+        if ordered.len() >= 2 && any_shared {
+            let mut lft_ok = true;
+            let mut lft_patterns: Vec<(TriplePattern, Vec<(String, u8)>)> = Vec::new();
+            for pat in &ordered {
+                match pattern_to_scan_plan(pat, dict, &HashSet::new()) {
+                    ExecutionPlan::Scan { pattern, variables } => {
+                        lft_patterns.push((pattern, variables));
+                    }
+                    ExecutionPlan::ScanBound { base, free_vars, outer_vars } => {
+                        let mut all_vars = free_vars;
+                        all_vars.extend(outer_vars);
+                        lft_patterns.push((base, all_vars));
+                    }
+                    _ => { lft_ok = false; break; }
+                }
+            }
+            if lft_ok {
+                tracing::debug!(
+                    patterns = lft_patterns.len(),
+                    "optimize_triple_patterns: emitting LeapfrogJoin"
+                );
+                return ExecutionPlan::LeapfrogJoin { patterns: lft_patterns };
+            }
+        }
+    }
+    // ── end Leapfrog path ──────────────────────────────────────────────────────
+
     // ── Phase 2: Build a left-deep plan tree with pre-encoded scan nodes ──────
     //
     // Re-derive `current_bound` from `initially_bound`, growing it pattern by
@@ -5662,6 +5764,74 @@ fn bind_pattern_with_binding(
         }
     }
     p
+}
+
+/// Apply a `binding` map to a `TriplePattern`, substituting bound variable
+/// positions with their TermId values.  Used by `lft_enumerate`.
+fn apply_binding_to_pat(
+    pat: &TriplePattern,
+    vars: &[(String, u8)],
+    binding: &HashMap<String, TermId>,
+) -> TriplePattern {
+    let mut p = *pat;
+    for (name, pos) in vars {
+        if let Some(&val) = binding.get(name.as_str()) {
+            match pos {
+                0 => p.s = val,
+                1 => p.p = val,
+                _ => p.o = val,
+            }
+        }
+    }
+    p
+}
+
+/// Determine the processing order of variables for Leapfrog Triejoin.
+///
+/// Greedy strategy: at each step pick the "eligible" variable with the smallest
+/// estimated cardinality.  A variable is eligible when at least one pattern that
+/// contains it has all of its *other* free variables already in `bound`.
+/// When no variable is eligible (e.g. the first step or disconnected components),
+/// the global minimum is chosen instead.
+fn lft_var_order(
+    patterns: &[(TriplePattern, Vec<(String, u8)>)],
+    all_vars: &[String],
+    index: &TripleIndex,
+) -> Vec<String> {
+    let mut bound: HashSet<String> = HashSet::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut remaining: Vec<String> = all_vars.to_vec();
+
+    while !remaining.is_empty() {
+        let eligible: Vec<String> = remaining.iter()
+            .filter(|var| {
+                patterns.iter().any(|(_, vars)| {
+                    vars.iter().any(|(n, _)| n == *var) &&
+                    vars.iter().filter(|(n, _)| n != *var).all(|(n, _)| bound.contains(n.as_str()))
+                })
+            })
+            .cloned()
+            .collect();
+
+        let pool: &[String] = if eligible.is_empty() { &remaining } else { &eligible };
+
+        let next_var = pool.iter()
+            .min_by_key(|var| {
+                patterns.iter()
+                    .filter(|(_, vars)| vars.iter().any(|(n, _)| n == *var))
+                    .map(|(pat, _)| index.estimate(pat))
+                    .min()
+                    .unwrap_or(u64::MAX)
+            })
+            .unwrap()
+            .clone();
+
+        remaining.retain(|v| v != &next_var);
+        bound.insert(next_var.clone());
+        order.push(next_var);
+    }
+
+    order
 }
 
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day).
