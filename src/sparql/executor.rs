@@ -327,6 +327,7 @@ impl<'a> Executor<'a> {
             return fast_result;
         }
 
+<<<<<<< HEAD
         if let Some(fast_result) = self.try_count_star_cross_product(query, &plan) {
             return fast_result;
         }
@@ -361,6 +362,8 @@ impl<'a> Executor<'a> {
         }
         // ── end cross-product guard ────────────────────────────────────────────
 
+=======
+>>>>>>> 583087b0f936c7c64e6a487eb4dfd6a098398d26
         // 2. Execute
         let t_bgp = Instant::now();
         let mut bindings = self.execute_plan(&plan);
@@ -2403,6 +2406,7 @@ impl<'a> Executor<'a> {
         Some(result)
     }
 
+<<<<<<< HEAD
     /// Fast path for cross-product COUNT(*).
     ///
     /// Detects: SELECT (COUNT(*) AS ?alias) WHERE { pure cross-product of independent scans }
@@ -2491,6 +2495,8 @@ impl<'a> Executor<'a> {
         Some(result)
     }
 
+=======
+>>>>>>> 583087b0f936c7c64e6a487eb4dfd6a098398d26
     /// Merge-scan join for PathPattern when the full path is in path_cache.
     ///
     /// Instead of N binary searches (one per left row) — each causing TLB/page-cache
@@ -2554,6 +2560,17 @@ impl<'a> Executor<'a> {
                 },
             };
 
+<<<<<<< HEAD
+=======
+        // Build src_id → list of left-row indices (O(N_left)).
+        let mut src_to_rows: HashMap<TermId, Vec<usize>> = HashMap::new();
+        for (row_idx, row) in left.rows.iter().enumerate() {
+            if let Some(Some(sid)) = row.get(s_col) {
+                src_to_rows.entry(*sid).or_default().push(row_idx);
+            }
+        }
+
+>>>>>>> 583087b0f936c7c64e6a487eb4dfd6a098398d26
         // Output variable list: left vars + new path_o var (if free).
         let mut out_vars: Vec<String> = left.variables.clone();
         if let Some(ref ov) = o_var_name {
@@ -2565,6 +2582,7 @@ impl<'a> Executor<'a> {
         let out_s_col = result.variable_index(&s_var_name);
         let out_o_col = o_var_name.as_deref().and_then(|ov| result.variable_index(ov));
 
+<<<<<<< HEAD
         // Adaptive join strategy:
         //   N_left small (< 100K): binary search per unique source value
         //     Cost: O(N_unique × log M + total_matches) – avoids full cache scan
@@ -2654,6 +2672,34 @@ impl<'a> Executor<'a> {
                     }
                     if self.is_limit_reached(result.rows.len()) { return result; }
                 }
+=======
+        // Single sequential scan through all cached pairs (O(M_cache)).
+        for &(src, dst) in cached.iter() {
+            if let Some(oid) = o_filter { if dst != oid { continue; } }
+            let row_indices = match src_to_rows.get(&src) {
+                Some(r) => r,
+                None => continue,
+            };
+            for &row_idx in row_indices {
+                let left_row = &left.rows[row_idx];
+                if let Some(o_lc) = o_left_col {
+                    if left_row.get(o_lc).copied().flatten() != Some(dst) { continue; }
+                }
+                let mut row = vec![None; result.variables.len()];
+                for (li, lv) in left.variables.iter().enumerate() {
+                    if let Some(oi) = result.variable_index(lv) {
+                        row[oi] = left_row.get(li).copied().flatten();
+                    }
+                }
+                if let Some(sc) = out_s_col { row[sc] = Some(src); }
+                if let Some(oc) = out_o_col { row[oc] = Some(dst); }
+                result.rows.push(row);
+                if result.rows.len() >= self.config.max_intermediate_rows {
+                    result.overflow = true;
+                    return result;
+                }
+                if self.is_limit_reached(result.rows.len()) { return result; }
+>>>>>>> 583087b0f936c7c64e6a487eb4dfd6a098398d26
             }
         }
 
@@ -2662,7 +2708,10 @@ impl<'a> Executor<'a> {
             cached_pairs = cached.len(),
             out_rows = result.rows.len(),
             elapsed_us = t0.elapsed().as_micros(),
+<<<<<<< HEAD
             strategy = if left.rows.len() < BINARY_SEARCH_THRESHOLD { "binary_search" } else { "linear_scan" },
+=======
+>>>>>>> 583087b0f936c7c64e6a487eb4dfd6a098398d26
             "path_cache_merge_join done"
         );
         result
@@ -5576,6 +5625,7 @@ fn rewrite_having_agg(expr: Expression, aliases: &[(Expression, String)]) -> Exp
             Box::new(rewrite_having_agg(*a, aliases)),
             Box::new(rewrite_having_agg(*b, aliases)),
         ),
+<<<<<<< HEAD
         Expression::In(expr, list) => Expression::In(
             Box::new(rewrite_having_agg(*expr, aliases)),
             list.into_iter().map(|e| rewrite_having_agg(e, aliases)).collect(),
@@ -5584,6 +5634,8 @@ fn rewrite_having_agg(expr: Expression, aliases: &[(Expression, String)]) -> Exp
             Box::new(rewrite_having_agg(*expr, aliases)),
             list.into_iter().map(|e| rewrite_having_agg(e, aliases)).collect(),
         ),
+=======
+>>>>>>> 583087b0f936c7c64e6a487eb4dfd6a098398d26
         other => other,
     }
 }
