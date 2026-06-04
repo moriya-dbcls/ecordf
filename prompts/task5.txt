@@ -1,4 +1,4 @@
-# タスク5: クエリエンジン最適化 (優先度①②)
+# タスク5: single-scan COUNT(*) 高速化
 
 ## 作業ディレクトリ
 /home/moriya/tmp/ecordf
@@ -7,37 +7,58 @@
 src/sparql/executor.rs
 
 ## 背景
-ベンチマーク結果から以下の問題が判明している:
-- G-1/F-2 類: 共有変数なしのクロス積クエリが 100M 行で打ち切られ **5分以上かかった上に誤答を返す**
-- ORDER BY + LIMIT クエリ: bgp_rows=12M でも全件ソートしており post_us=15-18s
+A-2 `SELECT (COUNT(*) AS ?count) WHERE { ?pe a jpost:PeptideEvidence }` が 1.6s かかっている。
+これは 8.6M 行をスキャンして数えているが、`index.estimate(pattern)` が
+p+o bound パターンで正確な件数を O(log N) バイナリサーチで返せる。
 
----
+`src/index.rs` の `estimate_cardinality()`:
+```rust
+let (start, end) = self.range_for_pattern(&raw_pat);
+if raw_pat[2].is_some() {
+    ((end - start) as u64).saturating_add(1) / 2   // 3rd position bound → 50% heuristic
+} else {
+    (end - start) as u64   // ← p+o bound (POS) や s+p bound (SPO) → 正確な値
+}
+```
 
-## 変更 1: クロス積の早期検出と正確な COUNT(*) 計算
+POS インデックスで `p=rdf:type, o=PeptideEvidence_id` の場合:
+raw_pat = [p_id, o_id, None] → `raw_pat[2].is_none()` → `(end-start)` = 正確な件数 ✓
 
-### 1-a. try_count_star_cross_product を追加
+## 変更内容
 
-`try_count_distinct_cross_product` の近く（2262行付近）に新しいメソッドを追加する。
+### try_count_star_single_scan を追加
 
-**目的**: `SELECT (COUNT(*) AS ?n) WHERE { ?a rdf:type X . ?b rdf:type Y . ?c rdf:type Z . }` のような
-共有変数なし（クロス積）の COUNT(*) クエリを、実際にクロス積を実体化せず
-各スキャンの行数の **積** として計算する。
+`try_count_star_cross_product` の近くに以下のメソッドを追加する:
 
 ```rust
-/// Fast path for cross-product COUNT(*).
+/// Fast path for `SELECT (COUNT(*) AS ?alias) WHERE { single_triple_pattern }`.
 ///
-/// Detects: SELECT (COUNT(*) AS ?alias) WHERE { pure cross-product of independent scans }
-/// Computes: N1 × N2 × ... × Nk  without materialising the cross-product.
-fn try_count_star_cross_product(
+/// When the plan is a single `Scan` (no joins, no filters) and the projection
+/// is exactly one COUNT(*) alias, compute the count via `index.estimate()`
+/// — an O(log N) binary-search range count — instead of materialising and
+/// counting all matching rows.
+///
+/// `index.estimate()` → `estimate_cardinality()` returns the **exact** row
+/// count when the tertiary (third) index column is unbound (i.e. at most two
+/// positions are bound).  This covers the common patterns:
+///   p + o  bound (POS)  →  `?s a SomeClass`        exact
+///   s + p  bound (SPO)  →  `?x pred:functional ?y` exact (functional pred)
+///   p only bound (POS)  →  `?s pred:any ?o`        exact
+///
+/// Only the 50% heuristic case (all three positions bound, direct lookup)
+/// is approximate, but COUNT(*) of a fully-specified triple is 0 or 1 and
+/// the heuristic doesn't matter there.
+fn try_count_star_single_scan(
     &self,
     query: &SelectQuery,
     plan: &ExecutionPlan,
 ) -> Option<ResultSet> {
-    if !query.group_by.is_empty() || !query.having.is_empty()
-        || query.distinct || query.offset.is_some() {
+    // Guard: no GROUP BY, HAVING, DISTINCT.
+    if !query.group_by.is_empty() || !query.having.is_empty() || query.distinct {
         return None;
     }
 
+    // Projection must be exactly one COUNT(*) alias (no inner expr, not DISTINCT).
     let alias_name = if let Projection::Variables(items) = &query.projection {
         if items.len() != 1 { return None; }
         match &items[0] {
@@ -47,23 +68,25 @@ fn try_count_star_cross_product(
             ) => name.clone(),
             _ => return None,
         }
-    } else { return None; };
+    } else {
+        return None;
+    };
 
-    let mut leaves: Vec<&ExecutionPlan> = Vec::new();
-    if !collect_cross_product_leaves(plan, &mut leaves) { return None; }
-    if leaves.len() < 2 { return None; }
+    // Plan must be a single Scan (no joins, no filters, no path patterns).
+    let pattern = match plan {
+        ExecutionPlan::Scan { pattern, .. } => pattern,
+        _ => return None,
+    };
 
-    let mut product: u128 = 1;
-    for leaf in &leaves {
-        let ExecutionPlan::Scan { pattern, .. } = leaf else { return None; };
-        let n = self.index.estimate(pattern) as u128;
-        if n == 0 { product = 0; break; }
-        product = product.saturating_mul(n);
-    }
+    // Count via index binary search — exact for ≤ 2 bound positions.
+    let n = self.index.estimate(pattern);
 
-    tracing::debug!(product, leaves = leaves.len(), "cross-product COUNT(*): computed analytically");
+    tracing::debug!(n, "single-scan COUNT(*): computed via index.estimate");
 
-    let n_str = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", product);
+    let n_str = format!(
+        "\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+        n
+    );
     let n_id = self.dict.encode(&n_str);
     let mut result = ResultSet::empty(vec![alias_name]);
     result.rows.push(vec![Some(n_id)]);
@@ -71,135 +94,30 @@ fn try_count_star_cross_product(
 }
 ```
 
-### 1-b. execute_select でクロス積を早期検出してエラー返却
+### execute_select での呼び出し追加
 
-`execute_select` の `try_count_distinct_cross_product` の呼び出し（326行付近）の **直後** に以下を追加する:
+`try_count_star_cross_product` の呼び出し（`try_count_distinct_cross_product` の後）の
+**直後** に追加する:
 
 ```rust
-        if let Some(fast_result) = self.try_count_star_cross_product(query, &plan) {
+        if let Some(fast_result) = self.try_count_star_single_scan(query, &plan) {
             return fast_result;
         }
-
-        // ── Cross-product guard ────────────────────────────────────────────────
-        // Pure cross-product with no useful LIMIT → abort rather than scanning 100M+ rows.
-        // With LIMIT the cross-product is bounded and may be intentional.
-        {
-            let mut cp_leaves: Vec<&ExecutionPlan> = Vec::new();
-            let is_cross_product = collect_cross_product_leaves(&plan, &mut cp_leaves)
-                && cp_leaves.len() >= 2;
-            let limit_val = query.limit.unwrap_or(u64::MAX) as usize;
-            if is_cross_product && limit_val > self.config.max_intermediate_rows {
-                let out_vars = if let Projection::Variables(items) = &query.projection {
-                    items.iter().map(|i| match i {
-                        SelectItem::Variable(v) => v.clone(),
-                        SelectItem::Alias(_, n) => n.clone(),
-                    }).collect()
-                } else { vec![] };
-                let mut result = ResultSet::empty(out_vars);
-                result.overflow = true;
-                tracing::warn!(
-                    leaves = cp_leaves.len(),
-                    "cross-product query without LIMIT — aborting to prevent OOM"
-                );
-                return result;
-            }
-        }
-        // ── end cross-product guard ────────────────────────────────────────────
 ```
 
----
-
-## 変更 2: ORDER BY キー事前計算 + Top-N 部分ソート
-
-### 目的
-- **常に有効**: 現在 `sort_by` 内で `eval_order_key` が O(M log M) 回呼ばれる。キーを事前計算すれば O(M) 回で済む。
-- **LIMIT がある場合**: M >> N（例: M=12M, N=100）なら `select_nth_unstable_by` で O(M) にパーティション後、先頭 N 件のみ O(N log N) でソートする。
-
-### execute_select の ORDER BY ブロック（400行付近）を置き換える
-
-`compare_order_keys` の現在のシグネチャを確認して適切に使用すること。
-コンパイルエラーが出た場合は適宜修正する。
-
-**現在の OLD_STRING（grep で確認してから置き換えること）:**
-```rust
-        // 5. Apply ORDER BY
-        if !query.order_by.is_empty() {
-            let t = Instant::now();
-            let vars = bindings.variables.clone();
-            let order = query.order_by.clone();
-            bindings.rows.sort_by(|a, b| {
+呼び出し順は以下になるはず:
 ```
-
-**変更後の NEW_STRING（全体）:**
-```rust
-        // 5. Apply ORDER BY
-        if !query.order_by.is_empty() {
-            let t = Instant::now();
-            let vars = bindings.variables.clone();
-            let order = query.order_by.clone();
-            let m = bindings.rows.len();
-
-            // Pre-compute sort keys once per row (avoids O(M log M) eval_order_key calls).
-            let keys: Vec<Vec<String>> = bindings.rows.iter().map(|row| {
-                let b = row_to_binding(&vars, row);
-                order.iter().map(|cond| self.eval_order_key(&cond.expr, &b)).collect()
-            }).collect();
-
-            let cmp_fn = |ai: &usize, bi: &usize| -> std::cmp::Ordering {
-                for (ki, cond) in order.iter().enumerate() {
-                    let va = keys[*ai].get(ki).map(|s| s.as_str()).unwrap_or("");
-                    let vb = keys[*bi].get(ki).map(|s| s.as_str()).unwrap_or("");
-                    let c = compare_order_keys(va, vb);
-                    let c = if cond.direction == OrderDirection::Desc { c.reverse() } else { c };
-                    if c != std::cmp::Ordering::Equal { return c; }
-                }
-                std::cmp::Ordering::Equal
-            };
-
-            // Number of rows we actually need (LIMIT + OFFSET, capped at M).
-            let need = query.limit
-                .map(|lim| {
-                    (lim as usize)
-                        .saturating_add(query.offset.unwrap_or(0) as usize)
-                        .min(m)
-                })
-                .unwrap_or(m);
-
-            let mut indices: Vec<usize> = (0..m).collect();
-
-            // Partial sort when need << M (at most 1/4 of rows needed).
-            let partial = need > 0 && need < m / 4;
-            if partial {
-                indices.select_nth_unstable_by(need - 1, |a, b| cmp_fn(a, b));
-                indices[..need].sort_unstable_by(|a, b| cmp_fn(a, b));
-            } else {
-                indices.sort_unstable_by(|a, b| cmp_fn(a, b));
-            }
-
-            let old_rows = std::mem::take(&mut bindings.rows);
-            let take = if partial { need } else { m };
-            bindings.rows = indices[..take].iter().map(|&i| old_rows[i].clone()).collect();
-
-            tracing::debug!(
-                orderby_us = t.elapsed().as_micros(),
-                rows_in = m,
-                rows_out = bindings.rows.len(),
-                partial_sort = partial,
-                "ORDER BY"
-            );
-        }
+try_count_distinct_cross_product  ← 既存
+try_count_star_cross_product      ← 前回追加
+try_count_star_single_scan        ← 今回追加  ← ここに挿入
 ```
-
-既存の `bindings.rows.sort_by(...)` から `tracing::debug!(orderby_us...` までの全ブロックを上記に置き換えること。
-
----
 
 ## ビルドと確認
 
 ```bash
 cd /home/moriya/tmp/ecordf
-cargo build --release 2>&1 | tail -30
-cargo test 2>&1 | tail -20
+cargo build --release 2>&1 | tail -20
+cargo test 2>&1 | tail -10
 ```
 
 ## やらないこと
@@ -210,10 +128,8 @@ cargo test 2>&1 | tail -20
 ## 報告先
 report/task5.md に追記:
 ```
-## クロス積早期検出 + TOP-N ソート (2026-06-04)
-- 変更: try_count_star_cross_product 追加
-- 変更: クロス積ガード追加（overflow=true で即返却）
-- 変更: ORDER BY キー事前計算 + partial sort (select_nth_unstable_by)
+## single-scan COUNT(*) 高速化 (2026-06-04)
+- 変更: try_count_star_single_scan 追加（単一スキャン COUNT(*) を index.estimate で計算）
 - ビルド: 成功/失敗
 - テスト: 成功/失敗
 ```

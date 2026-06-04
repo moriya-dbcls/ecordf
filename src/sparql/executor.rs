@@ -331,6 +331,10 @@ impl<'a> Executor<'a> {
             return fast_result;
         }
 
+        if let Some(fast_result) = self.try_count_star_single_scan(query, &plan) {
+            return fast_result;
+        }
+
         // ── Cross-product guard ────────────────────────────────────────────────
         // Pure cross-product with no useful LIMIT → abort rather than scanning 100M+ rows.
         // With LIMIT the cross-product is bounded and may be intentional.
@@ -2422,6 +2426,48 @@ impl<'a> Executor<'a> {
         tracing::debug!(product, leaves = leaves.len(), "cross-product COUNT(*): computed analytically");
 
         let n_str = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", product);
+        let n_id = self.dict.encode(&n_str);
+        let mut result = ResultSet::empty(vec![alias_name]);
+        result.rows.push(vec![Some(n_id)]);
+        Some(result)
+    }
+
+    /// Fast path for `SELECT (COUNT(*) AS ?alias) WHERE { single_triple_pattern }`.
+    ///
+    /// When the plan is a single `Scan` (no joins, no filters) and the projection
+    /// is exactly one COUNT(*) alias, compute the count via `index.estimate()`
+    /// — an O(log N) binary-search range count — instead of materialising and
+    /// counting all matching rows.
+    fn try_count_star_single_scan(
+        &self,
+        query: &SelectQuery,
+        plan: &ExecutionPlan,
+    ) -> Option<ResultSet> {
+        if !query.group_by.is_empty() || !query.having.is_empty()
+            || query.distinct || query.offset.is_some() {
+            return None;
+        }
+
+        let alias_name = if let Projection::Variables(items) = &query.projection {
+            if items.len() != 1 { return None; }
+            match &items[0] {
+                SelectItem::Alias(
+                    Expression::Count { distinct: false, expr: None },
+                    name,
+                ) => name.clone(),
+                _ => return None,
+            }
+        } else { return None; };
+
+        let pattern = match plan {
+            ExecutionPlan::Scan { pattern, .. } => pattern,
+            _ => return None,
+        };
+
+        let n = self.index.estimate(pattern);
+        tracing::debug!(n, "single-scan COUNT(*): computed via index.estimate");
+
+        let n_str = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n);
         let n_id = self.dict.encode(&n_str);
         let mut result = ResultSet::empty(vec![alias_name]);
         result.rows.push(vec![Some(n_id)]);

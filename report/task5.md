@@ -43,3 +43,8 @@ cargo test --lib       → test result: ok. 27 passed; 0 failed
 - 変更: ORDER BY キー事前計算 + partial sort (select_nth_unstable_by)
 - ビルド: 成功
 - テスト: 成功 (27 passed; 0 failed)
+
+## single-scan COUNT(*) 高速化 (2026-06-04)
+- 変更: try_count_star_single_scan 追加（単一スキャン COUNT(*) を index.estimate で計算）
+- ビルド: 成功
+- テスト: 成功
