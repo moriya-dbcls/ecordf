@@ -225,6 +225,25 @@ enum Command {
         force: bool,
     },
 
+    /// Re-encode column files with Zstd block compression (ECOCOL04).
+    ///
+    /// Reads existing .c0.dz / .c1.dz / .c2.dz files, applies Zstd compression,
+    /// and writes .c0.zst / .c1.zst / .c2.zst.  The original .dz files are kept
+    /// as fallback; delete them manually once the .zst files are verified.
+    ///
+    ///   ecordf recompress-zstd --dir ./store
+    ///   ecordf recompress-zstd --dir ./store --ordering spo   # only one ordering
+    #[clap(name = "recompress-zstd")]
+    RecompressZstd {
+        /// Store directory containing the index files.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Only recompress this ordering (spo/pos/osp/pso/sop/ops).
+        /// Default: recompress all orderings present in the store.
+        #[arg(long)]
+        ordering: Option<String>,
+    },
+
     /// Execute a SPARQL query from command line
     Query {
         /// Store directory
@@ -707,6 +726,52 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("Compressing column files in {:?}...", dir);
             let n = ecordf::index::TripleIndex::compress_columns(&dir, force)?;
             eprintln!("Done: {} column file(s) compressed.", n);
+        }
+
+        Command::RecompressZstd { dir, ordering } => {
+            let orderings: Vec<&str> = match ordering.as_deref() {
+                Some(o) => vec![o],
+                None    => vec!["spo", "pos", "osp", "pso", "sop", "ops"],
+            };
+            let mut total_before = 0u64;
+            let mut total_after  = 0u64;
+            for ord in &orderings {
+                let base = dir.join(format!("{}.bin", ord));
+                let cpaths = ecordf::index::col_paths(&base);
+                let dz0 = ecordf::col_delta::delta_path(&cpaths[0]);
+                let dz1 = ecordf::col_delta::delta_path(&cpaths[1]);
+                let dz2 = ecordf::col_delta::delta_path(&cpaths[2]);
+                if !dz0.exists() || !dz1.exists() || !dz2.exists() {
+                    eprintln!("{}: no .dz files found, skipping", ord);
+                    continue;
+                }
+                for (dz_path, c_path) in [&dz0, &dz1, &dz2].iter().zip([&cpaths[0], &cpaths[1], &cpaths[2]].iter()) {
+                    let zst_path = ecordf::col_delta::zstd_path(c_path);
+                    if zst_path.exists() {
+                        eprintln!("{}: already exists, skipping", zst_path.display());
+                        continue;
+                    }
+                    let before = std::fs::metadata(dz_path)?.len();
+                    eprintln!("  recompressing {} ({} MB) ...", dz_path.display(), before / 1024 / 1024);
+                    let t0 = std::time::Instant::now();
+                    let col = ecordf::col_delta::DeltaColFile::open(dz_path)?;
+                    let values: Vec<u64> = col.iter_from(0).collect();
+                    drop(col);
+                    ecordf::col_delta::encode_column_zstd(&values, &zst_path)?;
+                    let after = std::fs::metadata(&zst_path)?.len();
+                    total_before += before;
+                    total_after  += after;
+                    eprintln!("    {} MB -> {} MB ({:.1}×) in {:.1}s",
+                        before / 1024 / 1024, after / 1024 / 1024,
+                        before as f64 / after as f64,
+                        t0.elapsed().as_secs_f64());
+                }
+            }
+            if total_before > 0 {
+                eprintln!("Total: {} MB -> {} MB ({:.1}×)",
+                    total_before / 1024 / 1024, total_after / 1024 / 1024,
+                    total_before as f64 / total_after as f64);
+            }
         }
     }
 
