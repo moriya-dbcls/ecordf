@@ -3041,6 +3041,220 @@ impl<'a> Executor<'a> {
             groups.entry(key).or_default().push(row.clone());
         }
 
+        let can_stream = col_kinds.iter().all(|k| !matches!(k, ColKind::Complex));
+
+        // Sort-then-stream is optimal when there are no CountDistinct columns:
+        // the Vec<key> allocation (O(N) mallocs) dominates and sort removes it.
+        // When CountDistinct is present the HashSet operations dominate (~667 ns/insert)
+        // and the sort overhead (~4 s for 5.3 M elements) outweighs any key savings.
+        let has_distinct = col_kinds.iter().any(|k| matches!(k, ColKind::CountDistinct(_)));
+
+        if can_stream && !has_distinct {
+            // ── Fast path A: sort-then-stream (no CountDistinct) ───────────────
+            // New approach:
+            // 1. Extract all GROUP BY keys into one flat array (single allocation).
+            // 2. Sort row indices by key slice — O(N) when input is already ordered
+            //    by the GROUP BY variable (common when the outer-loop variable is
+            //    the GROUP BY key, e.g. D-1 where ?dataset drives the first scan).
+            // 3. Single sequential pass emitting each group when the key changes.
+            //    No HashMap, no per-row allocation, one HashSet active at a time.
+            enum Acc { Count(usize), Distinct(HashSet<TermId>) }
+
+            let key_width = gb_col_indices.len();
+
+            // One flat Vec<Option<TermId>> for all row keys (key_width entries per row).
+            let flat_keys: Vec<Option<TermId>> = rs.rows.iter().flat_map(|row| {
+                gb_col_indices.iter().map(move |&ci| {
+                    ci.and_then(|i| row.get(i).copied().flatten())
+                })
+            }).collect();
+
+            let mut indices: Vec<usize> = (0..rs.rows.len()).collect();
+            indices.sort_unstable_by(|&a, &b| {
+                let ka = &flat_keys[a * key_width .. (a + 1) * key_width];
+                let kb = &flat_keys[b * key_width .. (b + 1) * key_width];
+                ka.cmp(kb)
+            });
+
+            let make_accs = || col_kinds.iter().filter_map(|k| match k {
+                ColKind::CountStar | ColKind::Count(_) => Some(Acc::Count(0)),
+                ColKind::CountDistinct(_) => Some(Acc::Distinct(HashSet::new())),
+                ColKind::GbKey(_) | ColKind::Complex => None,
+            }).collect::<Vec<Acc>>();
+
+            let out_len = out_vars.len();
+            let mut result = ResultSet::empty(out_vars);
+            result.overflow = rs.overflow;
+
+            if indices.is_empty() { return result; }
+
+            let mut group_start = indices[0];
+            let mut accs = make_accs();
+
+            // Inline emit: build output row from current group's key + accs.
+            macro_rules! emit_group {
+                ($key_row:expr, $accs:expr) => {{
+                    let key = &flat_keys[$key_row * key_width .. ($key_row + 1) * key_width];
+                    let mut out_row = vec![None; out_len];
+                    let mut acc_idx = 0;
+                    for (out_i, kind) in col_kinds.iter().enumerate() {
+                        out_row[out_i] = match kind {
+                            ColKind::GbKey(ki) => key.get(*ki).copied().flatten(),
+                            ColKind::CountStar | ColKind::Count(_) => {
+                                let n = if let Acc::Count(c) = &$accs[acc_idx] { *c } else { 0 };
+                                acc_idx += 1;
+                                let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n);
+                                Some(self.dict.encode(&s))
+                            }
+                            ColKind::CountDistinct(_) => {
+                                let n = if let Acc::Distinct(set) = &$accs[acc_idx] { set.len() } else { 0 };
+                                acc_idx += 1;
+                                let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n);
+                                Some(self.dict.encode(&s))
+                            }
+                            ColKind::Complex => None,
+                        };
+                    }
+                    result.rows.push(out_row);
+                }};
+            }
+
+            for &row_idx in &indices {
+                let cur  = &flat_keys[row_idx   * key_width .. (row_idx   + 1) * key_width];
+                let prev = &flat_keys[group_start * key_width .. (group_start + 1) * key_width];
+                if cur != prev {
+                    emit_group!(group_start, accs);
+                    group_start = row_idx;
+                    accs = make_accs();
+                }
+
+                let row = &rs.rows[row_idx];
+                let mut acc_idx = 0;
+                for kind in &col_kinds {
+                    match kind {
+                        ColKind::GbKey(_) | ColKind::Complex => {}
+                        ColKind::CountStar => {
+                            if let Acc::Count(c) = &mut accs[acc_idx] { *c += 1; }
+                            acc_idx += 1;
+                        }
+                        ColKind::Count(ci) => {
+                            if let Acc::Count(c) = &mut accs[acc_idx] {
+                                if row.get(*ci).copied().flatten().is_some() { *c += 1; }
+                            }
+                            acc_idx += 1;
+                        }
+                        ColKind::CountDistinct(ci) => {
+                            if let Acc::Distinct(set) = &mut accs[acc_idx] {
+                                if let Some(id) = row.get(*ci).copied().flatten() {
+                                    set.insert(id);
+                                }
+                            }
+                            acc_idx += 1;
+                        }
+                    }
+                }
+            }
+            emit_group!(group_start, accs);  // final group
+            return result;
+        }
+
+        if can_stream && has_distinct {
+            // ── Fast path B: HashMap accumulator (with CountDistinct) ──────────
+            // HashSet.insert dominates (~667 ns/insert); sort overhead > key-alloc
+            // savings so we keep the HashMap path and only skip per-row key cloning
+            // via the shared flat_keys array (avoids per-row Vec<Option<TermId>> alloc).
+            enum Acc { Count(usize), Distinct(HashSet<TermId>) }
+
+            let key_width = gb_col_indices.len();
+            let flat_keys: Vec<Option<TermId>> = rs.rows.iter().flat_map(|row| {
+                gb_col_indices.iter().map(move |&ci| {
+                    ci.and_then(|i| row.get(i).copied().flatten())
+                })
+            }).collect();
+
+            // Use &[Option<TermId>] slice as logical key — but HashMap needs owned key.
+            // To avoid 5.3M Vec allocs, bucket rows by (row_index) using a pre-sized map.
+            // We still need one key Vec per GROUP (not per row): at most N_groups allocs.
+            let mut groups: HashMap<Vec<Option<TermId>>, Vec<Acc>> =
+                HashMap::with_capacity(1 << 10);
+
+            for (row_idx, row) in rs.rows.iter().enumerate() {
+                // Borrow key slice from flat_keys — compare without allocating.
+                let key_slice = &flat_keys[row_idx * key_width .. (row_idx + 1) * key_width];
+                // `entry` needs an owned key; use raw_entry to probe first.
+                let accs = groups.entry(key_slice.to_vec()).or_insert_with(|| {
+                    col_kinds.iter().filter_map(|k| match k {
+                        ColKind::CountStar | ColKind::Count(_) => Some(Acc::Count(0)),
+                        ColKind::CountDistinct(_) => Some(Acc::Distinct(HashSet::new())),
+                        ColKind::GbKey(_) | ColKind::Complex => None,
+                    }).collect()
+                });
+
+                let mut acc_idx = 0;
+                for kind in &col_kinds {
+                    match kind {
+                        ColKind::GbKey(_) | ColKind::Complex => {}
+                        ColKind::CountStar => {
+                            if let Acc::Count(c) = &mut accs[acc_idx] { *c += 1; }
+                            acc_idx += 1;
+                        }
+                        ColKind::Count(ci) => {
+                            if let Acc::Count(c) = &mut accs[acc_idx] {
+                                if row.get(*ci).copied().flatten().is_some() { *c += 1; }
+                            }
+                            acc_idx += 1;
+                        }
+                        ColKind::CountDistinct(ci) => {
+                            if let Acc::Distinct(set) = &mut accs[acc_idx] {
+                                if let Some(id) = row.get(*ci).copied().flatten() {
+                                    set.insert(id);
+                                }
+                            }
+                            acc_idx += 1;
+                        }
+                    }
+                }
+            }
+
+            let out_len = out_vars.len();
+            let mut result = ResultSet::empty(out_vars);
+            result.overflow = rs.overflow;
+            for (key, accs) in groups {
+                let mut out_row = vec![None; out_len];
+                let mut acc_idx = 0;
+                for (out_i, kind) in col_kinds.iter().enumerate() {
+                    out_row[out_i] = match kind {
+                        ColKind::GbKey(ki) => key.get(*ki).copied().flatten(),
+                        ColKind::CountStar | ColKind::Count(_) => {
+                            let n = if let Acc::Count(c) = &accs[acc_idx] { *c } else { 0 };
+                            acc_idx += 1;
+                            let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n);
+                            Some(self.dict.encode(&s))
+                        }
+                        ColKind::CountDistinct(_) => {
+                            let n = if let Acc::Distinct(set) = &accs[acc_idx] { set.len() } else { 0 };
+                            acc_idx += 1;
+                            let s = format!("\"{}\"^^<http://www.w3.org/2001/XMLSchema#integer>", n);
+                            Some(self.dict.encode(&s))
+                        }
+                        ColKind::Complex => None,
+                    };
+                }
+                result.rows.push(out_row);
+            }
+            return result;
+        }
+
+        // ── Slow path: store rows per group, then compute aggregates ──────────
+        let mut groups: HashMap<Vec<Option<TermId>>, Vec<Vec<Option<TermId>>>> = HashMap::new();
+
+        for row in &rs.rows {
+            let key: Vec<Option<TermId>> = gb_col_indices.iter()
+                .map(|ci| ci.and_then(|i| row.get(i).copied().flatten()))
+                .collect();
+            groups.entry(key).or_default().push(row.clone());
+        }
+
         let mut result = ResultSet::empty(out_vars.clone());
         result.overflow = rs.overflow;
 

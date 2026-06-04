@@ -627,6 +627,9 @@ impl DeltaColFile {
     }
 
     /// Return the index of the first block whose `first_value > target`.
+    ///
+    /// Reads O(log block_count) entries from the mmap block index region —
+    /// all cache-resident after the first query that touches that key range.
     pub fn block_upper_bound(&self, target: u64) -> usize {
         if self.is_v4() {
             return self.block_upper_bound_v4(target);
