@@ -333,6 +333,26 @@ where F: FnMut(&str, &str, &str, Option<&str>) -> io::Result<()>
 
 // ── Phase 1: string collection ────────────────────────────────────────────────
 
+/// Returns true if a blank-node label is likely file-local (not globally unique).
+///
+/// Safe patterns: long hex/UUID strings (Jena-style `_:B<32hex>` or
+/// `_:B<UUID-encoded>`).  Risky patterns: short, sequential, or human-readable
+/// labels like `_:b0`, `_:node1`, `_:genid_1` — these collide across files.
+pub fn is_risky_bnode(label: &str) -> bool {
+    let local = match label.strip_prefix("_:") {
+        Some(l) => l,
+        None    => return false,
+    };
+    // Safe: capital or lowercase letter + 20+ hex/UUID-encoded chars
+    // (covers Jena _:Bxxxx and _:Bxxxx-encoded UUIDs)
+    if local.len() >= 20 {
+        let hex_like = local.chars().all(|c| c.is_ascii_hexdigit() || c.is_ascii_uppercase()
+            || matches!(c, '-' | '_' | 'X'));  // X2D = URL-encoded '-'
+        if hex_like { return false; }
+    }
+    true
+}
+
 /// Collect every unique RDF term from a **single** input into `db`.
 ///
 /// Low-level helper shared by the sequential and parallel callers.
@@ -425,7 +445,23 @@ pub fn collect_strings_parallel(
 
 fn collect_nt_strings(path: &Path, graph: Option<&str>, db: &mut crate::dict_builder::DictBuilder) -> io::Result<LoadStats> {
     if let Some(g) = graph { db.add(g)?; }
-    visit_nt_file(path, |s, p, o| { db.add(s)?; db.add(p)?; db.add(o) })
+    let mut risky_count = 0u64;
+    let stats = visit_nt_file(path, |s, p, o| {
+        if s.starts_with("_:") && is_risky_bnode(s) { risky_count += 1; }
+        if o.starts_with("_:") && is_risky_bnode(o) { risky_count += 1; }
+        db.add(s)?; db.add(p)?; db.add(o)
+    })?;
+    if risky_count > 0 {
+        eprintln!(
+            "WARNING: {:?} contains {} file-local blank node label(s) (e.g. _:b0, _:node1).\n\
+             These labels are scoped per file per the N-Triples spec.  Loading multiple files\n\
+             with such labels merges blank nodes that should be distinct.  Use a tool that\n\
+             assigns globally-unique (UUID/hash-based) blank node IDs before loading.",
+            path.file_name().unwrap_or_default(),
+            risky_count
+        );
+    }
+    Ok(stats)
 }
 
 fn collect_nt_strings_gz(path: &Path, graph: Option<&str>, db: &mut crate::dict_builder::DictBuilder) -> io::Result<LoadStats> {

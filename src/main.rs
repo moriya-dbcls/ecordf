@@ -84,18 +84,18 @@ enum Command {
         #[arg(long, default_value_t = false)]
         resume_phase2: bool,
 
-        /// ビルド完了後にデルタ圧縮（compress-cols）を自動実行する。
+        /// Apply delta + Zstd compression after build (overrides build.auto_compress in config).
         ///
-        /// ecordf.toml の `build.auto_compress_cols` より優先される。
+        /// ecordf.toml の `build.auto_compress` より優先される。
+        /// HDD/SATA SSD 環境では強く推奨。
         #[arg(long, default_value_t = false)]
-        auto_compress_cols: bool,
+        compress: bool,
 
-        /// デルタ圧縮に続けて Zstd 再圧縮（recompress-zstd）を自動実行する。
+        /// Skip blank-node semantic reordering even when `build.reorder_bnodes = true`.
         ///
-        /// ecordf.toml の `build.auto_compress_zstd` より優先される。
-        /// `--auto-compress-cols` と組み合わせて使う。
+        /// Useful for fast iterative builds during development.
         #[arg(long, default_value_t = false)]
-        auto_compress_zstd: bool,
+        no_reorder_bnodes: bool,
     },
 
     /// Start the SPARQL 1.1 HTTP endpoint
@@ -187,6 +187,22 @@ enum Command {
         scan_dontneed_mb: u64,
     },
 
+    /// Reorder blank-node TermIds by primary predicate / rdf:type for better cache efficiency.
+    ///
+    /// Assigns blank nodes with the same `rdf:type` consecutive TermIds so that
+    /// bind-join probes and LFTJ seeks stay within compact regions of the index.
+    ///
+    /// Writes `bnode_remap.bin` (loaded automatically at serve time) and rewrites
+    /// all six column-index files in place.  Run once after `ecordf build`:
+    ///
+    ///   ecordf reorder-bnodes --dir ./store
+    ///
+    /// Time: comparable to Phase 2 of a full build (re-sorts 6 column indexes).
+    ReorderBnodes {
+        #[arg(short, long, default_value = "./ecordf-data")]
+        dir: PathBuf,
+    },
+
     /// Build per-predicate (S,O) partition files for fast predicate access.
     ///
     /// Scans the POS index and writes one `pred_parts/pp_<id>.bin` file per
@@ -206,49 +222,21 @@ enum Command {
         force: bool,
     },
 
-    /// Compress column files with delta encoding (ECOCOL02).
+    /// Compress column files with delta + Zstd encoding (ECOCOL04).
     ///
-    /// For each `*.c0`, `*.c1`, `*.c2` column file under the store directory,
-    /// writes a compressed `*.c0.dz`, `*.c1.dz`, `*.c2.dz` file.
+    /// Reads each *.c0 / *.c1 / *.c2 column file, encodes it with delta + Zstd
+    /// compression, writes *.c0.zst / *.c1.zst / *.c2.zst, and removes the
+    /// original uncompressed files.
     ///
-    /// The server automatically detects and uses `.dz` files when present.
+    /// Run once after `ecordf build` (if not using auto_compress = true):
     ///
     ///   ecordf compress-cols --dir ./store
-    ///
-    /// Expected compression ratios (JPostDB):
-    ///   pos.c0 (6 GB) → ~30 MB (200×)  — predicate IDs repeat extensively
-    ///   spo.c0 (6 GB) → ~750 MB (8×)   — ascending subject IDs, small deltas
-    ///   pos.c1 (6 GB) → ~1.5 GB (4×)   — object IDs sorted within predicates
     CompressCols {
         #[arg(short, long, default_value = "./ecordf-data")]
         dir: PathBuf,
-        /// Overwrite existing .dz files.
+        /// Overwrite existing .zst files.
         #[arg(long, default_value_t = false)]
         force: bool,
-        /// After delta compression, also apply Zstd block compression (ECOCOL04).
-        /// Converts .dz → .zst and removes the .dz files.
-        /// Equivalent to running `recompress-zstd` afterwards.
-        #[arg(long, default_value_t = false)]
-        zstd: bool,
-    },
-
-    /// Re-encode column files with Zstd block compression (ECOCOL04).
-    ///
-    /// Reads existing .c0.dz / .c1.dz / .c2.dz files, applies Zstd compression,
-    /// and writes .c0.zst / .c1.zst / .c2.zst.  The original .dz files are kept
-    /// as fallback; delete them manually once the .zst files are verified.
-    ///
-    ///   ecordf recompress-zstd --dir ./store
-    ///   ecordf recompress-zstd --dir ./store --ordering spo   # only one ordering
-    #[clap(name = "recompress-zstd")]
-    RecompressZstd {
-        /// Store directory containing the index files.
-        #[arg(long)]
-        dir: PathBuf,
-        /// Only recompress this ordering (spo/pos/osp/pso/sop/ops).
-        /// Default: recompress all orderings present in the store.
-        #[arg(long)]
-        ordering: Option<String>,
     },
 
     /// Execute a SPARQL query from command line
@@ -367,7 +355,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Build { dir, files, from_file, resume_phase2, auto_compress_cols, auto_compress_zstd } => {
+        Command::Build { dir, files, from_file, resume_phase2, compress, no_reorder_bnodes } => {
             let inputs = resolve_input_files(files, from_file)?;
             if inputs.is_empty() {
                 anyhow::bail!(
@@ -376,34 +364,23 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             // CLI flag overrides config file.
-            let mut store = if resume_phase2 {
-                Store::load_with_graphs_resume_phase2(&dir, &inputs)?
+            let reorder_override = if no_reorder_bnodes { Some(false) } else { None };
+            let store = if resume_phase2 {
+                Store::load_with_graphs_resume_phase2_opts(&dir, &inputs, reorder_override)?
             } else {
-                Store::load_with_graphs(&dir, &inputs)?
+                Store::load_with_graphs_opts(&dir, &inputs, reorder_override)?
             };
-            let do_compress_cols = auto_compress_cols || store.config.build.auto_compress_cols;
-            let do_compress_zstd = auto_compress_zstd || store.config.build.auto_compress_zstd;
-            if auto_compress_cols && !store.config.build.auto_compress_cols {
-                // CLI flag set but config didn't trigger it yet — run now.
-                eprintln!("Auto-compressing column files (--auto-compress-cols)…");
+            // --compress CLI flag overrides config if config has it false.
+            // When config.build.auto_compress = true, store.rs already ran compress_columns.
+            if compress && !store.config.build.auto_compress {
+                eprintln!("Compressing column files (--compress)…");
                 let t = std::time::Instant::now();
                 match ecordf::index::TripleIndex::compress_columns(&dir, false) {
-                    Ok(n) => eprintln!("Column compression done: {} file(s) in {:.1}s.", n, t.elapsed().as_secs_f64()),
-                    Err(e) => eprintln!("Warning: column compression failed — {e}"),
-                }
-                store.config.build.auto_compress_cols = true;
-            }
-            if do_compress_cols && do_compress_zstd {
-                eprintln!("Auto-applying Zstd recompression (--auto-compress-zstd)…");
-                let t = std::time::Instant::now();
-                match run_recompress_zstd(&dir, None) {
-                    Ok((before, after)) => eprintln!(
-                        "Zstd recompression done: {} MB → {} MB ({:.1}×) in {:.1}s.",
-                        before / 1024 / 1024, after / 1024 / 1024,
-                        before as f64 / after as f64,
-                        t.elapsed().as_secs_f64()
+                    Ok(n) => eprintln!(
+                        "  {} file(s) compressed in {:.1}s.",
+                        n, t.elapsed().as_secs_f64()
                     ),
-                    Err(e) => eprintln!("Warning: Zstd recompression failed — {e}"),
+                    Err(e) => eprintln!("Warning: column compression failed — {e}"),
                 }
             }
             let store = store;
@@ -737,6 +714,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        Command::ReorderBnodes { dir } => {
+            eprintln!("Reordering blank nodes by primary predicate in {:?}...", dir);
+            ecordf::bnode_reorder::reorder_bnodes(&dir)?;
+        }
+
         Command::BuildPredParts { dir, force } => {
             let store = Store::open(&dir)?;
             eprintln!("Building predicate partition files for {:?}...", dir);
@@ -744,97 +726,13 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("Done: {} partition file(s) written.", n);
         }
 
-        Command::CompressCols { dir, force, zstd } => {
+        Command::CompressCols { dir, force } => {
             eprintln!("Compressing column files in {:?}...", dir);
             let n = ecordf::index::TripleIndex::compress_columns(&dir, force)?;
             eprintln!("Done: {} column file(s) compressed.", n);
-            if zstd {
-                eprintln!("Applying Zstd recompression (--zstd)…");
-                let t = std::time::Instant::now();
-                let (before, after) = run_recompress_zstd(&dir, None)?;
-                eprintln!(
-                    "Done: {} MB → {} MB ({:.1}×) in {:.1}s.",
-                    before / 1024 / 1024, after / 1024 / 1024,
-                    before as f64 / after as f64,
-                    t.elapsed().as_secs_f64()
-                );
-            }
-        }
-
-        Command::RecompressZstd { dir, ordering } => {
-            let t = std::time::Instant::now();
-            let (before, after) = run_recompress_zstd(&dir, ordering.as_deref())?;
-            if before > 0 {
-                eprintln!("Total: {} MB -> {} MB ({:.1}×) in {:.1}s",
-                    before / 1024 / 1024, after / 1024 / 1024,
-                    before as f64 / after as f64,
-                    t.elapsed().as_secs_f64());
-            }
         }
     }
 
     Ok(())
 }
 
-/// Recompress .dz column files to .zst (ECOCOL04) for the given store directory.
-///
-/// If `only_ordering` is Some("spo") etc., only that ordering is processed.
-/// Returns (total_bytes_before, total_bytes_after).
-///
-/// After successful conversion, the .dz files are deleted.
-fn run_recompress_zstd(dir: &Path, only_ordering: Option<&str>) -> anyhow::Result<(u64, u64)> {
-    let orderings: Vec<&str> = match only_ordering {
-        Some(o) => vec![o],
-        None    => vec!["spo", "pos", "osp", "pso", "sop", "ops"],
-    };
-    let mut total_before = 0u64;
-    let mut total_after  = 0u64;
-
-    for ord in &orderings {
-        let base   = dir.join(format!("{}.bin", ord));
-        let cpaths = ecordf::index::col_paths(&base);
-        let dz0    = ecordf::col_delta::delta_path(&cpaths[0]);
-        let dz1    = ecordf::col_delta::delta_path(&cpaths[1]);
-        let dz2    = ecordf::col_delta::delta_path(&cpaths[2]);
-
-        if !dz0.exists() || !dz1.exists() || !dz2.exists() {
-            // Skip silently — ordering may have been intentionally removed.
-            continue;
-        }
-
-        for (dz_path, c_path) in [&dz0, &dz1, &dz2].iter().zip(cpaths.iter()) {
-            let zst_path = ecordf::col_delta::zstd_path(c_path);
-            if zst_path.exists() {
-                // Already converted — skip, but remove orphaned .dz if .zst is newer.
-                let zst_mtime = std::fs::metadata(&zst_path).and_then(|m| m.modified()).ok();
-                let dz_mtime  = std::fs::metadata(dz_path).and_then(|m| m.modified()).ok();
-                if let (Some(zst), Some(dz)) = (zst_mtime, dz_mtime) {
-                    if zst >= dz { let _ = std::fs::remove_file(dz_path); }
-                }
-                continue;
-            }
-
-            let before = std::fs::metadata(dz_path)?.len();
-            eprintln!("  recompressing {} ({} MB) ...", dz_path.display(), before / 1024 / 1024);
-            let t0 = std::time::Instant::now();
-
-            let col    = ecordf::col_delta::DeltaColFile::open(dz_path)?;
-            let values: Vec<u64> = col.iter_from(0).collect();
-            drop(col);
-            ecordf::col_delta::encode_column_zstd(&values, &zst_path)?;
-
-            let after = std::fs::metadata(&zst_path)?.len();
-            total_before += before;
-            total_after  += after;
-            eprintln!("    {} MB -> {} MB ({:.1}×) in {:.1}s",
-                before / 1024 / 1024, after / 1024 / 1024,
-                before as f64 / after as f64,
-                t0.elapsed().as_secs_f64());
-
-            // Remove the .dz file now that .zst is written.
-            let _ = std::fs::remove_file(dz_path);
-        }
-    }
-
-    Ok((total_before, total_after))
-}

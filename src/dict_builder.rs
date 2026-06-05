@@ -542,6 +542,9 @@ pub struct ReadonlyDict {
     /// `RwLock` (not `RefCell`) makes `ReadonlyDict` `Sync` so it can be
     /// shared across query threads via `Arc<Store>`.
     cache: RwLock<FxHashMap<Box<str>, u64>>,
+    /// Optional blank-node TermId remapping (written by `ecordf reorder-bnodes`).
+    /// When present, translates between old dictionary IDs and new sorted IDs.
+    pub bnode_remap: Option<std::sync::Arc<crate::bnode_reorder::BnodeRemap>>,
 }
 
 impl ReadonlyDict {
@@ -570,6 +573,7 @@ impl ReadonlyDict {
             count,
             offsets_start,
             cache: RwLock::new(FxHashMap::default()),
+            bnode_remap: None,
         })
     }
 
@@ -580,6 +584,9 @@ impl ReadonlyDict {
     }
 
     /// Look up a string and return its ID, or `None` if not present.
+    ///
+    /// If `bnode_remap` is loaded, blank-node IDs are translated from the
+    /// dictionary's old position to the semantically reordered new ID.
     pub fn get_id(&self, s: &str) -> Option<u64> {
         // Fast path: hot cache (read lock, no exclusive contention with readers).
         {
@@ -589,8 +596,14 @@ impl ReadonlyDict {
             }
         }
         // Slow path: binary search in mmap.
-        let id = self.binary_search(s)?;
-        // Cache result if the cache is not yet full.
+        let old_id = self.binary_search(s)?;
+        // Apply blank-node remapping if active.
+        let id = if let Some(ref remap) = self.bnode_remap {
+            if remap.is_bnode(old_id) { remap.old_to_new(old_id) } else { old_id }
+        } else {
+            old_id
+        };
+        // Cache the final (possibly remapped) ID.
         let mut cache = self.cache.write().unwrap();
         if cache.len() < MAX_CACHE_ENTRIES {
             cache.insert(s.into(), id);
@@ -599,8 +612,16 @@ impl ReadonlyDict {
     }
 
     /// Decode an ID to its string slice (zero-copy reference into the mmap).
+    ///
+    /// If `bnode_remap` is loaded, translates the new (reordered) ID back to
+    /// the dictionary's original position before lookup.
     pub fn get_str(&self, id: u64) -> &str {
-        let off = self.offset_of(id) as usize;
+        let dict_id = if let Some(ref remap) = self.bnode_remap {
+            if remap.is_bnode(id) { remap.new_to_old(id) } else { id }
+        } else {
+            id
+        };
+        let off = self.offset_of(dict_id) as usize;
         let len = u32::from_le_bytes(self.mmap[off..off + 4].try_into().unwrap()) as usize;
         std::str::from_utf8(&self.mmap[off + 4..off + 4 + len])
             .expect("dict_sorted.bin contains invalid UTF-8")

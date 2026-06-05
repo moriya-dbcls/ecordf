@@ -560,6 +560,87 @@ impl<'a> Executor<'a> {
         !results.rows.is_empty()
     }
 
+    /// Execute a DESCRIBE query.
+    ///
+    /// Returns a ResultSet with variables ["s", "p", "o"] containing all triples
+    /// where each described resource appears as subject (Concise Bounded Description
+    /// subject-only variant — cheapest correct implementation).
+    pub fn execute_describe(&self, query: &DescribeQuery) -> ResultSet {
+        let mut rs = ResultSet::empty(vec!["s".into(), "p".into(), "o".into()]);
+
+        // Collect all resource TermIds to describe.
+        let mut resource_ids: Vec<TermId> = Vec::new();
+
+        // Resolve variable targets from the WHERE clause first.
+        let mut var_names: Vec<String> = Vec::new();
+        for target in &query.targets {
+            match target {
+                DescribeTarget::Iri(iri) => {
+                    if let Some(id) = self.dict.lookup(iri) {
+                        resource_ids.push(id);
+                    }
+                }
+                DescribeTarget::Variable(v) => var_names.push(v.clone()),
+                DescribeTarget::Wildcard => {
+                    // Defer wildcard expansion until we know all variables.
+                }
+            }
+        }
+
+        // If there are variable targets or wildcard, evaluate the WHERE clause.
+        let has_vars = !var_names.is_empty()
+            || query.targets.iter().any(|t| matches!(t, DescribeTarget::Wildcard));
+        if has_vars {
+            if let Some(pattern) = &query.pattern {
+                let select = super::ast::SelectQuery {
+                    distinct: false,
+                    projection: super::ast::Projection::Wildcard,
+                    dataset: Vec::new(),
+                    pattern: pattern.clone(),
+                    group_by: Vec::new(),
+                    having: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: query.limit,
+                    offset: query.offset,
+                    values: None,
+                };
+                let binding_rs = self.execute_select(&select);
+                // Determine which column indices to extract resource IDs from.
+                let col_indices: Vec<usize> = if query.targets.iter().any(|t| matches!(t, DescribeTarget::Wildcard)) {
+                    (0..binding_rs.variables.len()).collect()
+                } else {
+                    var_names.iter()
+                        .filter_map(|v| binding_rs.variable_index(v))
+                        .collect()
+                };
+                for row in &binding_rs.rows {
+                    for &ci in &col_indices {
+                        if let Some(Some(id)) = row.get(ci) {
+                            resource_ids.push(*id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Deduplicate resource IDs.
+        resource_ids.sort_unstable();
+        resource_ids.dedup();
+
+        // For each resource, collect all triples where it is the subject.
+        for id in resource_ids {
+            let pat = TriplePattern { s: id, p: UNBOUND, o: UNBOUND };
+            for t in self.index.scan(&pat) {
+                rs.rows.push(vec![Some(t.s), Some(t.p), Some(t.o)]);
+                if rs.rows.len() >= self.config.max_intermediate_rows {
+                    rs.overflow = true;
+                    return rs;
+                }
+            }
+        }
+        rs
+    }
+
     // ── Pattern execution ─────────────────────────────────────────────────────
 
     /// Execute a plan with no outer binding context.

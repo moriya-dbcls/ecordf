@@ -158,7 +158,7 @@ Delta 圧縮が存在する場合（`*.dz`）は自動的に優先される。
 chunk_size = 5_000_000        # 外部ソートのトリプルチャンクサイズ
 dict_chunk_mb = 200           # Phase1 文字列バッファ（MB）
 parallel_threads = 0          # 0 = 全 CPU コア
-auto_compress_cols = false    # ビルド後に compress-cols を自動実行
+auto_compress = false         # ビルド後に delta + Zstd 圧縮 (ECOCOL04) を自動適用
 
 [server]
 pred_cache_mb = 6144          # 述語キャッシュの RAM 予算

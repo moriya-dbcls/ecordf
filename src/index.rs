@@ -2562,48 +2562,34 @@ impl TripleIndex {
         idx.advise_dontneed()
     }
 
-    /// Compress all column files under `store_dir` into delta-encoded `.dz` files.
+    /// Compress all column files under `store_dir` into delta + Zstd `.zst` files (ECOCOL04).
     ///
     /// For each `*.c0` / `*.c1` / `*.c2` file under `store_dir`, reads the raw
-    /// u64 values and writes a compressed `*.c0.dz` / `*.c1.dz` / `*.c2.dz`
-    /// file next to it.
+    /// u64 values, encodes with delta + Zstd compression, and writes
+    /// `*.c0.zst` / `*.c1.zst` / `*.c2.zst` next to it.  The original raw
+    /// file is removed after successful compression.
     ///
-    /// - `force = false`: skip columns whose `.dz` already exists.
-    /// - `force = true`:  overwrite existing `.dz` files.
-    ///
-    /// **Predicate-boundary alignment**: for `pos.c1` and `pso.c1` (object
-    /// column of predicate-sorted indexes), a new delta block is forced at each
-    /// predicate boundary.  This keeps all object IDs in a block within one
-    /// predicate's range, minimising maximum delta and enabling U8/U16 encoding.
+    /// - `force = false`: skip columns whose `.zst` already exists.
+    /// - `force = true`:  overwrite existing `.zst` files.
     ///
     /// Returns the number of column files compressed.
     pub fn compress_columns(store_dir: &std::path::Path, force: bool) -> io::Result<usize> {
-        use crate::col_delta::{encode_column, encode_column_pred_aligned};
-
-        /// Load predicate run boundaries (lo positions > 0) from the .pidx alongside c0.
-        fn load_pred_boundaries(c0_path: &std::path::Path) -> Vec<usize> {
-            let pidx_path = pidx_path_from_c0(c0_path);
-            let Ok(pidx) = PredicateIndex::load(&pidx_path) else { return Vec::new(); };
-            let mut boundaries: Vec<usize> = pidx.ranges.values().map(|&(lo, _)| lo).collect();
-            boundaries.sort_unstable();
-            boundaries.retain(|&b| b > 0);
-            boundaries
-        }
+        use crate::col_delta::encode_column_zstd;
 
         let mut compressed = 0usize;
         for entry in std::fs::read_dir(store_dir)?.flatten() {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-            // Match *.c0, *.c1, *.c2 (but not *.c0.dz, etc.)
+            // Match *.c0, *.c1, *.c2 (but not *.c0.dz, *.c0.zst, etc.)
             if !( (name.ends_with(".c0") || name.ends_with(".c1") || name.ends_with(".c2"))
                   && !name.ends_with(".dz") )
             {
                 continue;
             }
 
-            let dz_path = delta_path(&path);
-            if !force && dz_path.exists() {
-                tracing::debug!(?dz_path, "compress-cols: already exists, skipping");
+            let zst_path = zstd_path(&path);
+            if !force && zst_path.exists() {
+                tracing::debug!(?zst_path, "compress-cols: already exists, skipping");
                 continue;
             }
 
@@ -2636,42 +2622,28 @@ impl TripleIndex {
 
             let t = std::time::Instant::now();
 
-            // For pos.c1 / pso.c1 (object column of predicate-sorted index),
-            // use predicate-boundary-aligned encoding for better compression.
-            let use_pred_align = name == "pos.c1" || name == "pso.c1";
-            if use_pred_align {
-                let c0_name = name.replace(".c1", ".c0");
-                let c0_path = path.with_file_name(&c0_name);
-                let boundaries = load_pred_boundaries(&c0_path);
-                if !boundaries.is_empty() {
-                    tracing::debug!(
-                        col = name.as_str(),
-                        boundaries = boundaries.len(),
-                        "compress-cols: using pred-aligned encoding"
-                    );
-                    encode_column_pred_aligned(&values, &boundaries, &dz_path)?;
-                } else {
-                    encode_column(&values, &dz_path)?;
-                }
-            } else {
-                encode_column(&values, &dz_path)?;
-            }
+            // TODO: use pred-aligned block boundaries for pos.c1 / pso.c1 once
+            // encode_column_pred_aligned_zstd is available in col_delta.
+            encode_column_zstd(&values, &zst_path)?;
+
             let orig_mb = mmap.len() as f64 / (1024.0 * 1024.0);
-            let dz_size = std::fs::metadata(&dz_path)?.len();
-            let dz_mb   = dz_size as f64 / (1024.0 * 1024.0);
-            let ratio   = orig_mb / dz_mb;
+            let zst_size = std::fs::metadata(&zst_path)?.len();
+            let zst_mb   = zst_size as f64 / (1024.0 * 1024.0);
+            let ratio    = orig_mb / zst_mb;
             tracing::info!(
                 col = name.as_str(),
                 orig_mb = format!("{:.1}", orig_mb),
-                dz_mb   = format!("{:.1}", dz_mb),
+                zst_mb  = format!("{:.1}", zst_mb),
                 ratio   = format!("{:.1}×", ratio),
                 elapsed_ms = t.elapsed().as_millis(),
                 "compress-cols: compressed"
             );
             eprintln!(
                 "  {} → {:.1} MB → {:.1} MB ({:.1}×) in {}ms",
-                name, orig_mb, dz_mb, ratio, t.elapsed().as_millis()
+                name, orig_mb, zst_mb, ratio, t.elapsed().as_millis()
             );
+            // Remove the original raw column file now that .zst is written.
+            let _ = std::fs::remove_file(&path);
             compressed += 1;
         }
 

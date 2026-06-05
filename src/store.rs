@@ -128,6 +128,16 @@ impl Store {
         config: &Config,
         resume_phase2: bool,
     ) -> io::Result<Self> {
+        Self::load_two_pass_internal_opts(dir, inputs, config, resume_phase2, None)
+    }
+
+    fn load_two_pass_internal_opts(
+        dir: &Path,
+        inputs: &[InputSpec],
+        config: &Config,
+        resume_phase2: bool,
+        reorder_bnodes_override: Option<bool>,
+    ) -> io::Result<Self> {
         let tmp_dir = dir.join("_ecordf_tmp");
         let dict_sorted_path = tmp_dir.join("dict_sorted.bin");
 
@@ -356,9 +366,27 @@ impl Store {
         // Cleanup entire tmp dir (dict_sorted.bin + any remaining chunk dirs)
         let _ = fs::remove_dir_all(&tmp_dir);
 
-        // ── Auto compress-cols (build.auto_compress_cols = true) ──────────────
-        if config.build.auto_compress_cols {
-            eprintln!("Auto-compressing column files (build.auto_compress_cols = true)…");
+        // ── Blank-node semantic reordering (build.reorder_bnodes = true) ──────
+        // Groups blank nodes by rdf:type so bind-join probes access a compact
+        // region of the column index.  Run BEFORE compress-cols so that the
+        // reordered (uncompressed) column files are then compressed in one step.
+        let do_reorder = reorder_bnodes_override.unwrap_or(config.build.reorder_bnodes);
+        if do_reorder {
+            eprintln!("Reordering blank nodes by rdf:type (build.reorder_bnodes = true)…");
+            let t_reorder = Instant::now();
+            match crate::bnode_reorder::reorder_bnodes(dir) {
+                Ok(()) => eprintln!(
+                    "Blank-node reorder done in {:.1}s.",
+                    t_reorder.elapsed().as_secs_f64()
+                ),
+                Err(e) => eprintln!("Warning: blank-node reorder failed — {e}"),
+            }
+        }
+
+        // ── Auto compress (build.auto_compress = true) ────────────────────────
+        // Applies delta + Zstd encoding (ECOCOL04) directly.
+        if config.build.auto_compress {
+            eprintln!("Auto-compressing column files (delta + Zstd)…");
             let t_compress = Instant::now();
             match crate::index::TripleIndex::compress_columns(dir, false) {
                 Ok(n) => eprintln!(
@@ -384,11 +412,22 @@ impl Store {
     ///
     /// Uses the same two-pass / one-pass logic as [`Store::load`].
     pub fn load_with_graphs(dir: &Path, inputs: &[InputSpec]) -> io::Result<Self> {
+        Self::load_with_graphs_opts(dir, inputs, None)
+    }
+
+    /// Like [`load_with_graphs`] but with CLI-level overrides.
+    /// `reorder_bnodes_override = Some(false)` skips the reorder step even if
+    /// `build.reorder_bnodes = true` in the config.
+    pub fn load_with_graphs_opts(
+        dir: &Path,
+        inputs: &[InputSpec],
+        reorder_bnodes_override: Option<bool>,
+    ) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let config = Config::resolve(None, dir).map_err(io::Error::from)?;
 
         if config.build.chunk_size > 0 {
-            Self::load_two_pass_internal(dir, inputs, &config, false)
+            Self::load_two_pass_internal_opts(dir, inputs, &config, false, reorder_bnodes_override)
         } else {
             let t0 = Instant::now();
             eprintln!("=== EcoRDF: loading {} file(s) [one-pass] ===", inputs.len());
@@ -414,11 +453,19 @@ impl Store {
     ///
     /// `chunk_size == 0` の場合は通常の one-pass ビルドにフォールバックします。
     pub fn load_with_graphs_resume_phase2(dir: &Path, inputs: &[InputSpec]) -> io::Result<Self> {
+        Self::load_with_graphs_resume_phase2_opts(dir, inputs, None)
+    }
+
+    pub fn load_with_graphs_resume_phase2_opts(
+        dir: &Path,
+        inputs: &[InputSpec],
+        reorder_bnodes_override: Option<bool>,
+    ) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let config = Config::resolve(None, dir).map_err(io::Error::from)?;
 
         if config.build.chunk_size > 0 {
-            Self::load_two_pass_internal(dir, inputs, &config, true)
+            Self::load_two_pass_internal_opts(dir, inputs, &config, true, reorder_bnodes_override)
         } else {
             // chunk_size == 0 はもともと one-pass なので resume の概念がない
             eprintln!("警告: chunk_size=0 のため --resume-phase2 は無視し通常ビルドを実行します");
@@ -865,6 +912,21 @@ impl Store {
             QueryForm::Construct(_) => {
                 return Err(QueryError::Unsupported("CONSTRUCT not yet implemented".into()));
             }
+            QueryForm::Describe(ref dq) => {
+                let rs = executor.execute_describe(dq);
+                let rows = rs.rows.len();
+                let execute_us = t.elapsed().as_micros();
+                let total_us   = t_total.elapsed().as_micros();
+                tracing::info!(
+                    parse_us,
+                    execute_us,
+                    total_us,
+                    rows,
+                    q = &sparql[..sparql.len().min(400)],
+                    "query(DESCRIBE)"
+                );
+                QueryResult::Describe(rs)
+            }
         };
 
         Ok(result)
@@ -897,6 +959,12 @@ impl Store {
                 Ok(rows)
             }
             QueryResult::Ask(b) => Ok(vec![vec![b.to_string()]]),
+            QueryResult::Describe(rs) => Ok(rs.rows.iter().map(|row| {
+                row.iter().map(|cell| match cell {
+                    Some(id) => self.dict.display(*id),
+                    None => String::new(),
+                }).collect()
+            }).collect()),
         }
     }
 
@@ -927,7 +995,12 @@ impl Store {
 fn open_query_dict(dir: &Path) -> io::Result<QueryDict> {
     let mmap_path = dir.join("dict_sorted.bin");
     if mmap_path.exists() {
-        let base = ReadonlyDict::open(&mmap_path)?;
+        let mut base = ReadonlyDict::open(&mmap_path)?;
+        // Load blank-node semantic remap if present (written by `ecordf reorder-bnodes`).
+        if let Some(remap) = crate::bnode_reorder::BnodeRemap::open(dir)? {
+            eprintln!("bnode_remap.bin loaded: {} blank nodes remapped.", remap.count);
+            base.bnode_remap = Some(std::sync::Arc::new(remap));
+        }
         return Ok(QueryDict::from_mmap(base));
     }
     // Legacy fallback: load dict.bin into memory.
@@ -935,6 +1008,7 @@ fn open_query_dict(dir: &Path) -> io::Result<QueryDict> {
     let (id_to_str, str_to_id) = legacy.into_parts();
     Ok(QueryDict::from_legacy(id_to_str, str_to_id))
 }
+
 
 /// `_ecordf_tmp/p1_NNNNNN/` ディレクトリ内の文字列チャンクファイルを収集する。
 ///
@@ -1047,6 +1121,7 @@ fn validate_group_by(sq: &crate::sparql::ast::SelectQuery) -> Option<String> {
 pub enum QueryResult {
     Select(ResultSet),
     Ask(bool),
+    Describe(ResultSet),
 }
 
 #[derive(Debug)]

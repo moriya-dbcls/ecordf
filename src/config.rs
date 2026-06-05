@@ -179,47 +179,26 @@ pub struct BuildConfig {
     /// Set to 1 if you hit memory pressure on a machine with many cores.
     pub parallel_threads: usize,
 
-    /// Automatically run delta compression (`compress-cols`) after `ecordf build`.
+    /// Automatically compress column files with delta + Zstd (ECOCOL04) after build.
     ///
-    /// When `true`, EcoRDF calls `compress-cols` immediately after writing the
-    /// raw column files (`.c0`, `.c1`, `.c2`), replacing them with delta-encoded
-    /// `.dz` files before the build command exits.  This combines the two steps
-    /// into one and ensures the store is always served in its optimal format.
+    /// When `true`, runs both `compress-cols` (delta encoding) and
+    /// `recompress-zstd` (Zstd block compression) immediately after the index
+    /// build completes. The resulting `.c0.zst` / `.c1.zst` / `.c2.zst` files
+    /// are 10–20× smaller than the raw columns and dramatically reduce I/O cost
+    /// for HDD/SSD-based stores.
     ///
-    /// ## いつ有効にするか（推奨環境）
+    /// Default: `false`.  Enable with `--compress` on the command line or set
+    /// `auto_compress = true` in `ecordf.toml`.
     ///
-    /// | 環境 | 推奨 | 理由 |
-    /// |------|------|------|
-    /// | HDD（7200rpm など）| **true を強く推奨** | I/O が支配的。8× 圧縮で読み出し時間が 8× 短縮。展開コストは I/O 削減に比べ無視できる |
-    /// | SATA SSD | **true を推奨** | SSD 帯域（500 MB/s 程度）はデルタ展開速度（1–2 GB/s）より遅いため依然 I/O ボトルネック |
-    /// | NVMe SSD | **どちらでも可** | NVMe 帯域（3–7 GB/s）はデルタ展開速度に近く、圧縮の効果が小さい。ディスク節約が目的なら true |
-    /// | NVMe + 大容量 RAM（データがほぼページキャッシュに乗る）| **false を検討** | キャッシュ済みなら展開コストの方が高くつく場合がある |
-    ///
-    /// デフォルト `false` — 明示的に `compress-cols` を実行するか、このフラグを `true` に
-    /// することで圧縮を有効にする。既存ストアへの再適用は `ecordf compress-cols --force` を使う。
-    ///
-    /// Overridable with `--auto-compress-cols` on the command line.
-    pub auto_compress_cols: bool,
-
-    /// Automatically run Zstd recompression (`recompress-zstd`) after delta compression.
-    ///
-    /// When `true`, EcoRDF converts `.dz` files to `.zst` (ECOCOL04 format: delta +
-    /// Zstd block compression) immediately after `compress-cols` completes, then
-    /// deletes the `.dz` files.  Requires `auto_compress_cols = true` to take effect
-    /// during `ecordf build`; can also be triggered standalone via
-    /// `ecordf compress-cols --zstd --dir <store>`.
-    ///
-    /// ## いつ `true` にするか（推奨環境）
+    /// ## 環境別推奨値
     ///
     /// | 環境 | 推奨値 | 理由 |
     /// |------|--------|------|
-    /// | HDD（7200 rpm 等） | **`true` を強く推奨** | .dz よりさらに 2–20× 圧縮（spo.c1 では 20×）。I/O 削減がクエリ速度に直結 |
-    /// | SATA SSD（書き込み帯域 ≤ 500 MB/s）| **`true` を推奨** | ディスク節約 + I/O ボトルネック解消。Zstd 展開コストは軽微 |
-    /// | NVMe SSD（帯域 3 GB/s 以上）| **任意** | ディスク節約目的なら `true`。CPU オーバーヘッド（+1–3%/query）が許容できるか次第 |
-    /// | データが全て OS ページキャッシュに乗る大容量 RAM 環境 | **`false` を推奨** | ページキャッシュ済みなら Zstd 展開コスト（~50 µs/chunk）が相対的に割高 |
-    ///
-    /// デフォルト `false`。既存ストアへの後付け適用: `ecordf compress-cols --zstd --dir <store>`
-    pub auto_compress_zstd: bool,
+    /// | HDD（7200 rpm 等） | **`true` を強く推奨** | I/O 削減がクエリ速度に直結 |
+    /// | SATA SSD | **`true` を推奨** | ディスク節約 + I/O ボトルネック解消 |
+    /// | NVMe SSD | 任意 | ディスク節約目的なら `true` |
+    /// | 全データが OS ページキャッシュに乗る大容量 RAM | `false` を推奨 | Zstd 展開コストが相対的に割高 |
+    pub auto_compress: bool,
 
     /// Per-file buffer size for Phase 2a string collection (MB).
     ///
@@ -227,6 +206,19 @@ pub struct BuildConfig {
     /// streaming Phase 2 join step at the cost of more RAM per thread.
     /// Default: 64 MB.  For 50B+ triple datasets, 512–2048 is recommended.
     pub p2a_buf_mb: usize,
+
+    /// Automatically run blank-node semantic reordering after the index is built.
+    ///
+    /// Groups blank nodes sharing the same `rdf:type` into consecutive TermId
+    /// ranges so that bind-join probes and LFTJ seeks access a compact region
+    /// of the column index.  Expected improvement: up to ~20× cache efficiency
+    /// for type-filtered blank-node queries.
+    ///
+    /// Cost: one additional pass over the index (similar to Phase 2 time).
+    ///
+    /// Default: `true`.  Disable with `--no-reorder-bnodes` on the command line
+    /// or set `reorder_bnodes = false` in `ecordf.toml` for fast iterative builds.
+    pub reorder_bnodes: bool,
 }
 
 impl Default for BuildConfig {
@@ -235,9 +227,9 @@ impl Default for BuildConfig {
             chunk_size: 5_000_000,
             dict_chunk_mb: 200,
             parallel_threads: 0,
-            auto_compress_cols: false,
-            auto_compress_zstd: false,
+            auto_compress: false,
             p2a_buf_mb: 64,
+            reorder_bnodes: true,
         }
     }
 }

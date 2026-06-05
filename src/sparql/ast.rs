@@ -20,6 +20,25 @@ pub enum QueryForm {
     Select(SelectQuery),
     Ask(AskQuery),
     Construct(ConstructQuery),
+    Describe(DescribeQuery),
+}
+
+/// DESCRIBE query: returns all triples where described resources appear as subject.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DescribeQuery {
+    /// Resources to describe: explicit IRIs, variables, or wildcard (*).
+    pub targets: Vec<DescribeTarget>,
+    /// Optional WHERE clause; evaluated to bind variables.
+    pub pattern: Option<GraphPattern>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DescribeTarget {
+    Iri(String),
+    Variable(String),
+    Wildcard,
 }
 
 #[derive(Debug, Clone, PartialEq)]

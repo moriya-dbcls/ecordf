@@ -29,6 +29,7 @@
 //!   [Dictionary] ── string ↔ u32 with namespace compression
 //! ```
 
+pub mod bnode_reorder;
 pub mod col_delta;
 pub mod config;
 pub mod dict;

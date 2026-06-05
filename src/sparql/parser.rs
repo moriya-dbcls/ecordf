@@ -480,7 +480,11 @@ impl<'a> Parser<'a> {
                 self.lexer.next();
                 Ok(QueryForm::Construct(self.parse_construct()?))
             }
-            other => Err(ParseError(format!("expected SELECT/ASK/CONSTRUCT, got {:?}", other))),
+            Token::Kw(k) if k.eq_ignore_ascii_case("describe") => {
+                self.lexer.next();
+                Ok(QueryForm::Describe(self.parse_describe()?))
+            }
+            other => Err(ParseError(format!("expected SELECT/ASK/CONSTRUCT/DESCRIBE, got {:?}", other))),
         }
     }
 
@@ -571,6 +575,43 @@ impl<'a> Parser<'a> {
         let pattern = self.parse_group_graph_pattern()?;
         let (limit, offset) = self.parse_limit_offset()?;
         Ok(ConstructQuery { template, dataset, pattern, limit, offset })
+    }
+
+    fn parse_describe(&mut self) -> ParseResult<DescribeQuery> {
+        // Parse one or more targets: * | (<iri> | ?var)+
+        let mut targets = Vec::new();
+        loop {
+            match self.lexer.peek().clone() {
+                Token::Times => {
+                    self.lexer.next();
+                    targets.push(DescribeTarget::Wildcard);
+                    break;
+                }
+                Token::Var(v) => {
+                    let v = v.to_string();
+                    self.lexer.next();
+                    targets.push(DescribeTarget::Variable(v));
+                }
+                Token::IriRef(_) | Token::PrefixedName(_, _) => {
+                    let iri = self.parse_iri()?;
+                    targets.push(DescribeTarget::Iri(iri));
+                }
+                _ => break,
+            }
+        }
+        if targets.is_empty() {
+            return Err(ParseError("DESCRIBE requires at least one target (IRI, ?var, or *)".into()));
+        }
+        // Optional WHERE clause
+        let _dataset = self.parse_dataset_clauses()?;
+        let pattern = if matches!(self.lexer.peek(), Token::Kw(k) if k.eq_ignore_ascii_case("where")) {
+            self.lexer.next();
+            Some(self.parse_group_graph_pattern()?)
+        } else {
+            None
+        };
+        let (limit, offset) = self.parse_limit_offset()?;
+        Ok(DescribeQuery { targets, pattern, limit, offset })
     }
 
     fn parse_dataset_clauses(&mut self) -> ParseResult<Vec<DatasetClause>> {

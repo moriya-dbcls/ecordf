@@ -343,6 +343,21 @@ fn build_query_response(store: &Store, result: QueryResult, format: &str, t_req:
             response
         }
         QueryResult::Ask(b) => format_ask(*b, format),
+        QueryResult::Describe(rs) => {
+            let t_decode = Instant::now();
+            let decoded = decode_result_set(rs, store);
+            let decode_us = t_decode.elapsed().as_micros();
+            let t_ser = Instant::now();
+            let body = describe_to_ntriples(&decoded);
+            let serialize_us = t_ser.elapsed().as_micros();
+            let total_us = t_req.elapsed().as_micros();
+            tracing::info!(decode_us, serialize_us, total_us, rows = rs.rows.len(), "describe decode+serialize");
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/n-triples; charset=utf-8")],
+                body,
+            ).into_response()
+        }
     }
 }
 
@@ -532,6 +547,36 @@ fn encode_term_xml(s: &str) -> String {
         format!("<bnode>{}</bnode>", xml_escape(&s[2..]))
     } else {
         format!("<uri>{}</uri>", xml_escape(s))
+    }
+}
+
+/// Format DESCRIBE result rows (s, p, o decoded strings) as N-Triples.
+/// dict.decode returns IRIs without <>, literals with quotes, bnodes with _:.
+fn describe_to_ntriples(decoded: &[DecodedRow]) -> String {
+    let mut out = String::new();
+    for row in decoded {
+        let s = row.0.get(0).and_then(|v| v.as_deref());
+        let p = row.0.get(1).and_then(|v| v.as_deref());
+        let o = row.0.get(2).and_then(|v| v.as_deref());
+        if let (Some(s), Some(p), Some(o)) = (s, p, o) {
+            out.push_str(&ntriples_term(s));
+            out.push(' ');
+            out.push_str(&ntriples_term(p));
+            out.push(' ');
+            out.push_str(&ntriples_term(o));
+            out.push_str(" .\n");
+        }
+    }
+    out
+}
+
+/// Wrap a decoded term string in N-Triples syntax.
+/// IRIs get <>, literals and bnodes are kept as-is.
+fn ntriples_term(s: &str) -> String {
+    if s.starts_with('"') || s.starts_with("_:") {
+        s.to_string()
+    } else {
+        format!("<{}>", s)
     }
 }
 
