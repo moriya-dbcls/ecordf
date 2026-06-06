@@ -32,8 +32,8 @@ ln -sf debug.log.$(date +%y%m%d.%H) debug.log   # 最新ログへのシンボリ
 ```
 
 ### サーバー管理ルール（親タスク = タスク0 が担当）
-- **起動・再起動は親タスクが行う**。ユーザから「再起動して」と言われた場合、または
-  ビルド後の動作確認が必要な場合は、上記コマンドで起動する。
+- **起動・再起動は親タスクが行う**。ユーザからの依頼、または
+  親タスクの作業上再起動が必要な場合は、上記コマンドでユーザへの追加確認無しで起動とシンボリックリンク作成を行う。
 - ポート 17878 が使用中なら既存プロセスを確認（`ps aux | grep ecordf`）し、
   停止してから再起動する。
 - 起動後は `debug.log` に **"Server ready"** が出るまで 1 分ごとに確認してから作業を進める。
@@ -110,6 +110,7 @@ screen -dmS task6 bash -c "cd $PROJECT_ROOT && claude --dangerously-skip-permiss
   CLAUDE.md / prompts/ 編集・git add/commit・サーバー起動停止。
 - **子タスクは `--dangerously-skip-permissions` を必ず付ける**（非対話で放置するため）。
 - prompts/task[N].txt には「やらないこと」（git push・サーバー操作等）を明記する。
+- 子タスクの作業終了を確認して、子タスクのclaudeおよびscreenを終了する。
 
 ## 主要な型
 
