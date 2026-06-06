@@ -1430,6 +1430,36 @@ impl<'a> Executor<'a> {
                     // Force POS for (UNBOUND, p, o) → subject scan to avoid OPS routing
                     // which uses post-bnode_remap TermIds inconsistent with SPO/POS epoch.
                     self.index.pos.scan(&bound_pat).map(|t| t.s).collect()
+                } else if var_pos == 0
+                    && bound_pat.s == UNBOUND
+                    && bound_pat.p != UNBOUND
+                    && bound_pat.o == UNBOUND
+                {
+                    // 全主語列挙: pred_cache が使えれば in-memory で
+                    if let Some(pairs) = self.pred_cache.get(bound_pat.p) {
+                        let mut subjects: Vec<TermId> = Vec::new();
+                        let mut last = TermId::MAX;
+                        for &(s, _) in pairs.iter() {
+                            if s != last { subjects.push(s); last = s; }
+                        }
+                        subjects
+                    } else {
+                        self.index.scan(&bound_pat).map(|t| t.s).collect()
+                    }
+                } else if var_pos == 2
+                    && bound_pat.s == UNBOUND
+                    && bound_pat.p != UNBOUND
+                    && bound_pat.o == UNBOUND
+                {
+                    // 全目的語列挙: pred_cache が使えれば in-memory で
+                    if let Some(pairs) = self.pred_cache.get(bound_pat.p) {
+                        let mut objects: Vec<TermId> = pairs.iter().map(|&(_, o)| o).collect();
+                        objects.sort_unstable();
+                        objects.dedup();
+                        objects
+                    } else {
+                        self.index.scan(&bound_pat).map(|t| t.o).collect()
+                    }
                 } else {
                     self.index.scan(&bound_pat)
                         .map(|t| match var_pos { 0 => t.s, 1 => t.p, _ => t.o })
@@ -1450,6 +1480,18 @@ impl<'a> Executor<'a> {
             // otherwise fall through to scanning all patterns.
             if !filter_pats.is_empty() {
                 for (bound_pat, var_pos) in filter_pats.iter().zip(filter_var_pos.iter()) {
+                    // type_cache を優先: (UNBOUND, rdf:type, class_id) パターン
+                    if *var_pos == 0
+                        && bound_pat.s == UNBOUND
+                        && bound_pat.p != UNBOUND
+                        && bound_pat.o != UNBOUND
+                        && Some(bound_pat.p) == self.type_cache.rdf_type_id()
+                    {
+                        if let Some(class_ids) = self.type_cache.get_class(bound_pat.o) {
+                            for id in class_ids { set.insert(id); }
+                            continue;
+                        }
+                    }
                     // Force POS for (p+o)-bound patterns to avoid OPS routing which uses
                     // post-bnode_remap TermIds inconsistent with the SPO/POS index epoch.
                     let scan = if bound_pat.s == UNBOUND && bound_pat.p != UNBOUND && bound_pat.o != UNBOUND {
@@ -1461,6 +1503,28 @@ impl<'a> Executor<'a> {
                         let val = match var_pos { 0 => t.s, 1 => t.p, _ => t.o };
                         set.insert(val);
                     }
+                }
+                // When there are 2+ filter_pats, intersect them (AND semantics).
+                // Single filter_pat: no retain needed — the scan already produced
+                // exactly the matching values.
+                if filter_pats.len() > 1 {
+                    set.retain(|&val| {
+                        filter_pats.iter().zip(filter_var_pos.iter()).all(|(fpat, &fpos)| {
+                            let mut cp = *fpat;
+                            match fpos { 0 => cp.s = val, 1 => cp.p = val, _ => cp.o = val }
+                            if cp.s != UNBOUND && cp.p != UNBOUND && cp.o != UNBOUND {
+                                if let Some(pairs) = self.pred_cache.get(cp.p) {
+                                    let s = cp.s;
+                                    let o_target = cp.o;
+                                    let lo = pairs.partition_point(|&(subj, _)| subj < s);
+                                    return pairs[lo..].iter()
+                                        .take_while(|&&(subj, _)| subj == s)
+                                        .any(|&(_, obj)| obj == o_target);
+                                }
+                            }
+                            self.index.scan(&cp).next().is_some()
+                        })
+                    });
                 }
                 filter_pats.clear();
                 filter_var_pos.clear();
@@ -1481,7 +1545,7 @@ impl<'a> Executor<'a> {
 
         // Apply single-variable patterns as bound checks (consistent with SPO chain).
         // Try predcache first for forward (s→o) existence checks.
-        let candidates: Vec<TermId> = if filter_pats.is_empty() {
+        let mut candidates: Vec<TermId> = if filter_pats.is_empty() {
             pre_filter
         } else {
             pre_filter.into_iter()
@@ -1504,12 +1568,18 @@ impl<'a> Executor<'a> {
                 })
                 .collect()
         };
+        // Sort candidates for sequential index access (important when pre_filter
+        // came from a HashSet-based scan — avoids random-order SPO block seeks).
+        candidates.sort_unstable();
         for val in candidates {
             binding.insert(var.clone(), val);
             self.lft_enumerate(patterns, var_order, depth + 1, binding, rs);
             binding.remove(var.as_str());
             if rs.rows.len() >= self.config.max_intermediate_rows {
                 rs.overflow = true;
+                return;
+            }
+            if self.is_limit_reached(rs.rows.len()) {
                 return;
             }
         }
@@ -5586,24 +5656,39 @@ fn optimize_triple_patterns(
             let mut lft_ok = true;
             let mut lft_patterns: Vec<(TriplePattern, Vec<(String, u8)>)> = Vec::new();
             for pat in &ordered {
-                match pattern_to_scan_plan(pat, dict, &HashSet::new()) {
+                match pattern_to_scan_plan(pat, dict, initially_bound) {
                     ExecutionPlan::Scan { pattern, variables } => {
                         lft_patterns.push((pattern, variables));
                     }
-                    ExecutionPlan::ScanBound { base, free_vars, outer_vars } => {
-                        let mut all_vars = free_vars;
-                        all_vars.extend(outer_vars);
-                        lft_patterns.push((base, all_vars));
-                    }
+                    // ScanBound = 事前束縛変数あり → Phase 2 (bind_join) にフォールバック
                     _ => { lft_ok = false; break; }
                 }
             }
             if lft_ok {
-                tracing::debug!(
-                    patterns = lft_patterns.len(),
-                    "optimize_triple_patterns: emitting LeapfrogJoin"
-                );
-                return ExecutionPlan::LeapfrogJoin { patterns: lft_patterns };
+                // ── カーディナリティゲート ──────────────────────────────────
+                // LFTJ は「いずれかのパターンが定数で絞られ小集合になる」場合のみ有効。
+                // 全パターンが大規模 (例: type クラス全体) だと、LIMIT pushdown が
+                // 効かないクエリ (DISTINCT / ORDER BY / GROUP BY) で全件列挙となり
+                // 各要素ごとの未キャッシュ述語ランダム seek で著しく遅くなる。
+                // その場合は prefetch + pushdown を持つ bind_join (Phase 2) に委ねる。
+                const LFTJ_MAX_MIN_CARD: u64 = 500_000;
+                let min_card = lft_patterns.iter()
+                    .map(|(pat, _)| index.estimate(pat))
+                    .min()
+                    .unwrap_or(u64::MAX);
+                if min_card > LFTJ_MAX_MIN_CARD {
+                    tracing::debug!(
+                        min_card,
+                        "optimize_triple_patterns: LFTJ skipped (no selective anchor) → bind_join"
+                    );
+                } else {
+                    tracing::debug!(
+                        patterns = lft_patterns.len(),
+                        min_card,
+                        "optimize_triple_patterns: emitting LeapfrogJoin"
+                    );
+                    return ExecutionPlan::LeapfrogJoin { patterns: lft_patterns };
+                }
             }
         }
     }
