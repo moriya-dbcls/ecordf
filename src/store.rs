@@ -347,13 +347,10 @@ impl Store {
         let store_dict_sorted = dir.join("dict_sorted.bin");
         fs::copy(&dict_sorted_path, &store_dict_sorted)?;
 
-        // ── Write legacy dict.bin for backward compatibility ──────────────────
-        // Skipped when the dictionary exceeds 4.3 billion unique terms (u32 limit),
-        // since the legacy format uses u32 term counts.  Query-time lookups use
-        // dict_sorted.bin which supports unlimited term counts.
-        let readonly_dict = ReadonlyDict::open(&dict_sorted_path)?;
-        if let Err(e) = readonly_dict.write_legacy_dict(&dir.join("dict.bin")) {
-            eprintln!("Note: skipping legacy dict.bin — {}", e);
+        // dict_sorted.bin が作成されたので、古い dict.bin があれば削除する。
+        let dict_bin_path = dir.join("dict.bin");
+        if dict_bin_path.exists() {
+            let _ = fs::remove_file(&dict_bin_path);
         }
 
         eprintln!(
