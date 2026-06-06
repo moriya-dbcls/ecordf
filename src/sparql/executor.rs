@@ -1329,11 +1329,10 @@ impl<'a> Executor<'a> {
 
     /// Core Leapfrog Triejoin for a set of triple patterns sharing variables.
     ///
-    /// This is the key performance innovation over Virtuoso.
-    /// For each shared variable, we collect all the sorted value lists from
-    /// each pattern that binds that variable, then intersect them with leapfrog.
+    /// Uses cardinality-aware variable ordering (lft_var_order) with a
+    /// "connected variable" heuristic: variables reachable through already-bound
+    /// variables are processed before variables eligible only via constant patterns.
     fn execute_leapfrog_join(&self, patterns: &[(TriplePattern, Vec<(String, u8)>)]) -> ResultSet {
-        // Collect all variable names in order of first appearance across patterns.
         let mut seen_vars: HashSet<String> = HashSet::new();
         let mut all_vars: Vec<String> = Vec::new();
         for (_, vars) in patterns {
@@ -1348,22 +1347,21 @@ impl<'a> Executor<'a> {
             return ResultSet::empty(all_vars);
         }
 
-        // Determine the processing order for variables using cardinality-aware ordering.
         let var_order = lft_var_order(patterns, &all_vars, self.index);
+        tracing::debug!(var_order = ?var_order, "lft_var_order");
 
         let mut rs = ResultSet::empty(all_vars);
         let mut binding: HashMap<String, TermId> = HashMap::new();
         self.lft_enumerate(patterns, &var_order, 0, &mut binding, &mut rs);
+        tracing::debug!(rows = rs.rows.len(), "lft_enumerate done");
         rs
     }
 
     /// Recursive depth-first enumeration for Leapfrog Triejoin.
     ///
-    /// At each depth we process one variable from `var_order`. For that variable
-    /// we collect all "eligible" patterns (those whose other free variables are
-    /// already bound) and run a leapfrog intersection over them.  If no pattern
-    /// is eligible yet (isolated variable), we fall back to a union of all
-    /// candidate values from any pattern that mentions the variable.
+    /// At each depth, processes one variable from var_order. Collects "eligible"
+    /// patterns (those whose other free variables are already bound) and runs
+    /// leapfrog intersection. Falls back to union scan if no pattern is eligible yet.
     fn lft_enumerate(
         &self,
         patterns: &[(TriplePattern, Vec<(String, u8)>)],
@@ -1382,40 +1380,130 @@ impl<'a> Executor<'a> {
 
         let var = &var_order[depth];
 
-        // Collect sorted iterators from patterns where `var` is present and all
-        // other free variables are already in `binding`.
-        let eligible_iters: Vec<SortedIter> = patterns.iter()
-            .filter(|(_, vars)| {
-                vars.iter().any(|(n, _)| n == var) &&
-                vars.iter().filter(|(n, _)| n != var).all(|(n, _)| binding.contains_key(n.as_str()))
-            })
-            .map(|(pat, vars)| {
-                let bound_pat = apply_binding_to_pat(pat, vars, binding);
-                let var_pos = vars.iter().find(|(n, _)| n == var).unwrap().1;
-                let vals: Vec<TermId> = self.index.scan(&bound_pat)
-                    .map(|t| match var_pos { 0 => t.s, 1 => t.p, _ => t.o })
-                    .collect();
-                SortedIter::new(vals)
-            })
-            .collect();
+        // Separate eligible patterns into two groups:
+        // - join_iters: patterns with >1 variable (use leapfrog intersection — index-consistent)
+        // - filter_pats: patterns with only the current variable (apply as bound checks)
+        //
+        // Rationale: single-variable patterns may route to OPS/PSO/SOP indexes which can
+        // have different blank-node TermId epochs than SPO/POS/OSP (e.g. after bnode_remap
+        // rebuilt only some index files). Applying them as post-filters via fully-bound
+        // SPO checks keeps TermIds consistent throughout the chain.
+        let mut join_iters: Vec<SortedIter> = Vec::new();
+        let mut filter_pats: Vec<TriplePattern> = Vec::new();
+        let mut filter_var_pos: Vec<u8> = Vec::new();
 
-        let candidates: Vec<TermId> = if eligible_iters.is_empty() {
-            // Variable has no fully-bound context yet — collect all values from
-            // any pattern that mentions it, deduplicated (no intersection).
+        for (pat, vars) in patterns.iter() {
+            let mentions_var = vars.iter().any(|(n, _)| n == var);
+            let all_others_bound = vars.iter()
+                .filter(|(n, _)| n != var)
+                .all(|(n, _)| binding.contains_key(n.as_str()));
+            if !mentions_var || !all_others_bound { continue; }
+
+            let has_other_vars = vars.iter().any(|(n, _)| n != var);
+            let var_pos = vars.iter().find(|(n, _)| n == var).unwrap().1;
+            let bound_pat = apply_binding_to_pat(pat, vars, binding);
+
+            if has_other_vars {
+                // Multi-variable pattern → include in leapfrog intersection.
+                // For forward (s→o) scans, try the predcache first to avoid
+                // expensive Zstd block decompression in the columnar index.
+                let vals: Vec<TermId> = if var_pos == 2
+                    && bound_pat.s != UNBOUND
+                    && bound_pat.o == UNBOUND
+                    && bound_pat.p != UNBOUND
+                {
+                    if let Some(pairs) = self.pred_cache.get(bound_pat.p) {
+                        let s = bound_pat.s;
+                        let lo = pairs.partition_point(|&(subj, _)| subj < s);
+                        pairs[lo..].iter()
+                            .take_while(|&&(subj, _)| subj == s)
+                            .map(|&(_, obj)| obj)
+                            .collect()
+                    } else {
+                        self.index.scan(&bound_pat).map(|t| t.o).collect()
+                    }
+                } else if var_pos == 0
+                    && bound_pat.s == UNBOUND
+                    && bound_pat.p != UNBOUND
+                    && bound_pat.o != UNBOUND
+                {
+                    // Force POS for (UNBOUND, p, o) → subject scan to avoid OPS routing
+                    // which uses post-bnode_remap TermIds inconsistent with SPO/POS epoch.
+                    self.index.pos.scan(&bound_pat).map(|t| t.s).collect()
+                } else {
+                    self.index.scan(&bound_pat)
+                        .map(|t| match var_pos { 0 => t.s, 1 => t.p, _ => t.o })
+                        .collect()
+                };
+                join_iters.push(SortedIter::new(vals));
+            } else {
+                // Single-variable pattern → apply as post-filter (bound check)
+                filter_pats.push(bound_pat);
+                filter_var_pos.push(var_pos);
+            }
+        }
+
+        let pre_filter: Vec<TermId> = if join_iters.is_empty() {
+            // No multi-variable context — collect all values from any eligible pattern
             let mut set: HashSet<TermId> = HashSet::new();
-            for (pat, vars) in patterns.iter() {
-                if let Some((_, var_pos)) = vars.iter().find(|(n, _)| n == var) {
-                    for t in self.index.scan(pat) {
+            // Prefer filter_pats (single-var patterns) for initial candidates if present;
+            // otherwise fall through to scanning all patterns.
+            if !filter_pats.is_empty() {
+                for (bound_pat, var_pos) in filter_pats.iter().zip(filter_var_pos.iter()) {
+                    // Force POS for (p+o)-bound patterns to avoid OPS routing which uses
+                    // post-bnode_remap TermIds inconsistent with the SPO/POS index epoch.
+                    let scan = if bound_pat.s == UNBOUND && bound_pat.p != UNBOUND && bound_pat.o != UNBOUND {
+                        self.index.pos.scan(bound_pat)
+                    } else {
+                        self.index.scan(bound_pat)
+                    };
+                    for t in scan {
                         let val = match var_pos { 0 => t.s, 1 => t.p, _ => t.o };
                         set.insert(val);
+                    }
+                }
+                filter_pats.clear();
+                filter_var_pos.clear();
+            } else {
+                for (pat, vars) in patterns.iter() {
+                    if let Some((_, var_pos)) = vars.iter().find(|(n, _)| n == var) {
+                        for t in self.index.scan(pat) {
+                            let val = match var_pos { 0 => t.s, 1 => t.p, _ => t.o };
+                            set.insert(val);
+                        }
                     }
                 }
             }
             set.into_iter().collect()
         } else {
-            leapfrog_join(eligible_iters)
+            leapfrog_join(join_iters)
         };
 
+        // Apply single-variable patterns as bound checks (consistent with SPO chain).
+        // Try predcache first for forward (s→o) existence checks.
+        let candidates: Vec<TermId> = if filter_pats.is_empty() {
+            pre_filter
+        } else {
+            pre_filter.into_iter()
+                .filter(|&val| {
+                    filter_pats.iter().zip(filter_var_pos.iter()).all(|(fpat, &fpos)| {
+                        let mut cp = *fpat;
+                        match fpos { 0 => cp.s = val, 1 => cp.p = val, _ => cp.o = val }
+                        if cp.s != UNBOUND && cp.p != UNBOUND && cp.o != UNBOUND {
+                            if let Some(pairs) = self.pred_cache.get(cp.p) {
+                                let s = cp.s;
+                                let o_target = cp.o;
+                                let lo = pairs.partition_point(|&(subj, _)| subj < s);
+                                return pairs[lo..].iter()
+                                    .take_while(|&&(subj, _)| subj == s)
+                                    .any(|&(_, obj)| obj == o_target);
+                            }
+                        }
+                        self.index.scan(&cp).next().is_some()
+                    })
+                })
+                .collect()
+        };
         for val in candidates {
             binding.insert(var.clone(), val);
             self.lft_enumerate(patterns, var_order, depth + 1, binding, rs);
@@ -5483,9 +5571,6 @@ fn optimize_triple_patterns(
 
     // ── Leapfrog Triejoin path ─────────────────────────────────────────────────
     // Emit LeapfrogJoin when 2+ patterns share at least one variable.
-    // LFT handles multi-variable intersection more efficiently than a
-    // left-deep hash-join tree by intersecting all shared variables
-    // simultaneously depth-first.
     {
         let mut var_pat_count: HashMap<&str, usize> = HashMap::new();
         for pat in &ordered {
@@ -5874,6 +5959,21 @@ fn apply_binding_to_pat(
 /// contains it has all of its *other* free variables already in `bound`.
 /// When no variable is eligible (e.g. the first step or disconnected components),
 /// the global minimum is chosen instead.
+/// Compute variable processing order for Leapfrog Triejoin.
+///
+/// Uses a greedy approach with two prioritization tiers:
+///
+/// 1. **Connected variables** (priority 0): variables reachable through a pattern
+///    where at least one OTHER variable is already bound. These benefit from index
+///    pruning because a bound variable constrains the scan range.
+///
+/// 2. **Constant-eligible variables** (priority 1): variables whose only eligible
+///    patterns have all other positions bound by constants (not variables). These
+///    produce global scans regardless of binding state.
+///
+/// Within each tier, the variable with the lowest estimated cardinality wins.
+/// This prevents type-filter patterns (e.g. `?x a SomeClass`) from being chosen
+/// before chain patterns where a bound variable dramatically reduces the scan range.
 fn lft_var_order(
     patterns: &[(TriplePattern, Vec<(String, u8)>)],
     all_vars: &[String],
@@ -5884,6 +5984,7 @@ fn lft_var_order(
     let mut remaining: Vec<String> = all_vars.to_vec();
 
     while !remaining.is_empty() {
+        // Eligible = can be processed now (all other vars in its best pattern are bound).
         let eligible: Vec<String> = remaining.iter()
             .filter(|var| {
                 patterns.iter().any(|(_, vars)| {
@@ -5898,11 +5999,22 @@ fn lft_var_order(
 
         let next_var = pool.iter()
             .min_by_key(|var| {
-                patterns.iter()
+                // Tier 0 (connected): at least one eligible pattern for this var has
+                // another variable already bound (constrains the index scan).
+                // Tier 1 (constant-eligible): eligible only through constant positions.
+                let is_connected = patterns.iter().any(|(_, vars)| {
+                    vars.iter().any(|(n, _)| n == *var)
+                    && vars.iter().filter(|(n, _)| n != *var).all(|(n, _)| bound.contains(n.as_str()))
+                    && vars.iter().filter(|(n, _)| n != *var).any(|(n, _)| bound.contains(n.as_str()))
+                });
+
+                let min_card = patterns.iter()
                     .filter(|(_, vars)| vars.iter().any(|(n, _)| n == *var))
                     .map(|(pat, _)| index.estimate(pat))
                     .min()
-                    .unwrap_or(u64::MAX)
+                    .unwrap_or(u64::MAX);
+
+                (if is_connected { 0u8 } else { 1u8 }, min_card)
             })
             .unwrap()
             .clone();

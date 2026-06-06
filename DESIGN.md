@@ -118,6 +118,18 @@ for each term i in 0..count:
 
 ID は辞書順インデックスで割り当て。Phase 2 で構築されるトリプルインデックスが同じ ID を使うため、全文字列を HashMap に展開せず一貫性が保たれる。
 
+### ブランクノード再番号付け — `reorder_bnodes`
+
+ビルド完了後、`reorder_bnodes = true`（デフォルト）のとき、ブランクノードの TermId を型ごとに連番に割り振り直し、全6インデックスをまとめて書き換えます。
+
+**目的:**
+- **インデックス一貫性**: 全6インデックスが同一エポックの TermId を共有するため、OPS/PSO/SOP の検索結果と SPO/POS/OSP の結果が正確に突き合わせられる。一部インデックスのみ更新すると TermId エポックが混在し、大述語（OPS ルーティング閾値 = `total_triples / 1000` 超）で JOIN 結果が壊れる。
+- **圧縮効率**: ブランクノードが連番になるため、delta 符号化の効率が向上（特に c2 列）。
+
+**成果物:** `bnode_remap.bin`（旧 TermId → 新 TermId の写像、u64ペア配列）。
+
+`auto_compress = true` と組み合わせると、build → reorder_bnodes → ECOCOL04 圧縮の全ステップが1プロセスで完結します。
+
 ### レジューム機能 — `--resume-phase2`
 
 長大データセットのビルドが中断した場合：
@@ -198,10 +210,12 @@ POS索引:  述語でソート → 生命科学クエリの大半（型・関係
 OSP索引:  目的語でソート → 値や概念からの逆引き
   osp.c0.zst, osp.c1.zst, osp.c2.zst, osp.skip
 
-PSO/SOP/OPS索引: オプション（ファイルが存在する場合のみロード）
-  PSO: ?s p o の主語・述語同時束縛をより効率的に処理
-  SOP: ?s ?p o の主語・目的語同時束縛をより効率的に処理
-  OPS: ?s p o の目的語・述語同時束縛に特化（POS の代替）
+PSO/SOP/OPS索引: デフォルトでビルド済み（ファイル不在の場合のみスキップ）
+  PSO: 主語・述語同時束縛を効率的に処理
+  SOP: 主語・目的語同時束縛を効率的に処理
+  OPS: 目的語・述語同時束縛に特化。大述語（triple_count > total/1000）は
+       OPS にルーティングされるため、全6インデックスが同一 TermId エポックを
+       持つことが必須（→ reorder_bnodes で保証）
 
 GSPO索引 (gspo.bin): グラフ+SPO → Named Graphs / N-Quads 対応（存在する場合のみ）
 ```
@@ -282,8 +296,8 @@ anchors[i] = c0[i × 512]  (各8バイト)
 | 規模 | c0 ファイルサイズ | anchors サイズ |
 |------|-----------------|--------------|
 | 1,000万トリプル | ~80 MB | ~156 KB |
-| 11.8M (JPostDB) | ~94 MB | ~184 KB |
 | 3,000万トリプル | ~240 MB | ~469 KB |
+| 8億トリプル | ~6.4 GB | ~10 MB |
 
 SkipIndex は `.skip` ファイルに永続化し、次回起動は `read_to_end` で即座にロードします（最初のビルド時のみ c0 の全スキャンが走りますが、ログにメッセージが出ます）。
 
@@ -294,34 +308,27 @@ POS インデックスの各述語について `[lo, hi)` のエントリ範囲�
 ```
 ファイルフォーマット: magic(8B) + pred_count(8B) + entries[(pred:u64, lo:u64, hi:u64) × pred_count]
 エントリサイズ: 24 バイト × 述語数
-例: JPostDB 数百述語 → ~数十 KB
+述語数百の場合 → ~数十 KB
 ```
 
 POS スキャン時に述語が定数であれば、PredicateIndex を参照して **c0 全体を走査せずに** 正確な `[lo, hi)` 範囲を取得できます（SkipIndex の upper-bound ではなく exact range）。
 
-**ディスク使用量の概算（ECOCOL04 / SPO+POS+OSP のみ）:**
+**ディスク使用量の概算（ECOCOL04 / 全6インデックス）:**
 
-| トリプル数 | インデックス（.zst）| 辞書（dict_sorted.bin）| GSPO付き | 合計目安 |
-|-----------|-------------------|----------------------|---------|--------|
-| 1,000万   | ~100 MB           | ~200 MB              | +180 MB | ～500 MB |
-| 1億       | ~1 GB             | ~2 GB                | +1.8 GB | ～5 GB   |
-| 8億       | ~5.9 GB           | ~13 GB               | +24 GB  | ～44 GB  |
-| 10億      | ~7 GB             | ~16 GB               | +30 GB  | ～55 GB  |
+| トリプル数 | インデックス6種（.zst）| 辞書（dict_sorted.bin）| GSPO付き | 合計目安 |
+|-----------|----------------------|----------------------|---------|--------|
+| 1,000万   | ~200 MB              | ~200 MB              | +180 MB | ～600 MB |
+| 1億       | ~2 GB                | ~2 GB                | +1.8 GB | ～6 GB   |
+| 8億       | ~8.3 GB              | ~13 GB               | +26 GB  | ～50 GB  |
 
-JPostDB（797M トリプル）での実測値:
+列ごとの圧縮効果（目安）:
 
-| ファイル | サイズ |
-|---------|------|
-| spo.c0.zst | 136 MB |
-| spo.c1.zst | 283 MB (delta のみでは 5.8 GB → 20.6× 圧縮) |
-| spo.c2.zst | 1.7 GB |
-| pos.c0.zst | 2 MB (33.8×) |
-| pos.c1.zst | 220 MB |
-| pos.c2.zst | 1.7 GB |
-| osp 3列計 | 1.9 GB |
-| dict_sorted.bin | 13 GB |
-| gspo.bin | 24 GB |
-| **合計** | **44 GB** (元 raw 108 GB から 59% 削減) |
+| 列 | 特徴 | 圧縮率（ECOCOL04）|
+|---|---|---|
+| c0（1キー目） | 長連続 → delta が小さい | 10〜100× |
+| c1（2キー目） | グループ内で昇順 | 3〜20× |
+| c2（3キー目） | グループ境界でリセット → delta が大きい | 1.5〜5× |
+| 述語列（POS/PSO の c0）| 述語数が少なく同一値の連続が非常に長い | 100×以上 |
 
 ---
 
@@ -370,10 +377,10 @@ HDD ランダム I/O のコストが高い環境では、頻用述語の全ペ�
 budget = pred_cache_mb × 1 MiB
 per-pred cap = pred_cache_per_pred_cap_mb (0 のとき pred_cache_mb / 2)
 
-例: JPostDB, pred_cache_mb=2048, per_pred_cap_mb=200
-  → faldo:begin    (11.8M × 16B = 188MB) ✓ キャッシュ
-  → faldo:position (11.8M × 16B = 188MB) ✓ キャッシュ
-  → jpo:someHugePred (479MB) → cap 超過のためスキップ
+例: pred_cache_mb=2048, per_pred_cap_mb=200
+  → faldo:begin    (N ペア × 16B ≤ 200MB) ✓ キャッシュ
+  → faldo:position (N ペア × 16B ≤ 200MB) ✓ キャッシュ
+  → rdf:type や巨大述語 (> 200MB) → cap 超過のためスキップ
   → その他小述語   … 予算の残りで順次キャッシュ
 ```
 
@@ -396,10 +403,10 @@ rdf-config の `model.yaml` から抽出した**複合プロパティパス**（
 ```
 例: faldo パス [faldo:begin, faldo:position] を実体化
   手順:
-  1. POS で faldo:begin 全件 → (s, m) ペア 11.8M 件
-  2. POS で faldo:position 全件 → (m, o) ペア 11.8M 件
+  1. POS で faldo:begin 全件 → (s, m) ペア N 件
+  2. POS で faldo:position 全件 → (m, o) ペア N 件
   3. 結合 (s, o) を Vec に格納・ソート
-  消費メモリ ≈ 11.8M × 16B = 188MB
+  消費メモリ ≈ N × 16B
 
 SPARQL クエリ時:
   ?protein faldo:begin/faldo:position ?pos
@@ -418,9 +425,8 @@ SPARQL クエリ時:
 `?x a SomeClass` フィルタを O(1) lookup に変換します。
 
 ```
-jpost:Peptide         → RoaringTreemap { 3.7M subjects }  ~2-4 MB
-jpost:PeptideEvidence → RoaringTreemap { 9.3M subjects }  ~5-9 MB
-jpost:PSM             → RoaringTreemap { 10.5M subjects } ~5-10 MB
+up:Protein      → RoaringTreemap { ~560K subjects }  ~1 MB
+SomeClass       → RoaringTreemap { 数百万 subjects } ~数 MB
 ```
 
 設定: `server.type_cache_mb`（デフォルト 256 MB）。
@@ -432,11 +438,11 @@ PathCache と TypeCache はビルドに時間がかかるため、初回起動�
 
 | キャッシュ | ファイル | 初回ビルド時間 | 2回目以降ロード |
 |----------|---------|------------|-------------|
-| PathCache | `path_cache.bin` | ~23s (JPostDB 16パス) | ~3s |
-| TypeCache | `type_cache.bin` | ~24s (235クラス) | ~1s |
-| PredCache | なし（毎回ビルド） | ~72s | ~72s (永続化の効果なし) |
+| PathCache | `path_cache.bin` | 数十秒（パス数・トリプル数依存） | 数秒 |
+| TypeCache | `type_cache.bin` | 数十秒（クラス数・トリプル数依存） | ~1s |
+| PredCache | なし（毎回ビルド） | pred_cache_mb 量依存 | — (永続化の効果なし) |
 
-PredCache は非圧縮で 6.4GB と大きく、ファイルからの読み込みがビルドより遅いため
+PredCache は非圧縮データが大きく、ファイルからの読み込みよりビルドが速いため
 永続化を行いません。インデックスが更新された場合（`ecordf build` 再実行後）、
 参照インデックスファイル（`spo.c0` 等）の mtime と比較し自動的に再ビルドします。
 
@@ -470,19 +476,19 @@ else:
 
 ### フィルタリング hash join (`eval_sequence_with_subject_filter`)
 
-通常の hash join は Sequence パスのステップ 0 を全件スキャン（例: faldo:begin 11.8M 件）し、ステップ 1 の HashMap が 11.8M エントリになります。左辺の JOIN 変数の主語集合が既知の場合、ステップ 0 の直後にフィルタリングして中間結果を大幅に削減できます。
+通常の hash join は Sequence パスのステップ 0 を全件スキャン（例: faldo:begin の全 N 件）し、ステップ 1 の HashMap が N エントリになります。左辺の JOIN 変数の主語集合が既知の場合、ステップ 0 の直後にフィルタリングして中間結果を大幅に削減できます。
 
 ```
 通常の hash_join（Sequence [faldo:begin, faldo:position]）:
-  step 0: POS(faldo:begin)  → 11.8M (s, m) ペア
-  step 1: batch_scan        → 11.8M エントリの HashMap を構築 → ~18s
+  step 0: POS(faldo:begin)  → N (s, m) ペア
+  step 1: batch_scan        → N エントリの HashMap を構築
 
-フィルタリング hash_join（左辺の主語集合が既知: N=508 タンパク質）:
-  step 0: POS(faldo:begin)  → 11.8M (s, m) ペア
-  retain: subject_filter で s ∉ {508 IDs} を除去 → 508 (s, m) ペア
-  step 1: batch_scan        → 508 エントリの HashMap を構築 → ~5s
+フィルタリング hash_join（左辺の主語集合が既知: K 件、K << N）:
+  step 0: POS(faldo:begin)  → N (s, m) ペア
+  retain: subject_filter で s ∉ {K IDs} を除去 → K (s, m) ペア
+  step 1: batch_scan        → K エントリの HashMap を構築
 
-削減比: 11.8M → 508 = 約 23,000 倍
+削減比: N/K 倍（K が小さいほど効果大）
 ```
 
 実装: `eval_sequence_with_subject_filter(steps, s, o, subject_filter: &HashSet<TermId>)`。  
@@ -526,7 +532,7 @@ else:
 | CONSTRUCT | 未実装（`QueryError::Unsupported`） |
 | SPARQL UPDATE (INSERT/DELETE) | 未実装 |
 | SERVICE (フェデレーション) | 未実装 |
-| Leapfrog の多変数完全実装 | 共有変数が2つ以上のとき hash join にフォールバック |
+| Leapfrog streaming カーソル | 多変数対応は実装済み。ただし現実装は Vec 全量 collect のため巨大述語では OOM リスクあり（`LftCursor` への置き換えが課題）|
 | FILTER NOT EXISTS の最適化 | 現在は相関評価（全行についてサブパターンを逐次実行）。大規模データではアンチジョインへの変換が必要 |
 | STRDT / STRLANG / BNODE / RAND / UUID / SHA系ハッシュ | 未実装 |
 
@@ -762,7 +768,7 @@ ecordf/
 │   │                    JSON / XML / TSV / CSV レスポンス
 │   │                    CORS オプション対応
 │   └── main.rs        CLI: build / serve / query / stats / compress-cols / recompress-zstd
-│                        build: --resume-phase2 / --auto-compress-cols / --auto-compress-zstd
+│                        build: --resume-phase2 / --auto-compress
 │                        serve: --host / --port / --cors / --config / --warmup-mb
 │                               --pred-cache-mb / --pred-cache-per-pred-cap-mb
 │                               --rdf-config / --path-cache-mb
@@ -897,8 +903,7 @@ $EDITOR ./uniprot-store/ecordf.toml
 | `build.chunk_size` | 5,000,000 | 外部ソートのトリプルチャンクサイズ（0=レガシー1パス） |
 | `build.dict_chunk_mb` | 200 | Phase 1 文字列バッファの RAM 上限（MiB） |
 | `build.parallel_threads` | 0 | 並列ロードスレッド数（0=全 CPU コア） |
-| `build.auto_compress_cols` | false | ビルド後に `compress-cols`（ECOCOL02/03 delta）を自動実行 |
-| `build.auto_compress_zstd` | false | `compress-cols` 後に `recompress-zstd`（ECOCOL04）を自動実行。HDD/SATA SSD 環境で推奨 |
+| `build.auto_compress` | false | ビルド後に delta + Zstd 圧縮（ECOCOL04、`.c0.zst`）を自動適用。HDD/SSD 環境で推奨 |
 | `query.max_intermediate_rows` | 50,000,000 | 中間結果の行数上限（OOM防止） |
 | `query.bind_join_threshold` | 10,000 | bind_join / hash_join の切り替え閾値 |
 | `server.host` | `127.0.0.1` | バインドアドレス |
@@ -916,27 +921,26 @@ $EDITOR ./uniprot-store/ecordf.toml
 
 ```bash
 # ローカル起動（設定はecordf.tomlまたはデフォルト値）
-./target/release/ecordf serve --dir ./jpostdb-store
+./target/release/ecordf serve --dir ./store
 
 # CLIフラグはconfigファイルより優先
-./target/release/ecordf serve --dir ./jpostdb-store --host 0.0.0.0 --port 8080
+./target/release/ecordf serve --dir ./store --host 0.0.0.0 --port 8080
 
 # CORS許可（全オリジン）
-./target/release/ecordf serve --dir ./jpostdb-store --cors '*'
+./target/release/ecordf serve --dir ./store --cors '*'
 
 # コールドスタート対策: 起動直後に 8 GB 分のインデックスをページキャッシュへ読み込む
-./target/release/ecordf serve --dir ./uniprot-store --warmup-mb 8192
+./target/release/ecordf serve --dir ./store --warmup-mb 8192
 
-# 述語キャッシュ: faldo:begin/position (各 188 MB) をキャッシュ、巨大述語は除外
-# --pred-cache-per-pred-cap-mb 200 により 479 MB 超の述語をスキップ
-./target/release/ecordf serve --dir ./jpostdb-store \
+# 述語キャッシュ: faldo:begin/position をキャッシュ、巨大述語は per-pred-cap で除外
+./target/release/ecordf serve --dir ./store \
   --pred-cache-mb 2048 \
   --pred-cache-per-pred-cap-mb 200
 
 # rdf-config パスキャッシュ: faldo パスを 512 MB 予算で事前実体化
-./target/release/ecordf serve --dir ./jpostdb-store \
+./target/release/ecordf serve --dir ./store \
   --pred-cache-mb 2048 --pred-cache-per-pred-cap-mb 200 \
-  --rdf-config https://github.com/dbcls/rdf-config/tree/master/config/jpostdb \
+  --rdf-config https://github.com/dbcls/rdf-config/tree/master/config/YOUR_DB \
   --path-cache-mb 512
 
 # 起動ログ例:
@@ -944,7 +948,7 @@ $EDITOR ./uniprot-store/ecordf.toml
 #   Opening indexes...
 #     indexes opened in 2.31s
 #   Loading statistics...
-#   Opened store: 11,823,456 triples, 3,201,847 terms
+#   Opened store: 142,357,891 triples, 28,456,123 terms
 #   Building predicate cache (2048 MB, per-predicate cap = 200 MB)...
 #   Predicate cache ready (1842 MB used).
 ```
@@ -975,14 +979,14 @@ POST http://localhost:7878/sparql
 | 起動時間 | mmap のため index オープン自体は即時。ただし `open_with_config` 内でディスクから `.skip`/`.pidx`/`stats.bin` を読み込むため、コールドキャッシュ時は数秒かかる（ログで各ステップを可視化）。`--warmup-mb` でバックグラウンドウォームアップを有効化するとコールドスタート後の初回クエリが速くなる |
 | 起動時 RAM | PredCache: `pred_cache_mb` MiB（同期ビルド）。PathCache: `path_cache_mb` MiB（同期ビルド）。設定 0 の場合ゼロ |
 | クエリ時 RAM | ワーキングセット依存（OS ページキャッシュで管理） |
-| ビルド時ピーク RAM | 2パス外部ソートにより定数。Phase 1: `dict_chunk_mb × スレッド数` MB。Phase 2A: `chunk_size × 72B`。Phase 2B (Streaming): Phase 1 と同予算（`dict_chunk_mb × スレッド数`）|
+| ビルド時ピーク RAM | 2パス外部ソートにより定数。Phase 1: `dict_chunk_mb × スレッド数` MB。Phase 2A: `chunk_size × 72B`。Phase 2B (Streaming): Phase 1 と同予算（`dict_chunk_mb × スレッド数`）。`auto_compress = true` 時は追加で Zstd 圧縮バッファ（≤ 数十 MB）|
 | 並列クエリ処理 | 対応（tokio blocking pool） |
 | Property Path (* 転移閉包) | BFS（対応済） |
 | Named Graphs (GRAPH句) | GSPO索引（対応済） |
 
 ### 並列クエリ処理
 
-1クエリの内部処理はシングルスレッドですが、**複数クエリは並列に処理されます**。
+**クエリ間並列**と**クエリ内部の部分的並列化**の両方を実装しています。
 
 ```
 tokio worker threads (num_cpus):  HTTPコネクション管理・I/O
@@ -990,12 +994,22 @@ tokio blocking pool (最大512):    クエリ実行 (spawn_blocking)
 Semaphore (max_concurrent_queries): アプリ層の同時数キャップ
 ```
 
-各クエリは `spawn_blocking` でブロッキング専用スレッドプールに委譲されるため、非同期ワーカースレッドをブロックしません。`max_concurrent_queries = 0`（デフォルト）の場合はtokioの上限（512）まで並列実行できます。重いクエリが多い場合は `max_concurrent_queries = 2 × CPUコア数` を推奨します。
+各クエリは `spawn_blocking` でブロッキング専用スレッドプールに委譲されるため、非同期ワーカースレッドをブロックしません。`max_concurrent_queries = 0`（デフォルト）の場合はtokioの上限（512）まで並列実行できます。
+
+**クエリ内部の並列化（rayon）:**
+
+| 処理 | 実装 |
+|------|------|
+| ORDER BY ソート | `par_sort_unstable_by`（大結果セットで ~4× 高速化） |
+| hash_join probe フェーズ | `par_iter().flat_map()` による並列プローブ |
+| UNION ブランチ（トップレベル）| `rayon::join` で両ブランチを並列実行 |
+
+並列ブランチ実行には `Executor::fork()` を使用し、全インデックス・キャッシュを Arc クローンで共有しつつスレッドローカル状態（`scan_dontneed_bytes`, `pushdown_limit`）をリセットします。
 
 ### スケール時の制約
 
-- **1クエリの内部処理**: シングルスレッド。広域スキャンが絡む単一クエリでは内部並列実行を持つシステムに劣る場合があります。
-- **Leapfrog**: 共有変数が2つ以上のパターンはハッシュジョインにフォールバックします（完全な多変数 Leapfrog は今後の課題）。
+- **1クエリの内部処理**: ORDER BY ソート・hash_join probe フェーズ・UNION ブランチは rayon で並列化済み。ただし LFTJ 列挙など主要な実行ループはシングルスレッドのまま。
+- **Leapfrog の Vec collect**: 多変数対応は実装済み（`lft_enumerate` による再帰的深さ優先列挙）。ただし各パターンの候補値を `Vec` に全量 collect してから交差するため、巨大述語の直接スキャンが必要なパターンでは OOM リスクがあります。
 - **クエリ時辞書**: `ReadonlyDict`（2パス構築後）はホットキャッシュ (≤ 4M エントリ / ~400 MB) + mmap で動作します。レガシー1パス時は `dict.bin` を全件 HashMap に展開するためデータセット規模に比例します。
 
 ---
@@ -1051,14 +1065,14 @@ L1 anchors: 3Bトリプルで ~5.86M × 8B ≈ 47 MB (キャッシュ外)
 
 既存の `eval_sequence_with_subject_filter` に加え、hash_join パス全体に SIP 事前フィルタを追加。
 
-**既存 SIP**: 2-hop Sequence パスの step 0 → step 1 削減 (11.8M → 508)
+**既存 SIP**: 2-hop Sequence パスの step 0 → step 1 削減（N → K、K << N）
 
 **新規 SIP**: `hash_join` 選択時、`right_rs` を実行後・結合前にフィルタリング。
 
 ```
 条件: left_rs.rows < right_rs.rows / 10 かつ共有変数ごとの left値集合 ≤ 100,000
 効果: right_rs から join 不可能な行を除去 → hash_join のメモリと処理コストを削減
-例: left=508 peptide, right=10M rdf:type → right を508行にフィルタ後 join
+例: left=K タンパク質, right=大量 rdf:type → right を K 行にフィルタ後 join
 ```
 
 SIP_MAX_LEFT_VALUES = 100,000。超過時はフィルタをスキップして従来の hash_join へ。
@@ -1081,9 +1095,8 @@ executor.rs の `bind_join` 内 pred_partition パスで、機能的述語検出
 ## 今後の拡張候補
 
 1. **SPARQL UPDATE** — INSERT DATA / DELETE DATA / MODIFY
-2. **クエリ内部の並列化** — rayon による JOIN 内部のスレッド並列化（クエリ間並列は実装済み）
-3. **Leapfrog 多変数完全実装** — 共有変数が2つ以上の場合も Leapfrog で処理
-4. **SPARQL Federation** — SERVICE 句による外部エンドポイント連携
+2. **Leapfrog streaming カーソル** — 現在の `lft_enumerate` は各パターンから値を `Vec` に全量 collect してから `leapfrog_join` する。巨大述語では OOM のリスクがある。`LftCursor` によるストリーミング交差（Vec 確保ゼロ）への置き換えが必要
+3. **SPARQL Federation** — SERVICE 句による外部エンドポイント連携
 5. **CONSTRUCT** — RDF グラフを返すクエリ形式
 6. **FILTER NOT EXISTS のアンチジョイン最適化** — 現在は相関評価。大規模データには LEFT ANTI JOIN への変換が必要
 7. **STRDT / STRLANG / BNODE / RAND / UUID / SHA 系** — 未実装の SPARQL 1.1 組み込み関数
@@ -1091,5 +1104,5 @@ executor.rs の `bind_join` 内 pred_partition パスで、機能的述語検出
 9. **HyperLogLog** — subject_count / object_count の近似カウント（現在は2パス全スキャン）
 10. **BOUND_VAR_FACTOR の自動調整** — 述語の distinctiveness から動的に推定倍率を計算
 11. **ReadonlyDict のキャッシュ戦略改善** — ホットキャッシュを LRU 化して偏りのあるアクセスパターンに対応
-12. **フィルタリング hash join の対象拡大** — 現状は 2-hop Sequence のみ。3-hop 以上や Alternative パスにも適用を検討
+12. **フィルタリング hash join の Alternative パス対応** — `PropertyPath::Sequence` は 2-hop 以上すべてで動作済み（`steps.len() >= 2`）。`Alternative` パスへの適用は未対応
 13. **ecordf build 時の path/type cache 事前ビルド** — `ecordf build` で rdf-config を指定すれば初回起動をさらに高速化できる
