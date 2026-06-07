@@ -5665,29 +5665,43 @@ fn optimize_triple_patterns(
                 }
             }
             if lft_ok {
-                // ── カーディナリティゲート ──────────────────────────────────
-                // LFTJ は「いずれかのパターンが定数で絞られ小集合になる」場合のみ有効。
-                // 全パターンが大規模 (例: type クラス全体) だと、LIMIT pushdown が
-                // 効かないクエリ (DISTINCT / ORDER BY / GROUP BY) で全件列挙となり
-                // 各要素ごとの未キャッシュ述語ランダム seek で著しく遅くなる。
-                // その場合は prefetch + pushdown を持つ bind_join (Phase 2) に委ねる。
-                const LFTJ_MAX_MIN_CARD: u64 = 500_000;
-                let min_card = lft_patterns.iter()
-                    .map(|(pat, _)| index.estimate(pat))
-                    .min()
-                    .unwrap_or(u64::MAX);
-                if min_card > LFTJ_MAX_MIN_CARD {
+                // ── chain vs star 判定 ──────────────────────────────────────
+                // LFTJ が有効なのは「星型交差」= ある変数で2つ以上の多変数
+                // パターンが同時に eligible になり leapfrog 交差が起きる場合のみ。
+                // 各変数で eligible な多変数パターンが常に高々1つの「展開連鎖」は
+                // leapfrog の利点が無く、prefetch 付き bind_join の方が速い。
+                let max_join_iters = lft_max_join_iters(&lft_patterns, index);
+                if max_join_iters < 2 {
                     tracing::debug!(
-                        min_card,
-                        "optimize_triple_patterns: LFTJ skipped (no selective anchor) → bind_join"
+                        max_join_iters,
+                        "optimize_triple_patterns: LFTJ skipped (pure chain, no intersection) → bind_join"
                     );
                 } else {
-                    tracing::debug!(
-                        patterns = lft_patterns.len(),
-                        min_card,
-                        "optimize_triple_patterns: emitting LeapfrogJoin"
-                    );
-                    return ExecutionPlan::LeapfrogJoin { patterns: lft_patterns };
+                    // ── カーディナリティゲート ──────────────────────────────────
+                    // LFTJ は「いずれかのパターンが定数で絞られ小集合になる」場合のみ有効。
+                    // 全パターンが大規模 (例: type クラス全体) だと、LIMIT pushdown が
+                    // 効かないクエリ (DISTINCT / ORDER BY / GROUP BY) で全件列挙となり
+                    // 各要素ごとの未キャッシュ述語ランダム seek で著しく遅くなる。
+                    // その場合は prefetch + pushdown を持つ bind_join (Phase 2) に委ねる。
+                    const LFTJ_MAX_MIN_CARD: u64 = 500_000;
+                    let min_card = lft_patterns.iter()
+                        .map(|(pat, _)| index.estimate(pat))
+                        .min()
+                        .unwrap_or(u64::MAX);
+                    if min_card > LFTJ_MAX_MIN_CARD {
+                        tracing::debug!(
+                            min_card,
+                            "optimize_triple_patterns: LFTJ skipped (no selective anchor) → bind_join"
+                        );
+                    } else {
+                        tracing::debug!(
+                            patterns = lft_patterns.len(),
+                            min_card,
+                            max_join_iters,
+                            "optimize_triple_patterns: emitting LeapfrogJoin"
+                        );
+                        return ExecutionPlan::LeapfrogJoin { patterns: lft_patterns };
+                    }
                 }
             }
         }
@@ -6059,6 +6073,47 @@ fn apply_binding_to_pat(
 /// Within each tier, the variable with the lowest estimated cardinality wins.
 /// This prevents type-filter patterns (e.g. `?x a SomeClass`) from being chosen
 /// before chain patterns where a bound variable dramatically reduces the scan range.
+/// LFTJ が「星型交差」を含むかを静的に判定する。
+/// var_order に沿って lft_enumerate の join_iters 構築を事前シミュレートし、
+/// ある変数で同時に eligible になる多変数パターン数の最大を返す。
+/// 最大 >= 2 なら真の leapfrog 交差が起きる (= star)。
+/// 最大 < 2 なら純粋な展開連鎖 (= chain) で、bind_join の方が速い。
+fn lft_max_join_iters(
+    patterns: &[(TriplePattern, Vec<(String, u8)>)],
+    index: &TripleIndex,
+) -> usize {
+    // all_vars 収集 (execute_leapfrog_join と同一ロジック)
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut all_vars: Vec<String> = Vec::new();
+    for (_, vars) in patterns {
+        for (name, _) in vars {
+            if seen.insert(name.clone()) { all_vars.push(name.clone()); }
+        }
+    }
+    if all_vars.is_empty() { return 0; }
+
+    let var_order = lft_var_order(patterns, &all_vars, index);
+    let mut bound: HashSet<String> = HashSet::new();
+    let mut max_join_iters = 0usize;
+
+    for var in &var_order {
+        let mut count = 0usize;
+        for (_, vars) in patterns.iter() {
+            let mentions_var = vars.iter().any(|(n, _)| n == var);
+            let has_other_vars = vars.iter().any(|(n, _)| n != var);
+            let all_others_bound = vars.iter()
+                .filter(|(n, _)| n != var)
+                .all(|(n, _)| bound.contains(n.as_str()));
+            if mentions_var && has_other_vars && all_others_bound {
+                count += 1;
+            }
+        }
+        if count > max_join_iters { max_join_iters = count; }
+        bound.insert(var.clone());
+    }
+    max_join_iters
+}
+
 fn lft_var_order(
     patterns: &[(TriplePattern, Vec<(String, u8)>)],
     all_vars: &[String],
