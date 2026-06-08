@@ -60,7 +60,6 @@ src/
 ├── predcache.rs       → タスク6 (述語キャッシュ)
 ├── path_cache.rs      → タスク6 (多ホップパスキャッシュ)
 ├── type_cache.rs      → タスク6 (型キャッシュ、RoaringTreemap)
-├── pred_partition.rs  → タスク6 (オンディスク述語パーティション)
 ├── rdf_config.rs      → タスク7 (rdf-config 統合)
 ├── server.rs          → タスク7 (HTTP サーバー)
 └── main.rs            → タスク7 (CLI)
@@ -136,7 +135,6 @@ pub enum IndexKind { Spo, Pos, Osp, Pso, Sop, Ops }
 | `dict_sorted.bin` | 辞書（クエリ時） | ESRT0001 |
 | `stats.bin` | 述語統計 | ECOSTAT2 |
 | `gspo.bin` | Named Graph 索引 | ECOG0002 |
-| `pred_parts/pp_*.bin` | 述語パーティション | ECPP0001 |
 
 Delta 圧縮が存在する場合（`*.dz`）は自動的に優先される。
 
@@ -181,6 +179,25 @@ rdf_configs = [...]           # rdf-config の URL またはパス
 - SERVICE（フェデレーション）未実装
 - GROUP BY の大規模中間結果でのストリーミング集計は部分実装（COUNT DISTINCT は未対応）
 - 1クエリの内部並列化未実装（クエリ間並列は実装済み）
+
+## 削除済み機能（効果が実証されるまで安易に再実装しない）
+
+- **述語パーティション (pred_parts / PredPartitions / ECPP0001 / `build-pred-parts` /
+  `auto_pred_parts`)** — 2026-06-07 にコードごと完全削除。
+  「pred_cache に載らない大述語を無圧縮ソート(S,O)配列の mmap + 二分探索で補完する」
+  オンディスク二次索引だったが、jpost(797Mトリプル, RAM潤沢)での **同一バイナリ
+  A/B 実測で全クエリが逆効果**（pred_parts 有/無: NEW-4 15s/2s, B-3 36s/4s,
+  B-1 13s/2s, G-3 70s/34s, H-3 136s/88s）。
+  理由: 本体 index(.zst+skip) に対し展開CPUを省く代わりにデータが約3.5倍。
+  RAM潤沢なら小さい圧縮版が warmup 常駐して勝ち、RAM不足/HDDなら3.5倍バイトが
+  ディスクで不利。「無圧縮版を載せる RAM があるなら小さい圧縮版も載る」という
+  自己矛盾で勝てる帯域がほぼ無い。加えて無条件 pred_parts 優先・warmup 対象外で悪化。
+  **絶対禁止ではないが、優位な効果がデータで実証されるまで安易に再実装しないこと。**
+  復活させるなら「環境を当てる」素朴な実装ではなく、
+  **エンジンがウォーム度・選択率でコスト比較して index/pred_parts を選ぶ適応
+  ルーティング**を伴わせること（それ無しの素朴な復活は再び逆効果になった）。
+  実際の高速化は LIMIT pushdown 側で得た（H-3 143→88s）。
+  詳細は report/ の verify 比較と当時の調査ログ参照。
 
 ## クロスモジュール変更の例
 

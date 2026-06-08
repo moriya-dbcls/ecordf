@@ -230,16 +230,14 @@ impl StoreStatistics {
     ///
     /// Functional predicates include: `dct:identifier`, `up:mnemonic`,
     /// `schema:name` for most entities, `xsd:value`, etc.  For these, the
-    /// (S → O) mapping can be resolved in O(log N) via PredPartitions with
-    /// a single binary search, rather than returning a range of multiple objects.
+    /// (S → O) mapping is a single value, so a lookup can return exactly one
+    /// object rather than a range of multiple objects.
     ///
     /// ## Why this matters
     ///
     /// When a pattern `?x pred:functional ?value` is used in a JOIN where `?x`
-    /// is already bound, the executor can:
-    ///   - Skip the general POS scan (may touch many OS pairs)
-    ///   - Use `PredPartFile::get_single_object(s)` → exactly one result
-    ///   - Avoid allocating a Vec for the scan output
+    /// is already bound, the executor can treat each subject as having at most
+    /// one object and avoid allocating a Vec for a multi-object scan output.
     ///
     /// This is detected statically from `stats.bin` so there is no runtime cost.
     #[inline]

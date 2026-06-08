@@ -37,7 +37,6 @@ use crate::config::QueryConfig;
 use crate::dict_builder::QueryDict;
 use crate::index::{GspoIndexFile, TripleIndex};
 use crate::path_cache::PathCache;
-use crate::pred_partition::PredPartitions;
 use crate::predcache::{self, PredCache};
 use crate::stats::StoreStatistics;
 use crate::triple::{TermId, TriplePattern, UNBOUND};
@@ -186,8 +185,6 @@ pub struct Executor<'a> {
     pub path_cache: PathCache,
     /// Per-class subject membership cache for `?x a SomeClass` filter patterns.
     pub type_cache: TypeCache,
-    /// On-disk per-predicate sorted (S,O) partition files.
-    pub pred_partitions: PredPartitions,
     /// Cancellation flag set by the query-timeout task.
     ///
     /// Checked at each bind_join inner-loop iteration.  When `true`, execution
@@ -209,15 +206,50 @@ pub struct Executor<'a> {
     /// Uses `Cell` so it can be updated from `&self` context without changing
     /// function signatures across the recursive call tree.
     pushdown_limit: AtomicUsize,
+    /// LIMIT pushdown context flag: `true` iff the rows produced by the node
+    /// currently being executed form a *prefix* (order-preserving subset) of the
+    /// final query output.  Only then is it safe for an operator to truncate /
+    /// early-exit at `pushdown_limit` rows.
+    ///
+    /// It is `false` whenever the current node is an **inner operand of a join**
+    /// (hash_join build/probe side, path materialisation, bind_join probe, the
+    /// `opt` side of an OPTIONAL, a Filter's input, a named-graph subtree, …):
+    /// there the node's rows are NOT the final output (they are further joined /
+    /// filtered upward), so truncating them would drop rows that the real result
+    /// needs — the bug that turned C-2 into 0 rows.
+    ///
+    /// Set/cleared with `without_pushdown()` (save → false → restore) around the
+    /// operand recursions, and read by `limit_prefix_reached()`.  Like
+    /// `pushdown_limit` it is an atomic so it can be updated from `&self` without
+    /// threading a parameter through the whole recursive call tree.  Pre-existing
+    /// bind_join / leapfrog / predicate-scan early-exits intentionally do NOT
+    /// consult this flag — they are unchanged from before and validated as the
+    /// correctness oracle.
+    limit_applies: AtomicBool,
+    /// Exponential-budget-retry signal for FILTER + LIMIT pushdown.
+    ///
+    /// A residual FILTER drops rows, so capping its raw input at `pushdown_limit`
+    /// can leave fewer than LIMIT rows after filtering.  `execute_select` then
+    /// doubles the budget and re-runs.  To know whether doubling could find more,
+    /// a Filter node in prefix position sets this flag `true` when its raw input
+    /// was actually capped by the budget (`input_rows >= pushdown_limit`); a
+    /// `false` value after a run means the source was exhausted, so the < LIMIT
+    /// result is final and the retry loop stops.  Reset to `false` before each
+    /// budgeted run in `execute_select`; only ever set to `true` by a Filter.
+    ///
+    /// Shared (`Arc`) so parallel UNION branch forks set the *same* flag the
+    /// parent's retry loop reads — otherwise a capped filter inside a forked
+    /// branch would be invisible and the loop could stop early (undercount).
+    pushdown_cutoff_hit: Arc<AtomicBool>,
 }
 
 impl<'a> Executor<'a> {
     pub fn new(index: &'a TripleIndex, dict: &'a QueryDict) -> Self {
-        Self { index, dict, config: QueryConfig::default(), stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: AtomicUsize::new(usize::MAX) }
+        Self { index, dict, config: QueryConfig::default(), stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: AtomicUsize::new(usize::MAX), limit_applies: AtomicBool::new(true), pushdown_cutoff_hit: Arc::new(AtomicBool::new(false)) }
     }
 
     pub fn with_config(index: &'a TripleIndex, dict: &'a QueryDict, config: QueryConfig) -> Self {
-        Self { index, dict, config, stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: AtomicUsize::new(usize::MAX) }
+        Self { index, dict, config, stats: None, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: AtomicUsize::new(usize::MAX), limit_applies: AtomicBool::new(true), pushdown_cutoff_hit: Arc::new(AtomicBool::new(false)) }
     }
 
     pub fn with_config_and_stats(
@@ -226,7 +258,7 @@ impl<'a> Executor<'a> {
         config: QueryConfig,
         stats: Option<&'a StoreStatistics>,
     ) -> Self {
-        Self { index, dict, config, stats, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: AtomicUsize::new(usize::MAX) }
+        Self { index, dict, config, stats, pred_cache: PredCache::empty(), path_cache: PathCache::empty(), type_cache: TypeCache::empty(), cancel: Arc::new(AtomicBool::new(false)), scan_dontneed_bytes: 0, pushdown_limit: AtomicUsize::new(usize::MAX), limit_applies: AtomicBool::new(true), pushdown_cutoff_hit: Arc::new(AtomicBool::new(false)) }
     }
 
     /// Builder: attach a TypeCache.
@@ -241,21 +273,32 @@ impl<'a> Executor<'a> {
             pred_cache:          self.pred_cache.clone(),
             path_cache:          self.path_cache.clone(),
             type_cache:          self.type_cache.clone(),
-            pred_partitions:     self.pred_partitions.clone(),
             cancel:              self.cancel.clone(),
             scan_dontneed_bytes: 0,
-            pushdown_limit:      AtomicUsize::new(usize::MAX),
+            // Propagate the LIMIT pushdown budget into forked executors.
+            // fork() is used only by the parallel UNION path (rayon::join over
+            // the two branches).  Without this, each branch ran with
+            // pushdown_limit = MAX and materialised its whole BGP (observed:
+            // 3.7M rows for H-3) even though the enclosing query had LIMIT N.
+            // The budget applies to the UNION as a whole; letting each branch
+            // stop at `budget` rows is safe because the concatenated result is
+            // truncated to `budget` afterwards and SPARQL LIMIT is an upper
+            // bound (an arbitrary N rows is a valid answer without ORDER BY).
+            pushdown_limit:      AtomicUsize::new(self.pushdown_limit.load(Ordering::Relaxed)),
+            // Inherit the prefix flag too: fork() is used for the parallel UNION
+            // branches, which are prefix-preserving exactly when the UNION itself
+            // is (i.e. when the UNION is not an inner join operand).  Copying the
+            // current value gives each branch the UNION's prefix context, so a
+            // branch only truncates when truncation is safe for the whole query.
+            limit_applies:       AtomicBool::new(self.limit_applies.load(Ordering::Relaxed)),
+            // Share the parent's flag (Arc clone) so a capped filter inside a
+            // forked UNION branch is visible to the parent's retry loop.
+            pushdown_cutoff_hit: self.pushdown_cutoff_hit.clone(),
         }
     }
 
     pub fn with_type_cache(mut self, cache: TypeCache) -> Self {
         self.type_cache = cache;
-        self
-    }
-
-    /// Builder: attach PredPartitions.
-    pub fn with_pred_partitions(mut self, parts: PredPartitions) -> Self {
-        self.pred_partitions = parts;
         self
     }
 
@@ -285,6 +328,36 @@ impl<'a> Executor<'a> {
     fn is_limit_reached(&self, rows: usize) -> bool {
         let v = self.pushdown_limit.load(Ordering::Relaxed);
         v != usize::MAX && rows >= v
+    }
+
+    /// Returns `true` only when it is safe to truncate / early-exit at the
+    /// pushdown limit: the limit budget is set AND the current node's rows form a
+    /// prefix of the final query output (`limit_applies`).
+    ///
+    /// All truncation / early-exit added for LIMIT pushdown on operators that can
+    /// appear as a join's inner operand (Scan, path, hash_join, UNION, OPTIONAL
+    /// main, Extend) must gate on THIS, not `is_limit_reached`.  When the node is
+    /// an inner operand `limit_applies` is `false`, so this returns `false` and
+    /// the full (untruncated) operand is produced — exactly as before the LIMIT
+    /// pushdown work, which is what makes the result correct (cf. C-2).
+    #[inline]
+    fn limit_prefix_reached(&self, rows: usize) -> bool {
+        self.limit_applies.load(Ordering::Relaxed) && self.is_limit_reached(rows)
+    }
+
+    /// Run `f` with the prefix flag cleared, restoring it afterwards.
+    ///
+    /// Use this around any recursion that produces an **inner join operand**
+    /// (whose rows are NOT a prefix of the final output): the callee — and every
+    /// node beneath it — then sees `limit_applies == false`, so no pushdown
+    /// truncation fires inside it.  Restoring on return keeps sibling operands
+    /// that *are* prefixes (e.g. the next UNION branch) unaffected.
+    #[inline]
+    fn without_pushdown<R>(&self, f: impl FnOnce() -> R) -> R {
+        let saved = self.limit_applies.swap(false, Ordering::Relaxed);
+        let r = f();
+        self.limit_applies.store(saved, Ordering::Relaxed);
+        r
     }
 
     /// Builder: attach a predicate cache.
@@ -326,21 +399,37 @@ impl<'a> Executor<'a> {
         // does not require all rows (no ORDER BY / DISTINCT / GROUP BY / HAVING /
         // aggregates).  Stops joins early once `limit + offset` rows are found.
         // Reset to None after execution so subquery calls don't bleed the limit.
+        // NOTE: residual FILTER no longer disables pushdown.  A FILTER drops rows,
+        // so capping its raw input at `limit+offset` can leave fewer survivors —
+        // handled below by the exponential-budget retry loop, which doubles the
+        // budget until LIMIT survivors are found or the source is exhausted.  This
+        // replaces the previous `&& !plan_has_residual_filter(&plan)` gate that
+        // made FILTER+LIMIT queries scan the whole dataset (E-2 ≈ 200 s).
         let can_pushdown = query.order_by.is_empty()
             && !query.distinct
             && query.group_by.is_empty()
             && query.having.is_empty()
             && !projection_has_aggregates(query);
-        if can_pushdown {
-            if let Some(lim) = query.limit {
-                let budget = (lim as usize).saturating_add(query.offset.unwrap_or(0) as usize);
-                self.pushdown_limit.store(budget, Ordering::Relaxed);
-                tracing::debug!(limit = lim, offset = ?query.offset, budget, "LIMIT pushdown enabled");
-            } else {
-                self.pushdown_limit.store(usize::MAX, Ordering::Relaxed);
-            }
+        // The plan root's output IS the (pre-LIMIT) query output, so it is a
+        // prefix of the final result: enable prefix-position truncation here.
+        // Operand recursions clear this via without_pushdown(); the Subquery arm
+        // saves/restores it so a nested execute_select cannot leak `true` back to
+        // an enclosing operand context.
+        self.limit_applies.store(true, Ordering::Relaxed);
+        // `budget0` is the target number of post-BGP (post-FILTER) survivor rows we
+        // need before we can satisfy LIMIT(+offset).  `None` ⇒ no pushdown (full
+        // single-pass execution): aggregates / ORDER BY / DISTINCT / GROUP BY, or
+        // no LIMIT at all.
+        let budget0: Option<usize> = if can_pushdown {
+            query.limit.map(|lim| (lim as usize).saturating_add(query.offset.unwrap_or(0) as usize))
         } else {
-            self.pushdown_limit.store(usize::MAX, Ordering::Relaxed);
+            None
+        };
+        // Seed pushdown_limit for the count / cross-product fast paths below; the
+        // retry loop re-sets it per pass.
+        self.pushdown_limit.store(budget0.unwrap_or(usize::MAX), Ordering::Relaxed);
+        if let Some(b) = budget0 {
+            tracing::debug!(limit = ?query.limit, offset = ?query.offset, budget = b, "LIMIT pushdown enabled");
         }
 
         if let Some(fast_result) = self.try_count_distinct_cross_product(query, &plan) {
@@ -382,29 +471,72 @@ impl<'a> Executor<'a> {
         // ── end cross-product guard ────────────────────────────────────────────
 
 
-        // 2. Execute
+        // 2. Execute — exponential budget retry for residual FILTER under LIMIT.
+        //
+        // A residual FILTER drops rows, so capping its raw input at `budget0` can
+        // leave fewer than LIMIT survivors.  Rather than disable pushdown (which
+        // forced a full ~70M-row scan: E-2 ≈ 200 s) or accept a non-deterministic
+        // undercount, we run the BGP with a budget; if the FILTER left < budget0
+        // survivors AND a FILTER's raw input was actually capped by the budget
+        // (not exhausted), we double the budget and replay the plan.
+        //
+        //   budget = budget0
+        //   loop:
+        //     run plan with pushdown_limit = budget
+        //     break if overflow                         (truncated at the ceiling)
+        //     break if no budget0                       (pushdown disabled / no LIMIT)
+        //     break if survivors >= budget0             (LIMIT satisfiable)
+        //     break if no filter was capped this pass   (source exhausted → final)
+        //     break if budget >= max_intermediate_rows  (safety valve)
+        //     budget = min(budget * 2, max_intermediate_rows)
+        //
+        // A non-selective FILTER (E-2: high-frequency K-terminal peptides) fills
+        // budget0 within a few hundred raw rows → fast AND deterministic (exactly
+        // 100 every run, since we stop as soon as 100 survivors exist).  A
+        // super-selective FILTER keeps doubling until the source is exhausted —
+        // i.e. a full scan, the same correct (possibly < LIMIT) answer as before.
+        // Each replay is independent (the executor holds no cross-run state); the
+        // worst-case total work is ≈ 2× the final budget (geometric series).
+        //
+        // FILTER-free pushdown (C-2): the BGP itself stops at budget0 survivors on
+        // the first pass (or exhausts below it), so the loop is single-pass and
+        // behaviour is unchanged.  No budget0 (aggregate / ORDER BY / no LIMIT):
+        // one pass with budget = MAX — identical to the pre-retry path.
         let t_bgp = Instant::now();
-        let mut bindings = self.execute_plan(&plan);
-        self.pushdown_limit.store(usize::MAX, Ordering::Relaxed); // clear after BGP so later calls are unaffected
+        let cap = self.config.max_intermediate_rows.max(1);
+        let mut budget = budget0.unwrap_or(usize::MAX);
+        let mut bindings;
+        loop {
+            self.pushdown_cutoff_hit.store(false, Ordering::Relaxed);
+            self.pushdown_limit.store(budget, Ordering::Relaxed);
+            bindings = self.execute_plan(&plan);
+            self.pushdown_limit.store(usize::MAX, Ordering::Relaxed); // clear each pass
 
-        // Note: SPARQL LIMIT is "at most N rows", not "exactly N rows".
-        // Returning fewer rows than LIMIT is valid when filter steps after the
-        // pushdown cutoff reduce the intermediate result.  A retry without
-        // pushdown would process the full dataset (e.g. 10M PSMs × 7 blanknodes
-        // = 70M rows) and is far too expensive for large stores.
-        // We log a debug message so operators can observe the behaviour.
-        if can_pushdown && !bindings.overflow {
-            if let Some(lim) = query.limit {
-                if bindings.rows.len() < lim as usize {
-                    tracing::debug!(
-                        got = bindings.rows.len(),
-                        limit = lim,
-                        "LIMIT pushdown: fewer rows than limit (filter reduced result); \
-                         returning early — SPARQL LIMIT is a maximum, not a guarantee"
-                    );
-                }
+            if bindings.overflow { break; }
+            let Some(target) = budget0 else { break; };
+            if bindings.rows.len() >= target { break; }
+            if !self.pushdown_cutoff_hit.load(Ordering::Relaxed) {
+                tracing::debug!(
+                    got = bindings.rows.len(), target,
+                    "LIMIT pushdown: source exhausted below LIMIT (filter reduced result) — final result"
+                );
+                break;
             }
+            if budget >= cap {
+                tracing::debug!(
+                    got = bindings.rows.len(), target, budget,
+                    "LIMIT pushdown: budget reached max_intermediate_rows ceiling — stopping retry"
+                );
+                break;
+            }
+            let next = budget.saturating_mul(2).min(cap);
+            tracing::debug!(
+                got = bindings.rows.len(), target, budget, next,
+                "LIMIT pushdown: filter left < LIMIT survivors, doubling budget and retrying"
+            );
+            budget = next;
         }
+        self.pushdown_cutoff_hit.store(false, Ordering::Relaxed); // tidy up after BGP
 
         let bgp_us = t_bgp.elapsed().as_micros();
 
@@ -666,7 +798,11 @@ impl<'a> Executor<'a> {
             }
             ExecutionPlan::Join(left, right) => {
                 let t_join = std::time::Instant::now();
-                let left_rs = self.execute_plan_with_ctx(left, outer);
+                // Join operands are NOT a prefix of the final output (they are
+                // joined together), so suppress pushdown truncation while producing
+                // them.  The join helpers below (bind_join/hash_join/…) build the
+                // Join's OWN output and decide truncation under the current flag.
+                let left_rs = self.without_pushdown(|| self.execute_plan_with_ctx(left, outer));
                 if left_rs.overflow { return left_rs; }
                 let left_us = t_join.elapsed().as_micros();
 
@@ -706,7 +842,7 @@ impl<'a> Executor<'a> {
                 // every left row and produce a cross-product (shared variables are never
                 // substituted into the subquery).  Instead, execute once and hash_join.
                 if matches!(right.as_ref(), ExecutionPlan::Subquery(_)) {
-                    let right_rs = self.execute_plan_with_ctx(right, outer);
+                    let right_rs = self.without_pushdown(|| self.execute_plan_with_ctx(right, outer));
                     if right_rs.overflow { return right_rs; }
                     return self.hash_join(left_rs, right_rs);
                 }
@@ -900,7 +1036,12 @@ impl<'a> Executor<'a> {
                             left_rows = n,
                             "Join PathPattern: hash_join (full path scan)"
                         );
-                        let right_rs = self.execute_plan_with_ctx(right, outer);
+                        // The path is the join's inner operand: materialise ALL
+                        // (s,o) pairs (no LIMIT truncation), then hash_join keeps
+                        // only those joining the left rows.  This is the exact site
+                        // of the C-2 regression — truncating the path here cut it to
+                        // 100 arbitrary pairs and yielded 0 join matches.
+                        let right_rs = self.without_pushdown(|| self.execute_plan_with_ctx(right, outer));
                         if right_rs.overflow { return right_rs; }
                         return self.hash_join(left_rs, right_rs);
                     }
@@ -932,7 +1073,8 @@ impl<'a> Executor<'a> {
                 if left_rs.rows.len() <= self.config.bind_join_threshold {
                     return self.bind_join(left_rs, right, outer);
                 }
-                let mut right_rs = self.execute_plan_with_ctx(right, outer);
+                // Right side is an inner join operand → produce it in full.
+                let mut right_rs = self.without_pushdown(|| self.execute_plan_with_ctx(right, outer));
                 if right_rs.overflow { return right_rs; }
 
                 // ── SIP (Sideways Information Passing) pre-filter (改善5) ───────
@@ -1011,8 +1153,17 @@ impl<'a> Executor<'a> {
                 }
             }
             ExecutionPlan::Optional(main, opt) => {
-                let main_rs = self.execute_plan_with_ctx(main, outer);
+                let mut main_rs = self.execute_plan_with_ctx(main, outer);
                 if main_rs.overflow { return main_rs; }
+                // LIMIT pushdown: a LEFT JOIN never drops a main row (each main
+                // row emits ≥ 1 output row), so the main side is an upper bound on
+                // the output count.  Capping main at `budget` therefore still
+                // yields ≥ budget output rows and avoids probing the optional side
+                // for rows that LIMIT would discard.  Inert unless budget != MAX.
+                if self.limit_prefix_reached(main_rs.rows.len()) {
+                    let budget = self.pushdown_limit.load(Ordering::Relaxed);
+                    main_rs.rows.truncate(budget);
+                }
                 if main_rs.rows.len() <= self.config.bind_join_threshold {
                     // bind_left_join: probe opt per main row, directly building
                     // the LEFT JOIN result.  This avoids the duplicate-probe bug
@@ -1022,7 +1173,9 @@ impl<'a> Executor<'a> {
                     // produce 2× too many output rows (and eventually OOM).
                     return self.bind_left_join(main_rs, opt, outer);
                 }
-                let opt_rs = self.execute_plan_with_ctx(opt, outer);
+                // The optional side is an inner operand (it is matched against main
+                // rows): produce it in full, never truncated.
+                let opt_rs = self.without_pushdown(|| self.execute_plan_with_ctx(opt, outer));
                 if opt_rs.overflow { return opt_rs; }
                 self.left_join(main_rs, opt_rs)
             }
@@ -1032,12 +1185,25 @@ impl<'a> Executor<'a> {
                 // which has an unnameable lifetime; fall back to sequential in that case.
                 let (mut left_rs, right_rs) = if outer.is_empty() {
                     let empty: Binding = HashMap::new();
+                    // Each forked executor inherits the pushdown budget (see fork()),
+                    // so both branches stop near `budget` rows instead of running
+                    // their BGP to completion.
                     rayon::join(
                         || self.fork().execute_plan_with_ctx(left,  &empty),
                         || self.fork().execute_plan_with_ctx(right, &empty),
                     )
                 } else {
                     let lr = self.execute_plan_with_ctx(left,  outer);
+                    if lr.overflow { return lr; }
+                    // LIMIT pushdown short-circuit: if the left branch already
+                    // satisfied the budget, the concatenation will be truncated to
+                    // it anyway, so skip executing the right branch entirely.
+                    if self.limit_prefix_reached(lr.rows.len()) {
+                        let mut lr = lr;
+                        let budget = self.pushdown_limit.load(Ordering::Relaxed);
+                        lr.rows.truncate(budget);
+                        return lr;
+                    }
                     let rr = self.execute_plan_with_ctx(right, outer);
                     (lr, rr)
                 };
@@ -1057,10 +1223,48 @@ impl<'a> Executor<'a> {
                     left_rs.rows.push(new_row);
                 }
                 if right_overflow { left_rs.overflow = true; }
+                // LIMIT pushdown: the union is at most `budget` rows.  Each branch
+                // already capped itself near the budget; truncate the concatenation
+                // so we never hand more than the budget upward.  Safe for an
+                // unordered LIMIT (bag union; ORDER BY/DISTINCT force budget == MAX).
+                if !left_rs.overflow && self.limit_prefix_reached(left_rs.rows.len()) {
+                    let budget = self.pushdown_limit.load(Ordering::Relaxed);
+                    left_rs.rows.truncate(budget);
+                }
                 left_rs
             }
             ExecutionPlan::Filter(inner, expr) => {
-                let mut rs = self.execute_plan_with_ctx(inner, outer);
+                // A Filter drops rows, so its INPUT is not a prefix of the output:
+                // capping the input at `budget` could discard rows that pass the
+                // filter and leave < budget results.  Two regimes:
+                //
+                // * **Prefix position** (`limit_applies == true`, e.g. a top-level
+                //   `Filter(BGP) LIMIT N`): cap the raw input at the budget anyway,
+                //   and let `execute_select`'s exponential-budget retry double the
+                //   budget and re-run when the filter dropped too many rows.  For a
+                //   non-selective filter (E-2) a few hundred raw rows already yield
+                //   N survivors, so we avoid the full-dataset scan (200 s → fast).
+                //   We record whether the raw input was actually capped by the
+                //   budget (`input_rows >= budget`) so the retry loop knows whether
+                //   doubling could find more, vs. the source being exhausted.
+                //
+                // * **Inner join operand** (`limit_applies == false`): the input is
+                //   NOT the query prefix — truncating it could drop rows a
+                //   downstream join needs (cf. C-2).  Produce it in full
+                //   (without_pushdown), exactly as before.
+                let prefix = self.limit_applies.load(Ordering::Relaxed);
+                let mut rs = if prefix {
+                    let r = self.execute_plan_with_ctx(inner, outer);
+                    let budget = self.pushdown_limit.load(Ordering::Relaxed);
+                    if budget != usize::MAX && r.rows.len() >= budget {
+                        // Raw input hit the budget cap → more may exist upstream;
+                        // signal the retry loop that doubling is worthwhile.
+                        self.pushdown_cutoff_hit.store(true, Ordering::Relaxed);
+                    }
+                    r
+                } else {
+                    self.without_pushdown(|| self.execute_plan_with_ctx(inner, outer))
+                };
                 let vars = rs.variables.clone();
                 rs.rows.retain(|row| {
                     let b = row_to_binding(&vars, row);
@@ -1070,6 +1274,15 @@ impl<'a> Executor<'a> {
             }
             ExecutionPlan::Extend(inner, expr, var) => {
                 let mut rs = self.execute_plan_with_ctx(inner, outer);
+                // LIMIT pushdown: BIND/Extend is 1:1 (it never adds or drops a
+                // row), so the inner row count equals the output row count.
+                // Capping the inner result at `budget` is exact — not just an
+                // upper bound — and saves evaluating the expression on rows that
+                // LIMIT would discard.  Inert unless budget != MAX.
+                if !rs.overflow && self.limit_prefix_reached(rs.rows.len()) {
+                    let budget = self.pushdown_limit.load(Ordering::Relaxed);
+                    rs.rows.truncate(budget);
+                }
                 rs.variables.push(var.clone());
                 let vars = rs.variables[..rs.variables.len()-1].to_vec();
                 for row in &mut rs.rows {
@@ -1094,15 +1307,24 @@ impl<'a> Executor<'a> {
                 // the result is handed back to the outer query as a plain ResultSet.
                 // This is the correct SPARQL 1.1 semantics for { SELECT … } subqueries.
                 //
-                // Save and restore the outer pushdown_limit so the subquery's own
-                // execute_select (which resets pushdown_limit) doesn't clear ours.
+                // Save and restore the outer pushdown_limit AND prefix flag so the
+                // subquery's own execute_select (which sets both for its own root)
+                // doesn't leak its state back into our context.  The subquery
+                // result is then consumed as an operand by the enclosing query, so
+                // the restored flag governs whether *that* may truncate.
                 let saved = self.pushdown_limit.load(Ordering::Relaxed);
+                let saved_applies = self.limit_applies.load(Ordering::Relaxed);
                 let result = self.execute_select(sq);
                 self.pushdown_limit.store(saved, Ordering::Relaxed);
+                self.limit_applies.store(saved_applies, Ordering::Relaxed);
                 result
             }
             ExecutionPlan::NamedGraph { graph, inner } => {
-                self.execute_named_graph(graph, inner)
+                // execute_in_graph recurses through its own join helpers
+                // (hash_join/left_join) where inner sub-results are operands, not
+                // prefixes.  Disable pushdown truncation for the whole subtree so
+                // those helpers behave exactly as before (no LIMIT cut inside it).
+                self.without_pushdown(|| self.execute_named_graph(graph, inner))
             }
             // ScanAst: encode AST-level triple pattern into dictionary IDs at runtime.
             //
@@ -1304,6 +1526,12 @@ impl<'a> Executor<'a> {
                         row[i] = Some(match pos { 0 => s, 1 => pat.p, _ => o });
                     }
                     rs.rows.push(row);
+                    // LIMIT pushdown: stop materialising once the budget is met.
+                    // Gated by limit_prefix_reached so this fires ONLY when the scan
+                    // output is the query prefix (limit_applies).  As a join's inner
+                    // operand the scan must be produced in full, else downstream
+                    // joins/filters could drop the kept rows (cf. C-2).
+                    if self.limit_prefix_reached(rs.rows.len()) { break; }
                 }
                 return rs;
             }
@@ -1323,6 +1551,15 @@ impl<'a> Executor<'a> {
                 row[i] = Some(val);
             }
             rs.rows.push(row);
+            // LIMIT pushdown: stop the sequential scan once the budget is met.
+            // This is the dominant materialisation cost for BIND/Extend-over-Scan
+            // (H-4) and the left leaf of a simple chain (NEW-3).  Gated by
+            // limit_prefix_reached: it fires only when this scan's rows are the
+            // query prefix (e.g. a single-pattern query, or a top-level Extend
+            // over scan).  When the scan is a join's inner/driving operand
+            // limit_applies is false, so the full scan is produced — necessary
+            // because the join may discard a kept row (this is what broke C-2).
+            if self.limit_prefix_reached(rs.rows.len()) { break; }
         }
         rs
     }
@@ -1656,6 +1893,14 @@ impl<'a> Executor<'a> {
                         result.overflow = true;
                         return result;
                     }
+                    // LIMIT pushdown: cross-product can blow up; stop at budget —
+                    // but only when this join's output is the query prefix.  As an
+                    // inner operand (limit_applies == false) we must materialise it
+                    // fully so the enclosing join is not starved of matches.
+                    if self.limit_prefix_reached(result.rows.len()) {
+                        tracing::debug!(rows = result.rows.len(), "hash_join cross-product: LIMIT reached, stopping early");
+                        return result;
+                    }
                 }
             }
             return result;
@@ -1713,6 +1958,22 @@ impl<'a> Executor<'a> {
         if overflow {
             tracing::warn!(rows = new_rows.len(), "hash_join: intermediate result exceeded limit, truncating");
             new_rows.truncate(self.config.max_intermediate_rows);
+        }
+        // LIMIT pushdown: par_iter cannot early-exit, but we can drop the surplus
+        // before handing the result upward so downstream operators (UNION concat,
+        // Extend, post-processing) don't re-touch millions of rows.  Each produced
+        // row is a real join match, so keeping the first `budget` of them yields a
+        // valid result for an unordered LIMIT — BUT ONLY when this join's rows are
+        // the query prefix.  Gated by limit_prefix_reached: when this hash_join is
+        // an INNER operand of an outer join (limit_applies == false) we must keep
+        // every match, because the outer join may match only the surplus rows.
+        // (Truncating here unconditionally is exactly what reduced C-2 to 0 rows:
+        // the path side of `Join(Scan{57 proteins}, path)` was cut to 100 arbitrary
+        // pairs that mostly did not belong to the 57 proteins.)
+        else if self.limit_prefix_reached(new_rows.len()) {
+            let budget = self.pushdown_limit.load(Ordering::Relaxed);
+            tracing::debug!(rows = new_rows.len(), budget, "hash_join: LIMIT reached, truncating to budget");
+            new_rows.truncate(budget);
         }
         ResultSet { variables: out_vars, rows: new_rows, overflow }
     }
@@ -1783,6 +2044,16 @@ impl<'a> Executor<'a> {
                     result.overflow = true;
                     return result;
                 }
+            }
+            // LIMIT pushdown: stop after the current main row's matches once the
+            // budget is met.  A LEFT JOIN only adds rows, so the rows already
+            // emitted are a valid prefix of the result for an unordered LIMIT —
+            // but only when this OPTIONAL's rows are the query prefix.  Gated by
+            // limit_prefix_reached so an OPTIONAL nested as a join operand
+            // (limit_applies == false) is produced in full.
+            if self.limit_prefix_reached(result.rows.len()) {
+                tracing::debug!(rows = result.rows.len(), "left_join: LIMIT reached, stopping early");
+                break;
             }
         }
         result
@@ -1860,9 +2131,8 @@ impl<'a> Executor<'a> {
         // PSO must be available.
         if !self.index.has_pso() { return None; }
 
-        // Check pred_cache/pred_partition first — they're faster than PSO for small predicates.
+        // Check pred_cache first — it's faster than PSO for small predicates.
         if self.pred_cache.get(base.p).is_some() { return None; }
-        if self.pred_partitions.get(base.p).is_some() { return None; }
 
         let free_var_name = &free_vars[0].0;
         let outer_var_name = &outer_vars[0].0;
@@ -2051,8 +2321,7 @@ impl<'a> Executor<'a> {
             // Avoids the full rdf:type POS/OPS scan entirely.
             //
             // Priority 2: pred_cache — sorted (S,O) Vec in RAM.
-            // Priority 3: pred_partitions — sorted (S,O) mmap file on disk.
-            // Priority 4: POS/OPS index scan (fallback).
+            // Priority 3: POS/OPS index scan (fallback).
             let passing: HashSet<TermId> = if let Some(class_bitmap) =
                 self.type_cache.rdf_type_id()
                     .filter(|&rdf_type| base.p == rdf_type)
@@ -2080,18 +2349,6 @@ impl<'a> Executor<'a> {
                 let target_o = base.o;
                 subjects.iter().copied().filter(|&s| {
                     cached.binary_search(&(s, target_o)).is_ok()
-                }).collect()
-            } else if let Some(part) = self.pred_partitions.get(base.p) {
-                tracing::debug!(
-                    pred = base.p,
-                    unique_subjects = subjects.len(),
-                    part_pairs = part.len(),
-                    mode = "pred_partition_filter",
-                    "bind_join filter: using pred partition"
-                );
-                let target_o = base.o;
-                subjects.iter().copied().filter(|&s| {
-                    part.contains(s, target_o)
                 }).collect()
             } else {
                 // Scan the (P, O_fixed) range in POS/OPS — typically just a handful of
@@ -2140,7 +2397,7 @@ impl<'a> Executor<'a> {
         // Prefer pred_cache: merge scan (sort subjects + two-pointer) → O(N log N + M) RAM.
         // Fall back to sequential POS scan → O(pred_range) HDD.
         // Build (S → [O]) mapping from the best available source:
-        // pred_cache (RAM) → pred_partitions (mmap) → index scan (HDD).
+        // pred_cache (RAM) → index scan (HDD).
         let mut s_to_objects: HashMap<TermId, Vec<TermId>> = HashMap::new();
         if let Some(cached) = self.pred_cache.get(base.p) {
             tracing::debug!(
@@ -2166,43 +2423,6 @@ impl<'a> Executor<'a> {
                     while ci < cached.len() && cached[ci].0 == s { ci += 1; }
                     let objs: Vec<TermId> = cached[start..ci].iter().map(|&(_, o)| o).collect();
                     s_to_objects.insert(s, objs);
-                }
-            }
-        } else if let Some(part) = self.pred_partitions.get(base.p) {
-            // Check if this is a functional predicate (改善6): each subject has
-            // at most one object.  If so, use get_single_object() which is O(log N)
-            // with zero Vec allocation, vs get_objects() which allocates a slice.
-            let is_functional = self.stats
-                .map(|st| st.is_functional(base.p))
-                .unwrap_or(false);
-
-            if is_functional {
-                tracing::debug!(
-                    pred = base.p,
-                    unique_subjects = subjects.len(),
-                    part_pairs = part.len(),
-                    mode = "pred_partition_functional_join",
-                    "bind_join join: using pred partition (functional predicate, O(log N) single lookup)"
-                );
-                for &s in &subjects {
-                    if let Some(o) = part.get_single_object(s) {
-                        s_to_objects.insert(s, vec![o]);
-                    }
-                }
-            } else {
-                tracing::debug!(
-                    pred = base.p,
-                    unique_subjects = subjects.len(),
-                    part_pairs = part.len(),
-                    mode = "pred_partition_join",
-                    "bind_join join: using pred partition"
-                );
-                for &s in &subjects {
-                    let pairs = part.get_objects(s);
-                    if !pairs.is_empty() {
-                        let objs: Vec<TermId> = pairs.iter().map(|&(_, o)| o).collect();
-                        s_to_objects.insert(s, objs);
-                    }
                 }
             }
         } else if let Some(push_limit) = {
@@ -2432,6 +2652,32 @@ impl<'a> Executor<'a> {
             groups[g].1.push(row_idx);
         }
 
+        // ── Visibility guard (task C) ─────────────────────────────────────────
+        // When there is NO LIMIT budget (pushdown_limit == MAX, e.g. an aggregate
+        // or ORDER BY query) and the left side is enormous, this bind_join probes
+        // one right plan per group — the dominant cost of the slowest observed
+        // queries (left_rows up to 69.7M, ~160s).  LIMIT pushdown cannot rescue
+        // these (can_pushdown is false for GROUP BY / aggregate), so we only
+        // surface them for the operator; execution continues unchanged.  These
+        // need streaming aggregation or intra-query parallelism (out of scope).
+        const BIND_JOIN_WARN_THRESHOLD: usize = 5_000_000;
+        if self.pushdown_limit.load(Ordering::Relaxed) == usize::MAX
+            && left.rows.len() >= BIND_JOIN_WARN_THRESHOLD
+        {
+            let pred = match right_plan {
+                ExecutionPlan::ScanBound { base, .. } => base.p,
+                _ => UNBOUND,
+            };
+            tracing::warn!(
+                left_rows = left.rows.len(),
+                groups = groups.len(),
+                pred,
+                "bind_join: very large left side with no LIMIT budget — \
+                 not rescuable by LIMIT pushdown (aggregate/ORDER BY); \
+                 candidate for streaming aggregation or intra-query parallelism"
+            );
+        }
+
         let mut out_vars: Vec<String> = left.variables.clone();
         let mut result = ResultSet::empty(out_vars.clone());
 
@@ -2559,8 +2805,11 @@ impl<'a> Executor<'a> {
                 let _ = left_idx; // used via key indexing above
             }
 
-            // Execute right plan ONCE for this unique binding.
-            let right_rs = self.execute_plan_with_ctx(right_plan, &row_binding);
+            // Execute right plan ONCE for this unique binding.  The per-group probe
+            // result is an inner operand (it is distributed across the group's left
+            // rows): produce it in full.  The bind_join OUTPUT limit is enforced by
+            // the existing is_limit_reached checks below — unchanged from before.
+            let right_rs = self.without_pushdown(|| self.execute_plan_with_ctx(right_plan, &row_binding));
             let right_overflow = right_rs.overflow;
 
             // Expand output schema on first non-empty right result.
@@ -2996,8 +3245,8 @@ impl<'a> Executor<'a> {
             let mut row_binding = outer.clone();
             row_binding.extend(b.iter().map(|(k, v)| (k.clone(), *v)));
 
-            // Probe the optional side
-            let partial = self.execute_plan_with_ctx(opt_plan, &row_binding);
+            // Probe the optional side (inner operand → produce in full).
+            let partial = self.without_pushdown(|| self.execute_plan_with_ctx(opt_plan, &row_binding));
             // Note: overflow in opt is non-fatal for OPTIONAL — we treat it as
             // "no match" for this row rather than aborting the entire query.
             // The partial results we already have are still correct.
@@ -3858,12 +4107,14 @@ impl<'a> Executor<'a> {
             }
             Expression::Exists(pattern) => {
                 let plan = optimize_bgp(pattern, self.index, self.dict, self.stats);
-                let result = self.execute_plan_with_ctx(&plan, binding);
+                // Existence sub-BGP: its rows are not the query output → no pushdown.
+                let result = self.without_pushdown(|| self.execute_plan_with_ctx(&plan, binding));
                 Some(!result.rows.is_empty())
             }
             Expression::NotExists(pattern) => {
                 let plan = optimize_bgp(pattern, self.index, self.dict, self.stats);
-                let result = self.execute_plan_with_ctx(&plan, binding);
+                // Existence sub-BGP: its rows are not the query output → no pushdown.
+                let result = self.without_pushdown(|| self.execute_plan_with_ctx(&plan, binding));
                 Some(result.rows.is_empty())
             }
             _ => {
@@ -4455,6 +4706,17 @@ impl<'a> Executor<'a> {
         // Deduplicate (especially for * / + paths)
         rs.rows.sort_unstable();
         rs.rows.dedup();
+        // LIMIT pushdown: cap the (deduplicated) path result at `budget`.  Dedup
+        // must run over all pairs first, so this trims the result after the fact
+        // rather than short-circuiting eval_path.  Gated by limit_prefix_reached:
+        // when the path pattern is a join's inner operand (limit_applies == false,
+        // e.g. C-2's `Join(Scan{proteins}, path)`) the FULL pair set must be
+        // returned, because the enclosing join filters it down to the matching
+        // subjects — cutting to an arbitrary `budget` pairs here was the C-2 bug.
+        if self.limit_prefix_reached(rs.rows.len()) {
+            let budget = self.pushdown_limit.load(Ordering::Relaxed);
+            rs.rows.truncate(budget);
+        }
         rs
     }
 
