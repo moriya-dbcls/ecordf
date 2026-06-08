@@ -158,7 +158,27 @@ auto_compress = false
 #
 # Raise on servers with plentiful RAM and complex analytical queries.
 # Lower on memory-constrained environments (containers, shared hosts).
-max_intermediate_rows = 50_000_000
+#
+# NOTE: this is now a secondary, absolute safety cap. The primary per-query
+# memory limit is `max_intermediate_mb` below, which is byte-aware (it accounts
+# for result arity, i.e. number of columns). Whichever cap is hit first applies.
+max_intermediate_rows = 100_000_000
+
+# Per-query memory limit for intermediate results, in MiB. PRIMARY per-query cap.
+#
+# Unlike max_intermediate_rows (which counts rows regardless of width), this is
+# byte-aware: a result with arity A columns is capped at roughly
+#   max_intermediate_mb × 1 MiB / (A × 24 bytes)   rows
+# so wide results (many SELECT/join variables) cannot blow up the heap. When the
+# estimate is exceeded, the intermediate result is truncated (same as the row cap).
+#
+#   0     — disabled; only max_intermediate_rows applies (legacy behaviour).
+#   4096  — ~4 GB per query (recommended starting point).
+#
+# This value is also what the server reserves per query from the global pool
+# `total_query_mem_mb` below, so effective concurrency = total_query_mem_mb /
+# max_intermediate_mb.
+max_intermediate_mb = 4096
 
 # Row threshold for choosing bind-join over hash-join.
 #
@@ -199,16 +219,31 @@ port = 7878
 
 # Maximum number of queries that may execute concurrently.
 #
-# Each query runs in tokio's blocking thread pool (spawn_blocking).
-# This cap prevents a burst of slow queries from exhausting system resources.
+# DEPRECATED — prefer `total_query_mem_mb` below. With a memory pool configured,
+# concurrency is governed by memory (floor(total_query_mem_mb / per-query
+# reserve)), which prevents OOM far better than a raw count: a count limit lets
+# N heavy queries each materialise large intermediates and exhaust RAM.
 #
-#   0  — no limit; bounded only by tokio's blocking pool (default 512).
-#   N  — at most N queries run in parallel; excess requests are queued.
-#
-# Rule of thumb: 2 × number_of_CPU_cores.
-# Raise for short / I/O-bound queries.
-# Lower for RAM-heavy analytical queries to avoid memory pressure.
+#   0  — disabled; the memory pool governs concurrency (recommended).
+#   N  — additional hard cap: at most N queries run in parallel (queued beyond).
 max_concurrent_queries = 0
+
+# Global memory pool for query execution, in MiB. PRIMARY admission control.
+#
+# Before running, each query reserves `max_intermediate_mb` (its per-query cap)
+# from this pool. When the pool is exhausted, new queries WAIT (they are not
+# rejected) until a running query finishes and releases its reservation. Because
+# every admitted query holds its full reservation, none can be starved mid-flight,
+# so there is no deadlock.
+#
+# Effective max concurrency ≈ total_query_mem_mb / max_intermediate_mb.
+# Size it to leave headroom for caches (pred/path/type) and the OS:
+# roughly (physical_RAM − pred_cache_mb − a few GB). warmup_mb does NOT count
+# (it is OS page cache, not heap).
+#
+#   0      — disabled; unbounded admission (legacy behaviour).
+#   32768  — 32 GB pool; with max_intermediate_mb=4096 → ~8 concurrent queries.
+total_query_mem_mb = 32768
 
 # Allowed CORS origins for the HTTP endpoint.
 #
