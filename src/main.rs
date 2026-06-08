@@ -203,25 +203,6 @@ enum Command {
         dir: PathBuf,
     },
 
-    /// Build per-predicate (S,O) partition files for fast predicate access.
-    ///
-    /// Scans the POS index and writes one `pred_parts/pp_<id>.bin` file per
-    /// predicate.  These files are automatically loaded at `ecordf serve` time
-    /// and supplement (then replace) the pred_cache for uncached predicates.
-    ///
-    /// Run once after `ecordf build`:
-    ///
-    ///   ecordf build-pred-parts --dir ./store
-    ///
-    /// Re-run with --force to overwrite existing partition files.
-    BuildPredParts {
-        #[arg(short, long, default_value = "./ecordf-data")]
-        dir: PathBuf,
-        /// Overwrite existing partition files.
-        #[arg(long, default_value_t = false)]
-        force: bool,
-    },
-
     /// Compress column files with delta + Zstd encoding (ECOCOL04).
     ///
     /// Reads each *.c0 / *.c1 / *.c2 column file, encodes it with delta + Zstd
@@ -553,7 +534,6 @@ async fn main() -> anyhow::Result<()> {
                 pred_cache_mb = store.pred_cache.bytes_used() / (1024 * 1024),
                 path_cache_paths = store.path_cache.len(),
                 type_cache_classes = store.type_cache.len(),
-                pred_partitions = store.pred_partitions.len(),
                 "Server ready"
             );
             ecordf::server::serve(store, &effective_host, effective_port, effective_cors.as_deref()).await?;
@@ -717,13 +697,6 @@ async fn main() -> anyhow::Result<()> {
         Command::ReorderBnodes { dir } => {
             eprintln!("Reordering blank nodes by primary predicate in {:?}...", dir);
             ecordf::bnode_reorder::reorder_bnodes(&dir)?;
-        }
-
-        Command::BuildPredParts { dir, force } => {
-            let store = Store::open(&dir)?;
-            eprintln!("Building predicate partition files for {:?}...", dir);
-            let n = ecordf::pred_partition::build_pred_partitions(&dir, &*store.index, force)?;
-            eprintln!("Done: {} partition file(s) written.", n);
         }
 
         Command::CompressCols { dir, force } => {

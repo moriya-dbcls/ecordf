@@ -23,7 +23,6 @@ pub struct Store {
     pub pred_cache:      PredCache,
     pub path_cache:      PathCache,
     pub type_cache:      TypeCache,
-    pub pred_partitions: PredPartitions,
 }
 ```
 

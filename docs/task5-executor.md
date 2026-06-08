@@ -20,7 +20,6 @@ pub struct Executor<'a> {
     pub pred_cache:      PredCache,
     pub path_cache:      PathCache,
     pub type_cache:      TypeCache,
-    pub pred_partitions: PredPartitions,
     pub cancel:          Arc<AtomicBool>,
     pub scan_dontneed_bytes: usize,
     pushdown_limit:      Cell<Option<usize>>,
@@ -107,10 +106,11 @@ FILTER 式の評価。`IsNumeric`, `IsIri`, `IsLiteral`, `IsBlank`, `SameTerm`, 
 `?x a SomeClass` が filter パターンのとき（O が固定）、`type_cache.get_bitmap(class_id)` で
 RoaringTreemap O(1) ビットマップルックアップを使う。
 
-## 機能的述語の最適化
+## 機能的述語の判定
 
 `StoreStatistics::is_functional(pred)` が true（`triple_count ≈ subject_count`）の述語は
-`PredPartFile::get_single_object(s)` で S → O を O(log N) で直接解決する。
+各主語が高々1つの目的語しか持たないため、S → O のルックアップで Vec を確保せず
+単一の目的語を返せる。
 
 ## eval_sequence_with_subject_filter（フィルタリング hash join）
 

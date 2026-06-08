@@ -37,7 +37,6 @@ pub mod dict_builder;
 pub mod index;
 pub mod loader;
 pub mod path_cache;
-pub mod pred_partition;
 pub mod predcache;
 pub mod rdf_config;
 pub mod server;

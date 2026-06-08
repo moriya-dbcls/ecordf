@@ -6,7 +6,6 @@
 - `src/predcache.rs` — 述語キャッシュ（PredCache）
 - `src/path_cache.rs` — 多ホップパスキャッシュ（PathCache）
 - `src/type_cache.rs` — 型キャッシュ（TypeCache、RoaringTreemap）
-- `src/pred_partition.rs` — オンディスク述語パーティション（PredPartitions）
 
 ## このタスクの責務
 
@@ -136,30 +135,6 @@ impl TypeCache {
 メモリは `bm.serialized_size()` で計測（28MB の Vec → 2-4MB のビットマップ）。
 
 ---
-
-## PredPartitions（オンディスク述語パーティション）
-
-### 目的
-
-pred_cache の RAM 予算を超える大きな述語でも、mmap を使って HDD/SSD アクセスできる。
-`pred_parts/pp_{pred_id}.bin` として格納。`ecordf build-pred-parts` で生成。
-
-### 構造
-
-```rust
-pub struct PredPartFile { pairs: &'static [(TermId, TermId)] }  // mmap, (S,O) ソート済み
-impl PredPartFile {
-    pub fn get_objects(&self, s: TermId) -> &[(TermId, TermId)]  // O(log N) 二分探索
-    pub fn get_single_object(&self, s: TermId) -> Option<TermId>  // 機能的述語専用 O(log N)
-    pub fn contains(&self, s: TermId, o: TermId) -> bool
-}
-```
-
-### ファイルフォーマット（ECPP0001）
-
-```
-magic(8)="ECPP0001" + count(8) + [(s:u64, o:u64) × count]  ← (S,O) ソート済み
-```
 
 ## 注意事項
 

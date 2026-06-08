@@ -61,7 +61,6 @@ pub struct AppState {
 | `query` | コマンドラインクエリ |
 | `stats` | 述語統計を表示 |
 | `compress-cols` | Delta 圧縮を実行 |
-| `build-pred-parts` | 述語パーティションファイルを生成 |
 
 ### build コマンドの主要フラグ
 

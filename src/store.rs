@@ -23,7 +23,6 @@ use crate::loader::{collect_strings_from_inputs, collect_strings_parallel,
                     load_triples_with_readonly_dict, load_triples_parallel,
                     load_triples_streaming, InputSpec};
 use crate::path_cache::PathCache;
-use crate::pred_partition::{pred_parts_dir, PredPartitions};
 use crate::predcache::PredCache;
 use crate::rdf_config::{self, CompoundPath};
 use crate::type_cache::TypeCache;
@@ -50,9 +49,6 @@ pub struct Store {
     /// Per-class subject membership cache for `?x a SomeClass` patterns.
     /// Empty when `server.type_cache_mb = 0`.
     pub type_cache: TypeCache,
-    /// On-disk per-predicate sorted (S,O) partition files.
-    /// Empty when `{store_dir}/pred_parts/` directory is absent.
-    pub pred_partitions: PredPartitions,
 }
 
 impl Store {
@@ -112,7 +108,7 @@ impl Store {
         let dict = QueryDict::from_legacy(id_to_str, str_to_id);
         let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty() })
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty() })
     }
 
     // ── internal: two-pass (external-sort dict) ───────────────────────────────
@@ -398,7 +394,7 @@ impl Store {
         let dict = QueryDict::from_mmap(ReadonlyDict::open(&store_dict_sorted)?);
         let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty() })
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config: config.clone(), stats: store_stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty() })
     }
 
     /// Build a new store from RDF input files with optional per-file named graph assignment.
@@ -439,7 +435,7 @@ impl Store {
             let dict = QueryDict::from_legacy(id_to_str, str_to_id);
             let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
             let pred_cache = PredCache::empty();
-            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty() })
+            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty() })
         }
     }
 
@@ -478,7 +474,7 @@ impl Store {
             let dict = QueryDict::from_legacy(id_to_str, str_to_id);
             let store_stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
             let pred_cache = PredCache::empty();
-            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty() })
+            Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats: store_stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty() })
         }
     }
 
@@ -489,7 +485,7 @@ impl Store {
         let config = Config::resolve(None, dir).map_err(io::Error::from)?;
         let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions: PredPartitions::empty() })
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty() })
     }
 
     /// Reopen an existing store and apply an explicit config file (overrides
@@ -505,12 +501,7 @@ impl Store {
         eprintln!("Loading statistics...");
         let stats = StoreStatistics::load_or_build(&dir.join("stats.bin"), &*index)?;
         let pred_cache = PredCache::empty();
-        // Open per-predicate partition files if the pred_parts directory exists.
-        let pred_partitions = PredPartitions::open(&pred_parts_dir(dir));
-        if !pred_partitions.is_empty() {
-            eprintln!("  pred_partitions: {} file(s) loaded", pred_partitions.len());
-        }
-        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty(), pred_partitions })
+        Ok(Self { dict, index, dir: dir.to_path_buf(), config, stats, pred_cache, path_cache: PathCache::empty(), type_cache: TypeCache::empty() })
     }
 
     /// Build and attach a TypeCache from `rdf:type`.
@@ -848,7 +839,6 @@ impl Store {
             pred_cache_bytes = self.pred_cache.bytes_used(),
             pred_cache_mb = self.pred_cache.bytes_used() / (1024 * 1024),
             type_cache_classes = self.type_cache.len(),
-            pred_partitions = self.pred_partitions.len(),
             "execute: cache state"
         );
 
@@ -860,7 +850,6 @@ impl Store {
         ).with_pred_cache(self.pred_cache.clone())
          .with_path_cache(self.path_cache.clone())
          .with_type_cache(self.type_cache.clone())
-         .with_pred_partitions(self.pred_partitions.clone())
          .with_cancel(cancel_flag.clone())
          .with_scan_dontneed_bytes(
              (self.config.server.scan_dontneed_mb as usize) * 1024 * 1024
