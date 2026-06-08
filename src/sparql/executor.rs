@@ -71,6 +71,19 @@ impl ResultSet {
     pub fn variable_index(&self, name: &str) -> Option<usize> {
         self.variables.iter().position(|v| v == name)
     }
+
+    /// 中間結果のメモリ見積りに使う列数(アリティ)。
+    /// 通常は変数(列)数。`variables` が未設定なら最初の行の幅、行も無ければ 1。
+    /// `QueryConfig::row_cap(arity)` に渡してバイト見積りベースの行数上限を得る。
+    fn arity(&self) -> usize {
+        if !self.variables.is_empty() {
+            self.variables.len()
+        } else if let Some(row) = self.rows.first() {
+            row.len().max(1)
+        } else {
+            1
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -452,7 +465,13 @@ impl<'a> Executor<'a> {
             let is_cross_product = collect_cross_product_leaves(&plan, &mut cp_leaves)
                 && cp_leaves.len() >= 2;
             let limit_val = query.limit.unwrap_or(u64::MAX) as usize;
-            if is_cross_product && limit_val > self.config.max_intermediate_rows {
+            // Cross-product output arity = sum of each leaf's free variables, so a
+            // wide product gets a proportionally lower byte-budget row cap.
+            let cp_arity: usize = cp_leaves.iter().map(|p| match p {
+                ExecutionPlan::Scan { variables, .. } => variables.len(),
+                _ => 1,
+            }).sum::<usize>().max(1);
+            if is_cross_product && limit_val > self.config.row_cap(cp_arity) {
                 let out_vars = if let Projection::Variables(items) = &query.projection {
                     items.iter().map(|i| match i {
                         SelectItem::Variable(v) => v.clone(),
@@ -503,7 +522,10 @@ impl<'a> Executor<'a> {
         // behaviour is unchanged.  No budget0 (aggregate / ORDER BY / no LIMIT):
         // one pass with budget = MAX — identical to the pre-retry path.
         let t_bgp = Instant::now();
-        let cap = self.config.max_intermediate_rows.max(1);
+        // `cap` is the byte-budget-aware row ceiling for the doubling retry; it is
+        // refined to the actual BGP arity after each pass (row_cap == max_rows when
+        // max_intermediate_mb == 0, so behaviour is unchanged in that case).
+        let mut cap = self.config.max_intermediate_rows.max(1);
         let mut budget = budget0.unwrap_or(usize::MAX);
         let mut bindings;
         loop {
@@ -511,6 +533,7 @@ impl<'a> Executor<'a> {
             self.pushdown_limit.store(budget, Ordering::Relaxed);
             bindings = self.execute_plan(&plan);
             self.pushdown_limit.store(usize::MAX, Ordering::Relaxed); // clear each pass
+            cap = self.config.row_cap(bindings.arity()).max(1);
 
             if bindings.overflow { break; }
             let Some(target) = budget0 else { break; };
@@ -764,7 +787,7 @@ impl<'a> Executor<'a> {
             let pat = TriplePattern { s: id, p: UNBOUND, o: UNBOUND };
             for t in self.index.scan(&pat) {
                 rs.rows.push(vec![Some(t.s), Some(t.p), Some(t.o)]);
-                if rs.rows.len() >= self.config.max_intermediate_rows {
+                if rs.rows.len() >= self.config.row_cap(rs.arity()) {
                     rs.overflow = true;
                     return rs;
                 }
@@ -1812,7 +1835,7 @@ impl<'a> Executor<'a> {
             binding.insert(var.clone(), val);
             self.lft_enumerate(patterns, var_order, depth + 1, binding, rs);
             binding.remove(var.as_str());
-            if rs.rows.len() >= self.config.max_intermediate_rows {
+            if rs.rows.len() >= self.config.row_cap(rs.arity()) {
                 rs.overflow = true;
                 return;
             }
@@ -1885,7 +1908,7 @@ impl<'a> Executor<'a> {
                         }
                     }
                     result.rows.push(row);
-                    if result.rows.len() >= self.config.max_intermediate_rows {
+                    if result.rows.len() >= self.config.row_cap(result.arity()) {
                         tracing::warn!(
                             rows = result.rows.len(),
                             "leapfrog_join: intermediate result exceeded limit, truncating"
@@ -1954,10 +1977,11 @@ impl<'a> Executor<'a> {
             .collect();
 
         // Overflow: truncate after parallel collect (no early-exit in par_iter).
-        let overflow = new_rows.len() >= self.config.max_intermediate_rows;
+        let row_cap = self.config.row_cap(out_vars.len());
+        let overflow = new_rows.len() >= row_cap;
         if overflow {
-            tracing::warn!(rows = new_rows.len(), "hash_join: intermediate result exceeded limit, truncating");
-            new_rows.truncate(self.config.max_intermediate_rows);
+            tracing::warn!(rows = new_rows.len(), cap = row_cap, "hash_join: intermediate result exceeded limit, truncating");
+            new_rows.truncate(row_cap);
         }
         // LIMIT pushdown: par_iter cannot early-exit, but we can drop the surplus
         // before handing the result upward so downstream operators (UNION concat,
@@ -2018,7 +2042,7 @@ impl<'a> Executor<'a> {
                     }
                     result.rows.push(row);
                     matched = true;
-                    if result.rows.len() >= self.config.max_intermediate_rows {
+                    if result.rows.len() >= self.config.row_cap(result.arity()) {
                         tracing::warn!(
                             rows = result.rows.len(),
                             "left_join: intermediate result exceeded limit, truncating"
@@ -2036,7 +2060,7 @@ impl<'a> Executor<'a> {
                     if let Some(oi) = result.variable_index(lv) { row[oi] = lr[li]; }
                 }
                 result.rows.push(row);
-                if result.rows.len() >= self.config.max_intermediate_rows {
+                if result.rows.len() >= self.config.row_cap(result.arity()) {
                     tracing::warn!(
                         rows = result.rows.len(),
                         "left_join: intermediate result exceeded limit, truncating"
@@ -2202,7 +2226,7 @@ impl<'a> Executor<'a> {
                     row[oi] = Some(s_id);
                 }
                 result.rows.push(row);
-                if result.rows.len() >= self.config.max_intermediate_rows {
+                if result.rows.len() >= self.config.row_cap(result.arity()) {
                     result.overflow = true;
                     break 'scan;
                 }
@@ -2369,7 +2393,7 @@ impl<'a> Executor<'a> {
                     if passing.contains(&s_id) {
                         for &ri in row_indices {
                             result.rows.push(left.rows[ri].clone());
-                            if result.rows.len() >= self.config.max_intermediate_rows {
+                            if result.rows.len() >= self.config.row_cap(result.arity()) {
                                 result.overflow = true;
                                 return Some(result);
                             }
@@ -2549,7 +2573,7 @@ impl<'a> Executor<'a> {
                         row[oi] = Some(o_id);
                     }
                     result.rows.push(row);
-                    if result.rows.len() >= self.config.max_intermediate_rows {
+                    if result.rows.len() >= self.config.row_cap(result.arity()) {
                         result.overflow = true;
                         return Some(result);
                     }
@@ -2858,7 +2882,7 @@ impl<'a> Executor<'a> {
                     }
                     if !consistent { continue; }
                     result.rows.push(row);
-                    if result.rows.len() >= self.config.max_intermediate_rows {
+                    if result.rows.len() >= self.config.row_cap(result.arity()) {
                         tracing::warn!(
                             rows = result.rows.len(),
                             "bind_join: intermediate result exceeded limit, truncating"
@@ -3158,7 +3182,7 @@ impl<'a> Executor<'a> {
                         if let Some(sc) = out_s_col { row[sc] = Some(src); }
                         if let Some(oc) = out_o_col { row[oc] = Some(dst); }
                         result.rows.push(row);
-                        if result.rows.len() >= self.config.max_intermediate_rows {
+                        if result.rows.len() >= self.config.row_cap(result.arity()) {
                             result.overflow = true;
                             return result;
                         }
@@ -3188,7 +3212,7 @@ impl<'a> Executor<'a> {
                     if let Some(sc) = out_s_col { row[sc] = Some(src); }
                     if let Some(oc) = out_o_col { row[oc] = Some(dst); }
                     result.rows.push(row);
-                    if result.rows.len() >= self.config.max_intermediate_rows {
+                    if result.rows.len() >= self.config.row_cap(result.arity()) {
                         result.overflow = true;
                         return result;
                     }
@@ -3296,7 +3320,7 @@ impl<'a> Executor<'a> {
                 }
             }
 
-            if result.rows.len() >= self.config.max_intermediate_rows {
+            if result.rows.len() >= self.config.row_cap(result.arity()) {
                 tracing::warn!(
                     rows = result.rows.len(),
                     "bind_left_join: intermediate result exceeded limit, truncating"

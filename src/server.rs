@@ -34,12 +34,19 @@ use crate::store::{QueryResult, Store};
 
 pub type SharedStore = Arc<Store>;
 
-/// Shared server state: the store plus an optional concurrency limiter.
+/// Shared server state: the store plus admission control.
 #[derive(Clone)]
 pub struct AppState {
     pub store: SharedStore,
-    /// `None` = unlimited.  `Some(sem)` = at most N concurrent queries.
+    /// **Deprecated** count gate (`max_concurrent_queries`).
+    /// `None` = no count limit.  `Some(sem)` = at most N concurrent queries.
     pub semaphore: Option<Arc<Semaphore>>,
+    /// Server-wide query memory pool (`total_query_mem_mb`).  Permit count = pool
+    /// size in MiB; each query reserves `reserve_mb` permits for its lifetime.
+    /// `None` = no pool gate (unbounded, back-compat).
+    pub mem_permits: Option<Arc<Semaphore>>,
+    /// Per-query reservation (MiB) taken from `mem_permits` before execution.
+    pub reserve_mb: u32,
 }
 
 // ── Request types ─────────────────────────────────────────────────────────────
@@ -214,12 +221,32 @@ async fn handle_post(
 /// set after the timeout and the executor's inner loops abort at the next
 /// checkpoint.  The HTTP response is 408 with a JSON error body.
 async fn run_query(state: AppState, query: String, format: String) -> Response {
-    // Acquire a concurrency slot if a limit is configured.
+    // ── Admission control ──────────────────────────────────────────────────
+    // (1) Optional deprecated count gate (`max_concurrent_queries`).
     let _permit = if let Some(ref sem) = state.semaphore {
         match sem.clone().acquire_owned().await {
             Ok(p) => Some(p),
             Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "server shutting down"),
         }
+    } else {
+        None
+    };
+
+    // (2) Memory pool reservation (`total_query_mem_mb`).  Reserve `reserve_mb`
+    // permits and hold them for the query's whole lifetime; they are released
+    // automatically when `_mem` is dropped.  When the pool is exhausted this
+    // *waits* (does not reject), so effective concurrency = floor(pool/reserve).
+    let _mem = if let Some(ref sem) = state.mem_permits {
+        let t_wait = Instant::now();
+        let permit = match sem.clone().acquire_many_owned(state.reserve_mb).await {
+            Ok(p) => p,
+            Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "server shutting down"),
+        };
+        let waited_ms = t_wait.elapsed().as_millis();
+        if waited_ms >= 50 {
+            tracing::info!(waited_ms, reserve_mb = state.reserve_mb, "query waited for memory pool");
+        }
+        Some(permit)
     } else {
         None
     };
@@ -771,17 +798,67 @@ pub fn detect_bnode_hints(query_str: &str) -> Vec<String> {
 ///
 /// `cors_origins`: passed directly to `build_router` — see its doc for accepted values.
 pub async fn serve(store: Store, host: &str, port: u16, cors_origins: Option<&str>) -> io::Result<()> {
+    // ── Deprecated count gate (max_concurrent_queries) ─────────────────────
     let max_concurrent = store.config.server.max_concurrent_queries;
     let semaphore = if max_concurrent > 0 {
-        eprintln!("Concurrency limit: {} simultaneous queries", max_concurrent);
+        eprintln!(
+            "Concurrency count gate (max_concurrent_queries, DEPRECATED — prefer total_query_mem_mb): {} simultaneous queries",
+            max_concurrent
+        );
         Some(Arc::new(Semaphore::new(max_concurrent)))
     } else {
-        eprintln!("Concurrency limit: unlimited (bounded by tokio blocking pool, default 512)");
+        eprintln!("Concurrency count gate (max_concurrent_queries): disabled (0) — memory pool governs concurrency");
         None
     };
+
+    // ── Query memory pool (total_query_mem_mb) ─────────────────────────────
+    // Per-query reservation: the explicit byte budget if set, else estimate it
+    // from the row-count cap assuming ~40 B/row.
+    let total_query_mem_mb = store.config.server.total_query_mem_mb;
+    let mut reserve_mb: u32 = if store.config.query.max_intermediate_mb > 0 {
+        store.config.query.max_intermediate_mb as u32
+    } else {
+        std::cmp::max(
+            1,
+            (store.config.query.max_intermediate_rows * 40 / (1024 * 1024)) as u32,
+        )
+    };
+
+    let mem_permits = if total_query_mem_mb > 0 {
+        // A single query must fit inside the pool, else it would wait forever.
+        if reserve_mb as u64 > total_query_mem_mb {
+            eprintln!(
+                "WARNING: per-query reserve {} MB exceeds total_query_mem_mb {} MB; \
+                 clamping reserve to {} MB to avoid permanently blocking every query",
+                reserve_mb, total_query_mem_mb, total_query_mem_mb
+            );
+            tracing::warn!(
+                reserve_mb,
+                total_query_mem_mb,
+                "per-query reserve exceeds pool; clamping to pool size"
+            );
+            reserve_mb = total_query_mem_mb as u32;
+        }
+        let eff = total_query_mem_mb / reserve_mb as u64;
+        eprintln!(
+            "Query memory pool: {} MB, per-query reserve: {} MB, effective max concurrency ≈ {}",
+            total_query_mem_mb, reserve_mb, eff
+        );
+        Some(Arc::new(Semaphore::new(total_query_mem_mb as usize)))
+    } else {
+        eprintln!(
+            "Query memory pool: disabled (total_query_mem_mb=0) — unbounded admission (back-compat); \
+             per-query reserve would be {} MB",
+            reserve_mb
+        );
+        None
+    };
+
     let state = AppState {
         store: Arc::new(store),
         semaphore,
+        mem_permits,
+        reserve_mb,
     };
     let app = build_router(state, cors_origins);
     let addr = format!("{}:{}", host, port);

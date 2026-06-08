@@ -21,11 +21,18 @@
 //! [query]
 //! max_intermediate_rows = 5_000_000
 //! bind_join_threshold   = 10_000
+//! # Per-query memory cap (MiB) for intermediate results. 0 = disabled (rows-only).
+//! max_intermediate_mb   = 0
 //!
 //! [server]
 //! host        = "127.0.0.1"
 //! port        = 7878
 //! cors_origins = ""
+//! # Deprecated; prefer total_query_mem_mb. 0 = rely on the memory pool.
+//! max_concurrent_queries = 0
+//! # Server-wide query memory pool (MiB). New queries reserve their per-query
+//! # limit from here before running. 0 = no pool gate (back-compat).
+//! total_query_mem_mb = 0
 //! # Pre-populate the OS page cache on startup (0 = disabled).
 //! # For UniProt-scale stores, 4096–16384 MB is useful.
 //! warmup_mb   = 0
@@ -273,6 +280,23 @@ pub struct QueryConfig {
     /// benefit from index-guided right-side probing.
     /// Lower to prefer hash-join earlier (lower peak memory, but more scans).
     pub bind_join_threshold: usize,
+
+    /// Memory cap (MiB) a single query's intermediate results may use.  0 = disabled.
+    ///
+    /// Complements `max_intermediate_rows`: that limit bounds the *row count*
+    /// regardless of width, whereas this bounds the *byte footprint* by also
+    /// accounting for the result's arity (number of columns).  The executor
+    /// derives an arity-aware row cap via [`QueryConfig::row_cap`] and enforces
+    /// the stricter of the two.
+    ///
+    /// - `0` — disabled (default); only `max_intermediate_rows` is enforced.
+    ///   Preserves the previous behaviour for backward compatibility.
+    /// - `N` — a query may keep at most `N` MiB of intermediate rows; wide
+    ///   results (more columns) are capped at proportionally fewer rows.
+    ///
+    /// This is the per-query budget the server reserves from the global pool
+    /// (`server.total_query_mem_mb`) before running a query.
+    pub max_intermediate_mb: usize,
 }
 
 impl Default for QueryConfig {
@@ -280,7 +304,26 @@ impl Default for QueryConfig {
         Self {
             max_intermediate_rows: 50_000_000,
             bind_join_threshold: 10_000,
+            max_intermediate_mb: 0, // disabled; only max_intermediate_rows enforced (back-compat)
         }
+    }
+}
+
+impl QueryConfig {
+    /// 指定アリティ(列数)の中間結果が保持してよい最大行数。
+    /// 絶対行数上限 max_intermediate_rows と、メモリ上限 max_intermediate_mb の
+    /// 両方を尊重し、厳しい方を返す。
+    pub fn row_cap(&self, arity: usize) -> usize {
+        let arity = arity.max(1) as u64;
+        let by_rows = self.max_intermediate_rows;
+        if self.max_intermediate_mb == 0 {
+            return by_rows.max(1);
+        }
+        // 1 TermId=8B + Vec/dedup オーバヘッド込みで保守的に 24B/列 と見積る
+        const BYTES_PER_TERM: u64 = 24;
+        let budget = self.max_intermediate_mb as u64 * 1024 * 1024;
+        let by_mem = (budget / (arity * BYTES_PER_TERM)) as usize;
+        by_mem.min(by_rows).max(1)
     }
 }
 
@@ -324,6 +367,9 @@ pub struct ServerConfig {
     /// Overridable with `--cors` on the command line.
     pub cors_origins: String,
 
+    /// **非推奨。** `total_query_mem_mb` によるメモリ予約が主ゲート。`0` 推奨。
+    /// `> 0` のときのみ追加の数ゲートとして併用する。
+    ///
     /// Maximum number of queries that may execute concurrently.
     ///
     /// Each query runs in tokio's blocking thread pool (`spawn_blocking`).
@@ -331,13 +377,37 @@ pub struct ServerConfig {
     /// execution simultaneously, preventing a burst of slow queries from
     /// exhausting system resources.
     ///
-    /// - `0` — no limit (bounded only by tokio's blocking pool, default 512).
-    /// - `N` — at most N queries run in parallel; excess requests are queued.
+    /// - `0` — no separate count limit (**recommended**); concurrency is governed
+    ///   instead by the memory pool `total_query_mem_mb`, which admits roughly
+    ///   `floor(total_query_mem_mb / per-query reservation)` queries at a time.
+    /// - `N` — additionally cap at N queries in parallel; excess requests are
+    ///   queued.  Used as a supplementary count gate *on top of* the memory pool.
     ///
-    /// A good starting point is `2 × number_of_CPU_cores`.  Raise for
-    /// I/O-bound or short queries; lower for RAM-heavy analytical queries
-    /// where running too many in parallel causes memory pressure.
+    /// Historically a good starting point was `2 × number_of_CPU_cores`, but
+    /// the memory pool now bounds concurrency more precisely, so leave this at
+    /// `0` and tune `total_query_mem_mb` instead.
     pub max_concurrent_queries: usize,
+
+    /// サーバ全体のクエリ用メモリプール(MiB)。`0` = プールゲートなし（後方互換）。
+    ///
+    /// Server-wide memory pool (MiB) for query intermediate results.  A new query
+    /// reserves its per-query limit (≈ `query.max_intermediate_mb`, or an estimate
+    /// derived from `query.max_intermediate_rows` when that is 0) from this pool
+    /// before it starts executing.  When the pool lacks enough free budget, the
+    /// query **waits** (it is not rejected) until an in-flight query finishes and
+    /// returns its reservation.  Because each query reserves its full limit up
+    /// front, no query blocks for more memory mid-flight, so this cannot deadlock.
+    ///
+    /// Effective concurrency is therefore `floor(total_query_mem_mb / per-query
+    /// reservation)`, which is the intended replacement for `max_concurrent_queries`.
+    ///
+    /// - `0` — disabled (default); no pool gate, queries start immediately
+    ///   (the previous unbounded behaviour).  Preserves backward compatibility.
+    /// - `N` — admit queries only while the reserved total stays ≤ N MiB.
+    ///
+    /// Set this to a safe fraction of physical RAM (leaving room for caches and
+    /// the page cache) to prevent the OOM killer from terminating the server.
+    pub total_query_mem_mb: u64,
 
     /// MiB of index data to read into the OS page cache in a background thread
     /// immediately after startup.
@@ -462,7 +532,8 @@ impl Default for ServerConfig {
             host: "127.0.0.1".to_string(),
             port: 7878,
             cors_origins: String::new(),
-            max_concurrent_queries: 0,     // unlimited by default
+            max_concurrent_queries: 0,     // deprecated; 0 = rely on total_query_mem_mb pool
+            total_query_mem_mb: 0,         // 0 = no pool gate (back-compat); set to bound RAM
             warmup_mb: 0,                  // disabled by default
             pred_cache_mb: 1024,           // 1024 MB heap; 50% cap = 512 MB/predicate (covers faldo)
             pred_cache_per_pred_cap_mb: 0, // 0 = use pred_cache_mb / 2 (default)
