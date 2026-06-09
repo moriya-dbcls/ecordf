@@ -175,9 +175,10 @@ max_intermediate_rows = 100_000_000
 #   0     — disabled; only max_intermediate_rows applies (legacy behaviour).
 #   4096  — ~4 GB per query (recommended starting point).
 #
-# This value is also what the server reserves per query from the global pool
-# `total_query_mem_mb` below, so effective concurrency = total_query_mem_mb /
-# max_intermediate_mb.
+# This is the CEILING for a query's reservation from the global pool
+# `total_query_mem_mb` below. Reservations are now variable: a heavy query may
+# reserve up to this much, while a light query reserves only
+# `query_reserve_floor_mb`. (Previously every query reserved this full amount.)
 max_intermediate_mb = 4096
 
 # Row threshold for choosing bind-join over hash-join.
@@ -196,6 +197,24 @@ max_intermediate_mb = 4096
 # benefit from selective index probing (e.g. highly selective predicates).
 # Lower to switch to hash-join earlier (lower peak memory, more scans).
 bind_join_threshold = 10_000
+
+# Minimum per-query memory reservation, in MiB (floor for variable admission).
+#
+# The server estimates each query's intermediate-result peak BEFORE it runs and
+# reserves a proportional, query-specific slice of the global pool
+# (`total_query_mem_mb`) — instead of every query reserving the full
+# `max_intermediate_mb`. This floor is the smallest such reservation, and is also
+# the runtime memory cap a light query receives. `total_query_mem_mb` divided by
+# this value is the approximate maximum number of light queries that run at once.
+# Lower it to admit more light queries concurrently; raise it for more head-room
+# per light query. Heavy queries still reserve up to `max_intermediate_mb`.
+query_reserve_floor_mb = 256
+
+# Safety multiplier (percent) applied to the estimated peak when sizing a query's
+# reservation. 150 = ×1.5. The cardinality estimate is approximate; this head-room
+# prevents a query from being aborted by its own (reservation-derived) runtime cap
+# due to mild under-estimation. Higher = safer but reserves more pool per query.
+query_reserve_safety_pct = 150
 
 # ── HTTP server defaults ──────────────────────────────────────────────────────
 
@@ -230,19 +249,23 @@ max_concurrent_queries = 0
 
 # Global memory pool for query execution, in MiB. PRIMARY admission control.
 #
-# Before running, each query reserves `max_intermediate_mb` (its per-query cap)
-# from this pool. When the pool is exhausted, new queries WAIT (they are not
-# rejected) until a running query finishes and releases its reservation. Because
-# every admitted query holds its full reservation, none can be starved mid-flight,
-# so there is no deadlock.
+# Before running, each query reserves a VARIABLE slice of this pool, sized from a
+# pre-execution estimate of its intermediate-result peak (between
+# `query_reserve_floor_mb` and `max_intermediate_mb`). The reserved amount is also
+# the query's runtime memory cap, so the pool can never be over-committed (OOM-safe).
+# When the pool is exhausted, new queries WAIT (they are not rejected) until a
+# running query finishes and releases its reservation. Because every admitted query
+# holds its full reservation, none can be starved mid-flight, so there is no deadlock.
 #
-# Effective max concurrency ≈ total_query_mem_mb / max_intermediate_mb.
-# Size it to leave headroom for caches (pred/path/type) and the OS:
-# roughly (physical_RAM − pred_cache_mb − a few GB). warmup_mb does NOT count
+# Light queries reserve only the floor, so many run at once
+# (≈ total_query_mem_mb / query_reserve_floor_mb); heavy queries reserve more and
+# self-limit. Size the pool to leave headroom for caches (pred/path/type) and the
+# OS: roughly (physical_RAM − pred_cache_mb − a few GB). warmup_mb does NOT count
 # (it is OS page cache, not heap).
 #
 #   0      — disabled; unbounded admission (legacy behaviour).
-#   32768  — 32 GB pool; with max_intermediate_mb=4096 → ~8 concurrent queries.
+#   32768  — 32 GB pool; with floor=256 → up to ~128 light queries concurrently,
+#            or ~8 queries each at the 4096 MB ceiling.
 total_query_mem_mb = 32768
 
 # Allowed CORS origins for the HTTP endpoint.

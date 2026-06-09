@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
-use ecordf::{Config, InputSpec, Store};
+use ecordf::{InputSpec, Store};
 
 #[derive(Parser)]
 #[command(

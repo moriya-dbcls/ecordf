@@ -18,9 +18,9 @@ use crate::config::Config;
 use crate::dict::Dictionary;
 use crate::dict_builder::{QueryDict, ReadonlyDict};
 use crate::index::{AllBuilders, TripleIndex};
-use crate::loader::{collect_strings_from_inputs, collect_strings_parallel,
+use crate::loader::{collect_strings_parallel,
                     load_files, load_files_with_graphs,
-                    load_triples_with_readonly_dict, load_triples_parallel,
+                    load_triples_parallel,
                     load_triples_streaming, InputSpec};
 use crate::path_cache::PathCache;
 use crate::predcache::PredCache;
@@ -28,6 +28,7 @@ use crate::rdf_config::{self, CompoundPath};
 use crate::type_cache::TypeCache;
 use crate::sparql::{parse_query, Executor, ResultSet};
 use crate::sparql::ast::{Expression, Projection, QueryForm, SelectItem};
+use crate::sparql::executor::QueryMemEstimate;
 use crate::stats::StoreStatistics;
 
 pub struct Store {
@@ -814,19 +815,59 @@ impl Store {
         &self,
         sparql: &str,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        budget_mb: Option<u64>,
     ) -> Result<QueryResult, QueryError> {
-        self.query_impl(sparql, cancel)
+        self.query_impl(sparql, cancel, budget_mb)
     }
 
-    /// Execute a SPARQL query without a timeout/cancellation flag.
+    /// Estimate a query's intermediate-result memory footprint **without executing**.
+    ///
+    /// Used by the HTTP admission layer to size a per-query reservation from the
+    /// global memory pool.  Relies solely on cardinality statistics / index range
+    /// counts (no scans).  Biased to the high side — see [`QueryMemEstimate`].
+    ///
+    /// - `SELECT` → delegates to [`Executor::estimate_select_mem`].
+    /// - `ASK`     → `{ est_peak_rows: 1, est_arity: 1, unbounded: false }` (boolean).
+    /// - `DESCRIBE` / `CONSTRUCT` → safe-side `{ est_peak_rows: u64::MAX, est_arity: 1,
+    ///   unbounded: true }` (DESCRIBE fan-out is unbounded; CONSTRUCT is unimplemented).
+    /// - parse failure → `Err(QueryError::Parse(..))` (caller falls back to a full reserve).
+    pub fn estimate_query_mem(&self, sparql: &str) -> Result<QueryMemEstimate, QueryError> {
+        let ast = parse_query(sparql).map_err(|e| QueryError::Parse(e.to_string()))?;
+        match ast.form {
+            QueryForm::Select(ref sq) => {
+                // Same construction as execution, minus the runtime caches: the
+                // estimator only consults stats / index range counts.
+                let executor = Executor::with_config_and_stats(
+                    &*self.index,
+                    &self.dict,
+                    self.config.query.clone(),
+                    Some(&self.stats),
+                );
+                Ok(executor.estimate_select_mem(sq))
+            }
+            QueryForm::Ask(_) => Ok(QueryMemEstimate {
+                est_peak_rows: 1,
+                est_arity: 1,
+                unbounded: false,
+            }),
+            QueryForm::Describe(_) | QueryForm::Construct(_) => Ok(QueryMemEstimate {
+                est_peak_rows: u64::MAX,
+                est_arity: 1,
+                unbounded: true,
+            }),
+        }
+    }
+
+    /// Execute a SPARQL query without a timeout/cancellation flag (CLI path).
     pub fn query(&self, sparql: &str) -> Result<QueryResult, QueryError> {
-        self.query_impl(sparql, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        self.query_impl(sparql, std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), None)
     }
 
     fn query_impl(
         &self,
         sparql: &str,
         cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        budget_mb: Option<u64>,
     ) -> Result<QueryResult, QueryError> {
         let t_total = Instant::now();
 
@@ -842,10 +883,19 @@ impl Store {
             "execute: cache state"
         );
 
+        // Per-query memory budget: when the admission layer reserved `budget_mb`
+        // MiB from the pool, pin this query's runtime cap to that exact value so
+        // reservation == runtime limit (the OOM-safety invariant).  All
+        // `row_cap()` calls then honour the byte budget automatically.
+        let mut qcfg = self.config.query.clone();
+        if let Some(mb) = budget_mb {
+            qcfg.max_intermediate_mb = mb as usize;
+        }
+
         let executor = Executor::with_config_and_stats(
             &*self.index,
             &self.dict,
-            self.config.query.clone(),
+            qcfg,
             Some(&self.stats),
         ).with_pred_cache(self.pred_cache.clone())
          .with_path_cache(self.path_cache.clone())

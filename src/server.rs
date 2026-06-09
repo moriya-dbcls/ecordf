@@ -22,7 +22,7 @@ use axum::{
     extract::{Query as AxumQuery, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
     Router,
 };
 use serde::Deserialize;
@@ -31,6 +31,7 @@ use tokio::sync::Semaphore;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::store::{QueryResult, Store};
+use crate::sparql::executor::QueryMemEstimate;
 
 pub type SharedStore = Arc<Store>;
 
@@ -42,10 +43,13 @@ pub struct AppState {
     /// `None` = no count limit.  `Some(sem)` = at most N concurrent queries.
     pub semaphore: Option<Arc<Semaphore>>,
     /// Server-wide query memory pool (`total_query_mem_mb`).  Permit count = pool
-    /// size in MiB; each query reserves `reserve_mb` permits for its lifetime.
+    /// size in MiB; each query reserves a *variable* slice (sized per-query from a
+    /// pre-execution estimate, see `run_query`) for its lifetime.
     /// `None` = no pool gate (unbounded, back-compat).
     pub mem_permits: Option<Arc<Semaphore>>,
-    /// Per-query reservation (MiB) taken from `mem_permits` before execution.
+    /// Floor (minimum) per-query reservation (MiB) — the smallest slice a light
+    /// query takes and the admission fallback.  Actual reservations are computed
+    /// per query in `run_query`; this is the configured `query_reserve_floor_mb`.
     pub reserve_mb: u32,
 }
 
@@ -232,24 +236,54 @@ async fn run_query(state: AppState, query: String, format: String) -> Response {
         None
     };
 
-    // (2) Memory pool reservation (`total_query_mem_mb`).  Reserve `reserve_mb`
-    // permits and hold them for the query's whole lifetime; they are released
-    // automatically when `_mem` is dropped.  When the pool is exhausted this
-    // *waits* (does not reject), so effective concurrency = floor(pool/reserve).
+    // (2) Memory pool reservation (`total_query_mem_mb`).  The reservation is
+    // *variable*: a pre-execution estimate sizes a per-query slice of the pool so
+    // light queries reserve little and run many-at-once, while heavy queries take
+    // up to the ceiling.  The reserved MiB is also passed to the query as its
+    // runtime memory cap (`budget_mb`), keeping reservation == runtime limit so the
+    // pool can never be over-committed (OOM-safe).  Permits are held for the
+    // query's whole lifetime and released when `_mem` is dropped.  When the pool
+    // is exhausted this *waits* (does not reject).
     let _mem = if let Some(ref sem) = state.mem_permits {
+        // Estimate (over-biased); fall back to a full reserve if estimation fails.
+        let est = state.store.estimate_query_mem(&query).unwrap_or(QueryMemEstimate {
+            est_peak_rows: u64::MAX,
+            est_arity: 1,
+            unbounded: true,
+        });
+        let mut reserve_mb = state
+            .store
+            .config
+            .query
+            .reserve_mb_for(est.est_peak_rows, est.est_arity);
+        // Clamp to the pool size so a single query can never block forever.
+        let pool_mb = state.store.config.server.total_query_mem_mb;
+        if reserve_mb > pool_mb {
+            reserve_mb = pool_mb;
+        }
+        let reserve_u32 = reserve_mb.min(u32::MAX as u64).max(1) as u32;
+
         let t_wait = Instant::now();
-        let permit = match sem.clone().acquire_many_owned(state.reserve_mb).await {
+        let permit = match sem.clone().acquire_many_owned(reserve_u32).await {
             Ok(p) => p,
             Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE, "server shutting down"),
         };
         let waited_ms = t_wait.elapsed().as_millis();
         if waited_ms >= 50 {
-            tracing::info!(waited_ms, reserve_mb = state.reserve_mb, "query waited for memory pool");
+            tracing::info!(
+                waited_ms,
+                reserve_mb = reserve_u32,
+                est_rows = est.est_peak_rows,
+                unbounded = est.unbounded,
+                "query waited for memory pool"
+            );
         }
-        Some(permit)
+        Some((permit, reserve_u32))
     } else {
         None
     };
+    // The runtime cap handed to the query must equal the reserved amount.
+    let budget_mb = _mem.as_ref().map(|(_, r)| *r as u64);
 
     let timeout_secs = state.store.config.server.query_timeout_secs;
     let cancel = Arc::new(AtomicBool::new(false));
@@ -258,7 +292,7 @@ async fn run_query(state: AppState, query: String, format: String) -> Response {
     let store = Arc::clone(&state.store);
     let cancel_for_exec = Arc::clone(&cancel);
     let task = tokio::task::spawn_blocking(move || {
-        execute_query_with_cancel(&store, &query, &format, cancel_for_exec)
+        execute_query_with_cancel(&store, &query, &format, cancel_for_exec, budget_mb)
     });
 
     if timeout_secs > 0 {
@@ -298,23 +332,12 @@ fn execute_query_with_cancel(
     query: &str,
     format: &str,
     cancel: Arc<AtomicBool>,
+    budget_mb: Option<u64>,
 ) -> Response {
     let t_req = Instant::now();
     let hints = detect_bnode_hints(query);
 
-    let result = match store.query_with_cancel(query, cancel) {
-        Ok(r)  => r,
-        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
-    };
-
-    build_query_response(store, result, format, t_req, &hints)
-}
-
-fn execute_query(store: &Store, query: &str, format: &str) -> Response {
-    let t_req = Instant::now();
-    let hints = detect_bnode_hints(query);
-
-    let result = match store.query(query) {
+    let result = match store.query_with_cancel(query, cancel, budget_mb) {
         Ok(r)  => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
@@ -812,43 +835,42 @@ pub async fn serve(store: Store, host: &str, port: u16, cors_origins: Option<&st
     };
 
     // ── Query memory pool (total_query_mem_mb) ─────────────────────────────
-    // Per-query reservation: the explicit byte budget if set, else estimate it
-    // from the row-count cap assuming ~40 B/row.
+    // Reservations are now *variable*: each query reserves a slice sized from a
+    // pre-execution estimate (see run_query).  `reserve_mb` here is the floor —
+    // the smallest reservation any (light) query takes, and the AppState fallback.
     let total_query_mem_mb = store.config.server.total_query_mem_mb;
-    let mut reserve_mb: u32 = if store.config.query.max_intermediate_mb > 0 {
-        store.config.query.max_intermediate_mb as u32
-    } else {
-        std::cmp::max(
-            1,
-            (store.config.query.max_intermediate_rows * 40 / (1024 * 1024)) as u32,
-        )
-    };
+    let floor_mb = store.config.query.query_reserve_floor_mb.max(1);
+    let ceil_mb = store.config.query.max_intermediate_mb as u64; // 0 = no explicit ceiling
+    let mut reserve_mb: u32 = floor_mb.min(u32::MAX as u64) as u32;
 
     let mem_permits = if total_query_mem_mb > 0 {
-        // A single query must fit inside the pool, else it would wait forever.
+        // Even the lightest (floor) reservation must fit inside the pool, else it
+        // would wait forever.
         if reserve_mb as u64 > total_query_mem_mb {
             eprintln!(
-                "WARNING: per-query reserve {} MB exceeds total_query_mem_mb {} MB; \
-                 clamping reserve to {} MB to avoid permanently blocking every query",
+                "WARNING: floor reserve {} MB exceeds total_query_mem_mb {} MB; \
+                 clamping floor to {} MB to avoid permanently blocking every query",
                 reserve_mb, total_query_mem_mb, total_query_mem_mb
             );
             tracing::warn!(
                 reserve_mb,
                 total_query_mem_mb,
-                "per-query reserve exceeds pool; clamping to pool size"
+                "floor reserve exceeds pool; clamping to pool size"
             );
             reserve_mb = total_query_mem_mb as u32;
         }
-        let eff = total_query_mem_mb / reserve_mb as u64;
+        let light = total_query_mem_mb / reserve_mb as u64;
+        let heavy_cap = if ceil_mb > 0 { ceil_mb } else { total_query_mem_mb };
         eprintln!(
-            "Query memory pool: {} MB, per-query reserve: {} MB, effective max concurrency ≈ {}",
-            total_query_mem_mb, reserve_mb, eff
+            "Query memory pool: {} MB, floor reserve: {} MB → up to ~{} light queries \
+             concurrently (heavy queries reserve up to {} MB)",
+            total_query_mem_mb, reserve_mb, light, heavy_cap
         );
         Some(Arc::new(Semaphore::new(total_query_mem_mb as usize)))
     } else {
         eprintln!(
             "Query memory pool: disabled (total_query_mem_mb=0) — unbounded admission (back-compat); \
-             per-query reserve would be {} MB",
+             per-query reserve would be variable (floor {} MB)",
             reserve_mb
         );
         None

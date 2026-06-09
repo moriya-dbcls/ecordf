@@ -297,6 +297,33 @@ pub struct QueryConfig {
     /// This is the per-query budget the server reserves from the global pool
     /// (`server.total_query_mem_mb`) before running a query.
     pub max_intermediate_mb: usize,
+
+    /// Minimum per-query memory reservation (MiB) for variable admission.
+    ///
+    /// The server estimates each query's intermediate-result peak before it runs
+    /// and reserves a proportional, query-specific slice of the global pool
+    /// (`server.total_query_mem_mb`) — instead of every query reserving the full
+    /// `max_intermediate_mb`.  This floor is the *smallest* such reservation: it
+    /// is also the runtime memory cap a light query receives.
+    ///
+    /// `floor(total_query_mem_mb / query_reserve_floor_mb)` is therefore the
+    /// approximate maximum number of light queries that may run concurrently.
+    /// Raising the floor lowers light-query concurrency but gives each light
+    /// query more head-room; lowering it admits more light queries at once.
+    ///
+    /// Default: `256`.
+    pub query_reserve_floor_mb: u64,
+
+    /// Safety multiplier (percent) applied to the estimated intermediate-result
+    /// peak when sizing a query's reservation.  `150` = ×1.5.
+    ///
+    /// The cardinality estimate is approximate; multiplying by this factor guards
+    /// against mild under-estimation so that a query is not aborted by its own
+    /// (reservation-derived) runtime memory cap.  Higher values are safer but
+    /// reserve more of the pool per query, reducing concurrency.
+    ///
+    /// Default: `150`.
+    pub query_reserve_safety_pct: u32,
 }
 
 impl Default for QueryConfig {
@@ -305,6 +332,8 @@ impl Default for QueryConfig {
             max_intermediate_rows: 50_000_000,
             bind_join_threshold: 10_000,
             max_intermediate_mb: 0, // disabled; only max_intermediate_rows enforced (back-compat)
+            query_reserve_floor_mb: 256,  // minimum per-query reservation = light-query cap
+            query_reserve_safety_pct: 150, // ×1.5 head-room over the estimated peak
         }
     }
 }
@@ -324,6 +353,43 @@ impl QueryConfig {
         let budget = self.max_intermediate_mb as u64 * 1024 * 1024;
         let by_mem = (budget / (arity * BYTES_PER_TERM)) as usize;
         by_mem.min(by_rows).max(1)
+    }
+
+    /// 推定行数・アリティから「このクエリの予約MB（= 実行時メモリ上限）」を算出する。
+    ///
+    /// `reserve = clamp( ceil(est_rows * arity * BYTES_PER_TERM * safety_pct/100 / 1MiB),
+    ///                   query_reserve_floor_mb, ceil )`
+    /// で、`ceil = max_intermediate_mb`。`max_intermediate_mb == 0`（cap 無効・レガシー）の
+    /// ときは上限クランプを行わず `max(floor, est由来MB)` を返す。
+    ///
+    /// 予約 = 実行時上限。サーバはこの戻り値をプールから予約し、同じ値を `budget_mb` として
+    /// クエリへ渡すことで「プール総和 ≤ プール容量」を厳密に保つ。すべて飽和演算で行うため
+    /// `est_rows == u64::MAX` 等でも overflow せず、ceil（または現実的な大値）に張り付く。
+    pub fn reserve_mb_for(&self, est_rows: u64, arity: usize) -> u64 {
+        // row_cap と同じ保守係数（8B TermId + Vec/dedup オーバヘッド込み）。
+        const BYTES_PER_TERM: u64 = 24;
+        const MIB: u64 = 1024 * 1024;
+
+        let arity = (arity.max(1)) as u64;
+        let floor = self.query_reserve_floor_mb.max(1);
+
+        // bytes = est_rows * arity * BYTES_PER_TERM * safety_pct / 100（飽和）。
+        let bytes = est_rows
+            .saturating_mul(arity)
+            .saturating_mul(BYTES_PER_TERM)
+            .saturating_mul(self.query_reserve_safety_pct as u64)
+            / 100;
+        // ceil(bytes / 1MiB)（飽和加算で overflow させない）。
+        let est_mb = bytes.saturating_add(MIB - 1) / MIB;
+
+        if self.max_intermediate_mb == 0 {
+            // cap 無効: 上限クランプ無し。floor は必ず保証する。
+            return est_mb.max(floor);
+        }
+
+        // ceil = max_intermediate_mb。floor > ceil の誤設定でも panic しないようガード。
+        let ceil = (self.max_intermediate_mb as u64).max(floor);
+        est_mb.clamp(floor, ceil)
     }
 }
 
@@ -608,5 +674,66 @@ impl std::error::Error for ConfigError {}
 impl From<ConfigError> for std::io::Error {
     fn from(e: ConfigError) -> Self {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a QueryConfig with an explicit byte ceiling for reservation tests.
+    fn qcfg(max_mb: usize) -> QueryConfig {
+        QueryConfig {
+            max_intermediate_mb: max_mb,
+            ..QueryConfig::default()
+        }
+    }
+
+    #[test]
+    fn reserve_small_est_hits_floor() {
+        // A 1-row, 1-column query is far below the floor → reserved at the floor.
+        let c = qcfg(4096); // floor 256, safety 150
+        assert_eq!(c.reserve_mb_for(1, 1), 256);
+        assert_eq!(c.reserve_mb_for(0, 3), 256);
+    }
+
+    #[test]
+    fn reserve_mid_est_is_proportional() {
+        // 10M rows × arity 2 × 24 B × 1.5 = 720_000_000 B ≈ 687 MiB, inside [256, 4096].
+        let c = qcfg(4096);
+        let mb = c.reserve_mb_for(10_000_000, 2);
+        assert!(mb > 256 && mb < 4096, "expected proportional value, got {mb}");
+        // ceil(720_000_000 / 1MiB) = 687.
+        assert_eq!(mb, 687);
+    }
+
+    #[test]
+    fn reserve_saturates_to_ceil() {
+        // u64::MAX must saturate to the ceiling, never wrap to a small value.
+        let c = qcfg(4096);
+        assert_eq!(c.reserve_mb_for(u64::MAX, 1), 4096);
+        assert_eq!(c.reserve_mb_for(u64::MAX, 16), 4096);
+    }
+
+    #[test]
+    fn reserve_arity_increases_reservation() {
+        let c = qcfg(4096);
+        let a1 = c.reserve_mb_for(5_000_000, 1);
+        let a4 = c.reserve_mb_for(5_000_000, 4);
+        assert!(a4 > a1, "wider arity should reserve more: {a1} vs {a4}");
+    }
+
+    #[test]
+    fn reserve_no_ceiling_when_cap_disabled() {
+        // max_intermediate_mb == 0: no upper clamp, but floor is still guaranteed
+        // and the value must not overflow on u64::MAX.
+        let c = qcfg(0);
+        assert_eq!(c.reserve_mb_for(1, 1), 256); // floor
+        let huge = c.reserve_mb_for(u64::MAX, 8);
+        assert!(huge >= 256, "floor must hold even with cap disabled, got {huge}");
+        // No panic / wrap: result is a sane large-but-finite u64.
+        assert!(huge < u64::MAX);
     }
 }

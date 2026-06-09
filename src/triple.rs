@@ -151,8 +151,7 @@ impl TriplePattern {
             (false, false, true ) => IndexKind::Osp,
             // ── none bound (full scan) ──────────────────────────────────────────
             (false, false, false) => IndexKind::Spo,
-            // ── all three bound (any index works; SPO has smallest overhead) ───
-            (true,  true,  true ) => IndexKind::Spo,
+            // (all three bound is already covered by the (true, true, _) arm above)
         }
     }
 }
