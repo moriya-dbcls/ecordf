@@ -25,6 +25,7 @@ use super::ast::*;
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // Star/Plus/Div/Arrow/DecimalLit are reserved lexical tokens for future parser extensions
 enum Token<'a> {
     // Punctuation
     LBrace, RBrace, LParen, RParen, LBracket, RBracket,
@@ -61,10 +62,6 @@ struct Lexer<'a> {
 impl<'a> Lexer<'a> {
     fn new(input: &'a str) -> Self {
         Self { input, pos: 0, peeked: None }
-    }
-
-    fn remaining(&self) -> &'a str {
-        &self.input[self.pos..]
     }
 
     fn skip_ws_and_comments(&mut self) {
@@ -252,7 +249,7 @@ impl<'a> Lexer<'a> {
         let triple = self.input[self.pos..].starts_with("\"\"\"")
             || self.input[self.pos..].starts_with("'''");
 
-        let (start_skip, end_skip) = if triple { (3, 3) } else { (1, 1) };
+        let (start_skip, _end_skip) = if triple { (3, 3) } else { (1, 1) };
         self.pos += start_skip;
 
         let end_seq = if triple {

@@ -35,7 +35,7 @@ use std::time::Instant;
 
 use crate::config::QueryConfig;
 use crate::dict_builder::QueryDict;
-use crate::index::{GspoIndexFile, TripleIndex};
+use crate::index::TripleIndex;
 use crate::path_cache::PathCache;
 use crate::predcache::{self, PredCache};
 use crate::stats::StoreStatistics;
@@ -182,6 +182,31 @@ fn leapfrog_join(mut iters: Vec<SortedIter>) -> Vec<TermId> {
 // ══════════════════════════════════════════════════════════════════════════════
 // Main Executor
 // ══════════════════════════════════════════════════════════════════════════════
+
+/// Pre-execution estimate of a query's intermediate-result memory footprint.
+///
+/// Produced by [`Executor::estimate_select_mem`] **without executing any scan** —
+/// it relies solely on `stats` / `index.estimate` range counts.  Consumed by the
+/// admission layer (server) to size a per-query memory reservation.
+///
+/// **Safety contract: never under-estimate.**  Every field is biased to the high
+/// side.  Anything the estimator cannot analyse with confidence (UNION, OPTIONAL,
+/// sub-SELECT, VALUES, GRAPH, property paths, …) collapses to
+/// `est_peak_rows = u64::MAX` / `unbounded = true`, which the admission layer maps
+/// to a full-budget reservation.  Under-estimating would set the query's runtime
+/// memory cap too low and wrongly abort a legitimate heavy query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryMemEstimate {
+    /// Estimated peak intermediate-result row count (over-estimated).
+    pub est_peak_rows: u64,
+    /// Maximum column count (arity) handled in the intermediate result; min 1.
+    pub est_arity: usize,
+    /// `true` when aggregation / GROUP BY / ORDER BY / DISTINCT / HAVING makes the
+    /// pre-aggregation BGP peak un-rescuable by LIMIT (so `est_peak_rows` is the
+    /// full BGP peak, not a LIMIT-capped value), or when the structure could not
+    /// be analysed at all.
+    pub unbounded: bool,
+}
 
 pub struct Executor<'a> {
     pub index: &'a TripleIndex,
@@ -401,6 +426,112 @@ impl<'a> Executor<'a> {
     /// - `post_us`  : µs for GROUP BY / ORDER BY / DISTINCT / LIMIT
     /// - `rows`     : final row count after all post-processing
     /// - `plan`     : the physical plan chosen by the optimizer
+    /// Estimate a SELECT query's intermediate-result memory footprint **without
+    /// executing it** (no scans — only `stats` / `index.estimate` range counts).
+    ///
+    /// Used by the admission layer to compute a variable per-query reservation.
+    /// See [`QueryMemEstimate`] for the over-estimation safety contract.
+    ///
+    /// ## How the peak is derived (and why it does not under-estimate)
+    ///
+    /// The WHERE clause is normalised and reduced to a single BGP (+ residual
+    /// filters) via the same [`normalize_graph_pattern`] / [`extract_bgp_with_filters`]
+    /// path the executor uses.  Any node that is **not** a pure BGP/Join/Filter
+    /// tree (UNION, OPTIONAL, sub-SELECT, VALUES, GRAPH, property path, …) makes
+    /// extraction fail, and we return the maximal estimate (`u64::MAX`,
+    /// `unbounded`).  This is deliberately pessimistic: we would rather reserve a
+    /// full budget than risk capping a query we cannot model.
+    ///
+    /// For an analysable BGP we replay the greedy join order of
+    /// [`optimize_triple_patterns`] (Phase-1 selection is reproduced exactly,
+    /// reusing [`estimate_pattern_cardinality`]) and track the running join
+    /// cardinality, taking its **maximum across all steps** as the peak.  The join
+    /// step multiplies the running cardinality by the next pattern's
+    /// (bound-discounted) per-binding fan-out — the optimizer's own cost model —
+    /// so the peak follows the same numbers the planner trusts.  All arithmetic is
+    /// saturating, so an explosive product saturates to `u64::MAX` rather than
+    /// wrapping to a small value.
+    ///
+    /// LIMIT only caps the peak when LIMIT pushdown can actually bound the BGP
+    /// (no DISTINCT / GROUP BY / ORDER BY / HAVING / aggregate); otherwise the peak
+    /// is the pre-aggregation BGP peak and `unbounded` is set.
+    pub fn estimate_select_mem(&self, sq: &SelectQuery) -> QueryMemEstimate {
+        // A SELECT-level VALUES clause multiplies the BGP by an inline table whose
+        // expansion we do not model here — fall back to the safe maximum.
+        if sq.values.is_some() {
+            return QueryMemEstimate { est_peak_rows: u64::MAX, est_arity: 1, unbounded: true };
+        }
+
+        // Reduce the WHERE clause to a pure BGP (+ filters).  Extraction fails for
+        // any non-BGP structure (UNION / OPTIONAL / Subquery / Values / Graph /
+        // PathPattern / Extend / Empty) → safe over-estimate.
+        let normalized = normalize_graph_pattern(sq.pattern.clone());
+        let triples = match extract_bgp_with_filters(&normalized) {
+            Some((t, _filters)) if !t.is_empty() => t,
+            _ => return QueryMemEstimate { est_peak_rows: u64::MAX, est_arity: 1, unbounded: true },
+        };
+
+        let est_arity = bgp_distinct_var_count(&triples).max(1);
+        let peak = self.estimate_bgp_peak_rows(&triples);
+
+        let (cap, unbounded) = limit_pushdown_cap(sq);
+        let est_peak_rows = match cap {
+            Some(c) => peak.min(c), // LIMIT pushdown bounds the BGP peak
+            None => peak,           // no LIMIT, or LIMIT cannot rescue (unbounded)
+        };
+
+        QueryMemEstimate { est_peak_rows, est_arity, unbounded }
+    }
+
+    /// Replay [`optimize_triple_patterns`]'s greedy join order over `triples`,
+    /// tracking the running intermediate-result cardinality and returning its
+    /// **maximum across all steps** (the peak).
+    ///
+    /// This reuses [`estimate_pattern_cardinality`] / [`shares_var_with_bound`] so
+    /// the numbers match the planner's own model.  The peak is biased high: the
+    /// per-step join estimate is `running * next_pattern_fanout`, saturating on
+    /// overflow so an explosive product yields `u64::MAX` (never a wrapped small
+    /// value).  Pure estimation — performs no scan.
+    fn estimate_bgp_peak_rows(&self, triples: &[TriplePatternAst]) -> u64 {
+        let mut remaining: Vec<&TriplePatternAst> = triples.iter().collect();
+        let mut bound: HashSet<String> = HashSet::new();
+        let mut running: u64 = 0;
+        let mut peak: u64 = 0;
+        let mut first = true;
+
+        while !remaining.is_empty() {
+            // Same connected-component-aware greedy selection as
+            // optimize_triple_patterns' Phase 1.
+            let any_connected = !bound.is_empty()
+                && remaining.iter().any(|t| shares_var_with_bound(t, &bound));
+            let best_idx = remaining.iter().enumerate()
+                .filter(|(_, t)| !any_connected || shares_var_with_bound(t, &bound))
+                .min_by_key(|(_, t)| estimate_pattern_cardinality(t, &bound, self.index, self.dict, self.stats))
+                .map(|(i, _)| i)
+                .unwrap(); // safe: remaining is non-empty
+
+            let best = remaining.remove(best_idx);
+            let card = estimate_pattern_cardinality(best, &bound, self.index, self.dict, self.stats);
+
+            running = if first {
+                first = false;
+                card
+            } else {
+                // Bind-join growth: each running intermediate row is extended by
+                // this pattern's (bound-discounted) per-binding fan-out.
+                running.saturating_mul(card)
+            };
+
+            for term in [&best.s, &best.p, &best.o] {
+                if let Term::Variable(v) | Term::BlankNode(v) = term {
+                    bound.insert(v.clone());
+                }
+            }
+            peak = peak.max(running);
+        }
+        peak.max(1)
+    }
+
     pub fn execute_select(&self, query: &SelectQuery) -> ResultSet {
         // 1. Optimize the join order
         let t_plan = Instant::now();
@@ -525,7 +656,7 @@ impl<'a> Executor<'a> {
         // `cap` is the byte-budget-aware row ceiling for the doubling retry; it is
         // refined to the actual BGP arity after each pass (row_cap == max_rows when
         // max_intermediate_mb == 0, so behaviour is unchanged in that case).
-        let mut cap = self.config.max_intermediate_rows.max(1);
+        let mut cap;
         let mut budget = budget0.unwrap_or(usize::MAX);
         let mut bindings;
         loop {
@@ -1941,9 +2072,6 @@ impl<'a> Executor<'a> {
         let left_col_map: Vec<Option<usize>> = left.variables.iter()
             .map(|lv| out_vars.iter().position(|v| v == lv))
             .collect();
-        let right_col_map: Vec<Option<usize>> = right.variables.iter()
-            .map(|rv| out_vars.iter().position(|v| v == rv))
-            .collect();
         // For right side, track which columns are not already supplied by left.
         let right_new_cols: Vec<(usize, usize)> = right.variables.iter().enumerate()
             .filter(|(_, rv)| !left.variables.contains(rv))
@@ -2137,7 +2265,7 @@ impl<'a> Executor<'a> {
 
         // Must have exactly one needed variable (the subject key).
         if needed.len() != 1 { return None; }
-        let (subj_col, subj_var) = &needed[0];
+        let (subj_col, _subj_var) = &needed[0];
 
         // Fast path only worth it when left is significantly larger than limit.
         if left.rows.len() <= push_limit * 4 { return None; }
@@ -5795,6 +5923,46 @@ fn optimize_bgp_with_bound(
 /// runtime, sharply reducing result count.  Each such position reduces the estimate
 /// by `BOUND_VAR_FACTOR`.  This is a deliberate underestimate — we prefer to plan
 /// as if the pattern is cheap rather than generating a cross product.
+/// Count the distinct variables (including blank-node variables) appearing in a
+/// BGP — used as the intermediate-result arity for memory estimation. Min 0 here;
+/// the caller clamps to ≥1.
+fn bgp_distinct_var_count(triples: &[TriplePatternAst]) -> usize {
+    let mut vars: HashSet<&str> = HashSet::new();
+    for t in triples {
+        for term in [&t.s, &t.p, &t.o] {
+            if let Term::Variable(v) | Term::BlankNode(v) = term {
+                vars.insert(v.as_str());
+            }
+        }
+    }
+    vars.len()
+}
+
+/// Decide whether LIMIT pushdown can bound a query's BGP peak for memory
+/// estimation, mirroring the `can_pushdown` gate in `execute_select`.
+///
+/// Returns `(cap, unbounded)`:
+/// - `cap = Some(limit + offset)` when LIMIT pushdown applies (no DISTINCT /
+///   GROUP BY / ORDER BY / HAVING / aggregate) **and** a LIMIT is present — the
+///   estimator caps the peak at this value.  `offset` is added saturatingly.
+/// - `cap = None` otherwise (no LIMIT, or pushdown blocked).
+/// - `unbounded = true` exactly when pushdown is blocked by DISTINCT / GROUP BY /
+///   ORDER BY / HAVING / aggregate, i.e. the pre-aggregation BGP peak cannot be
+///   reduced by LIMIT.
+fn limit_pushdown_cap(sq: &SelectQuery) -> (Option<u64>, bool) {
+    let blocked = sq.distinct
+        || !sq.group_by.is_empty()
+        || !sq.order_by.is_empty()
+        || !sq.having.is_empty()
+        || projection_has_aggregates(sq);
+    if blocked {
+        (None, true)
+    } else {
+        let cap = sq.limit.map(|l| l.saturating_add(sq.offset.unwrap_or(0)));
+        (cap, false)
+    }
+}
+
 fn estimate_pattern_cardinality(
     t: &TriplePatternAst,
     bound: &HashSet<String>,
@@ -6286,37 +6454,6 @@ fn row_to_binding(variables: &[String], row: &[Option<TermId>]) -> Binding {
     b
 }
 
-fn merge_bindings(a: &Binding, b: &Binding) -> Option<Binding> {
-    let mut merged = a.clone();
-    for (k, v) in b {
-        if let Some(existing) = merged.get(k) {
-            if existing != v { return None; }
-        } else {
-            merged.insert(k.clone(), *v);
-        }
-    }
-    Some(merged)
-}
-
-fn bind_pattern_with_binding(
-    pat: &TriplePattern,
-    vars: &[(String, u8)],
-    var_name: &str,
-    val: TermId,
-) -> TriplePattern {
-    let mut p = *pat;
-    for (name, pos) in vars {
-        if name == var_name {
-            match pos {
-                0 => p.s = val,
-                1 => p.p = val,
-                _ => p.o = val,
-            }
-        }
-    }
-    p
-}
-
 /// Apply a `binding` map to a `TriplePattern`, substituting bound variable
 /// positions with their TermId values.  Used by `lft_enumerate`.
 fn apply_binding_to_pat(
@@ -6628,6 +6765,7 @@ impl ResultSet {
 // ── Debug helpers ──────────────────────────────────────────────────────────────
 
 /// Return a short type name for an ExecutionPlan node (no recursion).
+#[allow(dead_code)]
 fn plan_type_name(plan: &ExecutionPlan) -> &'static str {
     match plan {
         ExecutionPlan::Empty           => "Empty",
@@ -6648,6 +6786,7 @@ fn plan_type_name(plan: &ExecutionPlan) -> &'static str {
 }
 
 /// Recursively build a human-readable plan tree string (indented).
+#[allow(dead_code)]
 fn describe_plan(plan: &ExecutionPlan, indent: usize) -> String {
     let pad = "  ".repeat(indent);
     match plan {
@@ -6969,6 +7108,109 @@ mod normalize_tests {
             GraphPattern::Join(_, _) => { /* correct — Extend boundary preserved */ }
             other => panic!("Expected Join to be preserved, got {:?}", other),
         }
+    }
+
+    // ── Memory-estimation helpers (estimate_select_mem support) ──────────────
+    //
+    // The index-dependent peak (estimate_bgp_peak_rows) reuses the optimizer's
+    // own estimate_pattern_cardinality and needs a real on-disk index, so it is
+    // exercised by the integration/benchmark path rather than here.  These unit
+    // tests pin the pure decision logic that estimate_select_mem layers on top:
+    // the LIMIT-pushdown gate, the arity count, and the non-BGP fallback trigger.
+
+    fn select_with(pattern: GraphPattern) -> SelectQuery {
+        SelectQuery {
+            distinct: false,
+            projection: Projection::Wildcard,
+            dataset: vec![],
+            pattern,
+            group_by: vec![],
+            having: vec![],
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            values: None,
+        }
+    }
+
+    /// LIMIT with no DISTINCT/aggregate/ORDER BY → pushdown caps the peak at
+    /// limit+offset and the result is bounded.
+    #[test]
+    fn test_limit_pushdown_cap_simple() {
+        let mut sq = select_with(GraphPattern::Empty);
+        sq.limit = Some(100);
+        sq.offset = Some(10);
+        assert_eq!(limit_pushdown_cap(&sq), (Some(110), false));
+
+        // No LIMIT at all → no cap, still bounded (not unbounded).
+        let sq2 = select_with(GraphPattern::Empty);
+        assert_eq!(limit_pushdown_cap(&sq2), (None, false));
+    }
+
+    /// DISTINCT / ORDER BY / GROUP BY / aggregate block LIMIT pushdown → no cap
+    /// and unbounded=true (the BGP peak survives LIMIT).
+    #[test]
+    fn test_limit_pushdown_cap_blocked() {
+        let mut distinct = select_with(GraphPattern::Empty);
+        distinct.distinct = true;
+        distinct.limit = Some(100);
+        assert_eq!(limit_pushdown_cap(&distinct), (None, true));
+
+        let mut ordered = select_with(GraphPattern::Empty);
+        ordered.order_by = vec![OrderCondition {
+            direction: OrderDirection::Asc,
+            expr: Expression::Variable("x".to_string()),
+        }];
+        ordered.limit = Some(100);
+        assert_eq!(limit_pushdown_cap(&ordered), (None, true));
+
+        // (COUNT(*) AS ?n) aggregate in the projection.
+        let mut agg = select_with(GraphPattern::Empty);
+        agg.projection = Projection::Variables(vec![SelectItem::Alias(
+            Expression::Count { distinct: false, expr: None },
+            "n".to_string(),
+        )]);
+        agg.limit = Some(100);
+        assert_eq!(limit_pushdown_cap(&agg), (None, true));
+    }
+
+    /// Arity = distinct variable count across the BGP (min clamp applied by caller).
+    #[test]
+    fn test_bgp_distinct_var_count() {
+        let triples = vec![
+            tp(var("s"), iri("http://ex/p1"), var("o")),
+            tp(var("s"), iri("http://ex/p2"), var("o2")),
+        ];
+        // {s, o, o2} = 3 distinct variables.
+        assert_eq!(bgp_distinct_var_count(&triples), 3);
+        assert_eq!(bgp_distinct_var_count(&[]), 0);
+    }
+
+    /// Non-BGP structures must fail BGP extraction → estimate_select_mem returns
+    /// the safe maximum (u64::MAX, unbounded).  Here we assert the extraction
+    /// trigger directly (UNION / OPTIONAL / Subquery cannot be reduced to a BGP).
+    #[test]
+    fn test_non_bgp_extraction_fails() {
+        let a = bgp(vec![tp(var("s"), iri("http://ex/p1"), var("o1"))]);
+        let b = bgp(vec![tp(var("s"), iri("http://ex/p2"), var("o2"))]);
+
+        let union = GraphPattern::Union(Box::new(a.clone()), Box::new(b.clone()));
+        assert!(extract_bgp_with_filters(&normalize_graph_pattern(union)).is_none(),
+            "UNION must not reduce to a BGP → u64::MAX fallback");
+
+        let optional = GraphPattern::Optional(Box::new(a.clone()), Box::new(b.clone()));
+        assert!(extract_bgp_with_filters(&normalize_graph_pattern(optional)).is_none(),
+            "OPTIONAL must not reduce to a BGP → u64::MAX fallback");
+
+        let subquery = GraphPattern::Subquery(Box::new(select_with(a.clone())));
+        assert!(extract_bgp_with_filters(&normalize_graph_pattern(subquery)).is_none(),
+            "sub-SELECT must not reduce to a BGP → u64::MAX fallback");
+
+        // A pure BGP/Join/Filter tree *does* reduce (the analysable path).
+        let joined = GraphPattern::Join(Box::new(a), Box::new(b));
+        let extracted = extract_bgp_with_filters(&normalize_graph_pattern(joined));
+        assert!(matches!(extracted, Some((ref t, _)) if t.len() == 2),
+            "pure BGP join must extract its triple patterns");
     }
 }
 

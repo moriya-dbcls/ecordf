@@ -1525,47 +1525,13 @@ impl IndexFile {
         lo
     }
 
-    /// First position where `(col0, col1) >= (k0, k1)`.  Reads columns 0 and 1.
-    ///
-    /// ## Why narrow(k0).hi cannot be used here
-    ///
-    /// `narrow(k0)` returns a 512-entry window around the **first** occurrence
-    /// of k0 in c0.  When k0 is a common value (e.g. `rdf:type` spanning
-    /// billions of entries across thousands of skip blocks), the answer for
-    /// `(k0, k1)` with a large k1 lies deep inside k0's range — far beyond
-    /// the narrow window.  Clamping the binary search to that window would
-    /// cause the search to return `hi` (not found) and produce empty results.
-    ///
-    /// ## Two-phase approach
-    ///
-    /// Phase 1 — `lower_bound_0(k0)`: skip-optimised single-key search on c0.
-    ///   Touches exactly 1 OS page via skip + prefetch_c0.
-    ///   Result `lo` = first position where c0 >= k0.
-    ///
-    /// Phase 2 — binary search `[lo, count)` with `(c0, c1)` comparator.
-    ///   `lo` is tight (nothing before it can satisfy the predicate), so this
-    ///   is correct.  The range is `count - lo` which equals the size of the
-    ///   k0 range for exact predicate matches, giving O(log(|k0 range|)) steps.
-    fn lower_bound_01(&self, k0: u64, k1: u64) -> usize {
-        // Phase 1: find the exact start of k0's range, skip-optimised.
-        let lo = self.lower_bound_0(k0);
-        // Phase 2: binary search within [lo, count) with the two-key comparator.
-        let (mut a, mut b) = (lo, self.count);
-        while a < b {
-            let mid = a + (b - a) / 2;
-            let (c0, c1) = self.get_col01(mid);
-            if (c0, c1) < (k0, k1) { a = mid + 1; } else { b = mid; }
-        }
-        a
-    }
-
     // ── Scan API ──────────────────────────────────────────────────────────────
 
     /// Scan the index for all triples matching `pat`. Yields triples in SPO order.
     ///
     /// For DeltaColumnar storage, builds a `DeltaScanState` that uses three
     /// `DeltaColIter`s so each entry costs O(1) amortised instead of O(BLOCK_SIZE).
-    pub fn scan(&self, pat: &TriplePattern) -> TripleScan {
+    pub fn scan(&self, pat: &TriplePattern) -> TripleScan<'_> {
         let raw_pat = pattern_to_raw(*pat, self.kind);
         let (start, end) = self.range_for_pattern(&raw_pat);
         let delta = if let IndexStorage::DeltaColumnar { cols } = &self.storage {
@@ -2356,7 +2322,7 @@ impl TripleIndex {
     ///   SOP missing → SPO   (s is primary key in both)
     ///   PSO missing → POS   (p is primary key in both)
     ///   OPS missing → OSP   (o is primary key in both)
-    pub fn scan(&self, pat: &TriplePattern) -> TripleScan {
+    pub fn scan(&self, pat: &TriplePattern) -> TripleScan<'_> {
         match self.best_kind(pat) {
             IndexKind::Sop => self.sop.as_ref().map(|i| i.scan(pat))
                 .unwrap_or_else(|| self.spo.scan(pat)),
@@ -2389,7 +2355,7 @@ impl TripleIndex {
     ///
     /// Used by `StoreStatistics::build_from_index` (pass 2) to count distinct
     /// `(subject, predicate)` pairs per predicate.
-    pub fn spo_scan_all(&self) -> TripleScan {
+    pub fn spo_scan_all(&self) -> TripleScan<'_> {
         let pat = TriplePattern { s: UNBOUND, p: UNBOUND, o: UNBOUND };
         self.spo.scan(&pat)
     }
@@ -2398,7 +2364,7 @@ impl TripleIndex {
     ///
     /// Used by `StoreStatistics::build_from_index` (pass 1) to count triples
     /// and distinct objects per predicate without allocating a hash set.
-    pub fn pos_scan_all(&self) -> TripleScan {
+    pub fn pos_scan_all(&self) -> TripleScan<'_> {
         let pat = TriplePattern { s: UNBOUND, p: UNBOUND, o: UNBOUND };
         self.pos.scan(&pat)
     }
